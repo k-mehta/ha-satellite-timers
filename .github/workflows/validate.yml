@@ -1,0 +1,40 @@
+name: Validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  hassfest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Hassfest
+        uses: home-assistant/actions/hassfest@master
+
+  validate-hacs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+          # No brand icon/logo yet (see BEST_PRACTICES.md): skip brand
+          # validation until the integration is submitted to
+          # home-assistant/brands.
+          ignore: brands

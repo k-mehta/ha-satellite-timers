@@ -7,6 +7,16 @@ Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-01
+
+### Fixed
+
+- Declare the `http`, `intent`, and `lovelace` components as dependencies
+  in the manifest (hassfest requires any component the integration uses
+  to be listed), and drop the `min_hass_version` key, which is not a
+  valid manifest key in current Home Assistant (the minimum version is
+  declared in `hacs.json`).
+
 ## [0.1.9] - 2026-10-31
 
 ### Changed

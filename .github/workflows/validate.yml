@@ -36,5 +36,8 @@ jobs:
           category: integration
           # No brand icon/logo yet (see BEST_PRACTICES.md): skip brand
           # validation until the integration is submitted to
-          # home-assistant/brands.
-          ignore: brands
+          # home-assistant/brands. Topics and images are also skipped:
+          # this is a custom HACS repo, not a default-store listing,
+          # so repo topics are optional, and the README's only images
+          # are CI badges.
+          ignore: brands topics images

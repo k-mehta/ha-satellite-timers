@@ -45,7 +45,10 @@ jobs:
               assert required in manifest, f"manifest missing {required}"
           hacs = json.loads(Path("hacs.json").read_text())
           assert hacs["name"] == manifest["name"]
-          assert hacs["homeassistant"] == manifest["min_hass_version"]
+          # The minimum Home Assistant version lives only in hacs.json
+          # ("homeassistant"); the manifest must not carry min_hass_version
+          # (not a valid manifest key in current Home Assistant).
+          assert "min_hass_version" not in manifest
           PY
       - name: Install PyYAML for services metadata check
         run: python3 -c "import yaml" 2>/dev/null || pip install -q pyyaml

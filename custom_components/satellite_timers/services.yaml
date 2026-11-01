@@ -1,0 +1,78 @@
+pause_timer:
+  name: Pause timer
+  description: Pause a running voice timer.
+  fields:
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+resume_timer:
+  name: Resume timer
+  description: Resume a paused voice timer.
+  fields:
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+cancel_timer:
+  name: Cancel timer
+  description: Cancel a voice timer. The bridge sensor disappears.
+  fields:
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+add_time:
+  name: Add time
+  description: Add time to a running or paused voice timer.
+  fields:
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+    minutes:
+      name: Minutes
+      description: Whole minutes to add.
+      required: false
+      default: 0
+      example: 1
+    seconds:
+      name: Seconds
+      description: Seconds to add.
+      required: false
+      default: 0
+      example: 30
+dismiss_timer:
+  name: Dismiss timer
+  description: Clear a finished timer. The bridge sensor disappears. A timer that is still running cannot be dismissed; cancel it instead.
+  fields:
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+restart_timer:
+  name: Restart timer
+  description: Start a finished timer again, for the same duration unless minutes or seconds override it.
+  fields:
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+    minutes:
+      name: Minutes
+      description: Duration override, whole minutes. Omit to reuse the original duration.
+      required: false
+      default: 0
+      example: 10
+    seconds:
+      name: Seconds
+      description: Duration override, seconds. Omit to reuse the original duration.
+      required: false
+      default: 0
+      example: 0

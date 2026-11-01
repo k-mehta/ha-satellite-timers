@@ -1,0 +1,336 @@
+"""Satellite Timers: mirror Assist voice timers into sensor entities.
+
+Voice timers set on a satellite live in Home Assistant's memory only, so no
+card or automation can see them. This integration reads them through the
+bridge in ``bridge.py`` and exposes one sensor per timer, which a dial card
+can then show. It never starts, pauses or cancels a timer on its own:
+voice behaviour is completely unchanged. It also registers services
+(pause_timer, resume_timer, cancel_timer, add_time, dismiss_timer,
+restart_timer) so a dashboard card can control a timer by its id, and a
+"dismiss the pasta timer" voice intent (see ``intents.py``) for the
+finished timers the built-in sentences cannot reach.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import voluptuous as vol
+
+from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.intent.timers import (
+    TimerNotFoundError,
+    TimersNotSupportedError,
+)
+from homeassistant.components.lovelace.const import LOVELACE_DATA
+from homeassistant.components.lovelace.resources import ResourceStorageCollection
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import intent as intent_helpers
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.collection import ItemNotFound
+
+from .bridge import SatelliteTimerBridge, assist_supported, timer_devices, timer_manager
+from .const import (
+    CARD_RESOURCE_TYPE,
+    CARD_URL,
+    CARD_URL_PATH,
+    CONF_DEVICES,
+    DOMAIN,
+    INTENT_DISMISS_TIMER,
+    SERVICE_ADD_TIME,
+    SERVICE_CANCEL_TIMER,
+    SERVICE_DISMISS_TIMER,
+    SERVICE_PAUSE_TIMER,
+    SERVICE_RESTART_TIMER,
+    SERVICE_RESUME_TIMER,
+)
+from .intents import DismissFinishedTimerIntentHandler, async_ensure_dismiss_sentences
+
+_LOGGER = logging.getLogger(__name__)
+
+PLATFORMS = [Platform.SENSOR]
+
+_TIMER_ID_SCHEMA = vol.Schema({vol.Required("timer_id"): cv.string})
+_ADD_TIME_SCHEMA = vol.Schema(
+    {
+        vol.Required("timer_id"): cv.string,
+        vol.Optional("minutes", default=0): vol.All(
+            vol.Coerce(int), vol.Range(min=0)
+        ),
+        vol.Optional("seconds", default=0): vol.All(
+            vol.Coerce(int), vol.Range(min=0)
+        ),
+    }
+)
+_RESTART_SCHEMA = _ADD_TIME_SCHEMA
+
+
+def _register_dismiss_intent(hass: HomeAssistant) -> None:
+    """Register the "dismiss the pasta timer" voice intent, once.
+
+    The intent is global (not per entry), so a reload must not register
+    it twice — the flag lives next to the other per-process state.
+    """
+    data = hass.data.setdefault(DOMAIN, {})
+    if data.get("dismiss_intent_registered"):
+        return
+    intent_helpers.async_register(hass, DismissFinishedTimerIntentHandler())
+    data["dismiss_intent_registered"] = True
+
+
+def _unregister_dismiss_intent(hass: HomeAssistant) -> None:
+    """Remove the dismiss intent, if this integration registered it."""
+    data = hass.data.get(DOMAIN, {})
+    if not data.pop("dismiss_intent_registered", False):
+        return
+    intent_helpers.async_remove(hass, INTENT_DISMISS_TIMER)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Satellite Timers from a config entry."""
+    if timer_manager(hass) is None:
+        raise ConfigEntryNotReady("Assist timer manager is not ready yet")
+
+    if not assist_supported(hass):
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "assist_unsupported",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="assist_unsupported",
+        )
+        return False
+
+    device_ids = entry.options.get(CONF_DEVICES) or entry.data.get(CONF_DEVICES)
+    if not device_ids:
+        device_ids = timer_devices(hass)
+
+    bridge = SatelliteTimerBridge(hass, device_ids)
+    if not bridge.start():
+        return False
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"bridge": bridge}
+
+    _register_services(hass, entry, bridge)
+    _register_dismiss_intent(hass)
+
+    try:
+        await async_ensure_dismiss_sentences(hass)
+    except Exception:  # voice dismissal is optional; sensors must not fail
+        _LOGGER.warning(
+            "Could not install the dismiss sentences", exc_info=True
+        )
+
+    try:
+        resource_id = await _async_register_frontend(hass)
+    except Exception:  # the card is optional; sensors must not fail with it
+        _LOGGER.warning("Could not register the timer screen card", exc_info=True)
+        resource_id = None
+    hass.data[DOMAIN][entry.entry_id]["resource_id"] = resource_id
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    entry.async_on_unload(entry.add_update_listener(_update_listener))
+
+    return True
+
+
+async def _async_register_frontend(hass: HomeAssistant) -> str | None:
+    """Serve the timer screen card and add its Lovelace resource.
+
+    Returns the resource id, or None when Lovelace is not running in
+    storage mode (or is not loaded at all) — the sensors still work.
+    The static path is registered once per Home Assistant process; the
+    resource is added only if no item with our URL is already present,
+    so a reload never duplicates it.
+    """
+    data = hass.data.setdefault(DOMAIN, {})
+    if not data.get("frontend_static_path"):
+        www_path = Path(__file__).resolve().parent / "www"
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(CARD_URL_PATH, str(www_path), False)]
+        )
+        data["frontend_static_path"] = True
+
+    lovelace_data = hass.data.get(LOVELACE_DATA)
+    if lovelace_data is None:
+        _LOGGER.warning(
+            "Lovelace is not loaded; the timer screen card was not registered"
+        )
+        return None
+    collection = lovelace_data.resources
+    if not isinstance(collection, ResourceStorageCollection):
+        _LOGGER.warning(
+            "Lovelace is running in YAML mode; the timer screen card was "
+            "not registered"
+        )
+        return None
+    await collection.async_load()
+    for item in collection.async_items():
+        if item.get("url") == CARD_URL:
+            return item["id"]
+    item = await collection.async_create_item(
+        {"res_type": CARD_RESOURCE_TYPE, "url": CARD_URL}
+    )
+    return item["id"]
+
+
+async def _async_unregister_frontend(
+    hass: HomeAssistant, resource_id: str | None
+) -> None:
+    """Remove the Lovelace resource added for this entry, if we added one."""
+    if resource_id is None:
+        return
+    lovelace_data = hass.data.get(LOVELACE_DATA)
+    if lovelace_data is None:
+        return
+    collection = lovelace_data.resources
+    if not isinstance(collection, ResourceStorageCollection):
+        return
+    await collection.async_load()
+    try:
+        await collection.async_delete_item(resource_id)
+    except ItemNotFound:
+        pass
+
+
+def _register_services(
+    hass: HomeAssistant, entry: ConfigEntry, bridge: SatelliteTimerBridge
+) -> None:
+    """Register the timer control services for this entry.
+
+    The services act on a timer by its id (the id a bridge sensor carries
+    in its ``timer_id`` attribute), so they work even when several timers
+    share a name — the voice intents cannot tell those apart. Only timers
+    on the satellites this entry mirrors can be controlled.
+    """
+
+    def resolve(timer_id: str):
+        tm = timer_manager(hass)
+        if tm is None:
+            raise HomeAssistantError("Assist timer manager is not available")
+        timer = tm.timers.get(timer_id)
+        if timer is None:
+            raise HomeAssistantError(f"Timer {timer_id} not found")
+        if timer.device_id not in bridge.devices:
+            raise HomeAssistantError("Timer is not on a configured satellite")
+        return tm, timer
+
+    async def handle_pause(call) -> None:
+        tm, timer = resolve(call.data["timer_id"])
+        try:
+            tm.pause_timer(timer.id)
+        except TimerNotFoundError:
+            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+
+    async def handle_resume(call) -> None:
+        tm, timer = resolve(call.data["timer_id"])
+        try:
+            tm.unpause_timer(timer.id)
+        except TimerNotFoundError:
+            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+
+    async def handle_cancel(call) -> None:
+        tm, timer = resolve(call.data["timer_id"])
+        try:
+            tm.cancel_timer(timer.id)
+        except TimerNotFoundError:
+            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+
+    async def handle_add_time(call) -> None:
+        tm, timer = resolve(call.data["timer_id"])
+        total = call.data["minutes"] * 60 + call.data["seconds"]
+        if total == 0:
+            return
+        try:
+            tm.add_time(timer.id, total)
+        except TimerNotFoundError:
+            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+
+    async def handle_dismiss(call) -> None:
+        try:
+            bridge.dismiss_timer(call.data["timer_id"])
+        except ValueError:
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} is still running — "
+                "cancel it instead"
+            ) from None
+        except KeyError:
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+
+    async def handle_restart(call) -> None:
+        try:
+            bridge.restart_timer(
+                call.data["timer_id"],
+                minutes=call.data["minutes"],
+                seconds=call.data["seconds"],
+            )
+        except KeyError:
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except TimersNotSupportedError:
+            raise HomeAssistantError(
+                "The satellite no longer supports timers"
+            ) from None
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_PAUSE_TIMER, handle_pause, schema=_TIMER_ID_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RESUME_TIMER, handle_resume, schema=_TIMER_ID_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_CANCEL_TIMER, handle_cancel, schema=_TIMER_ID_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_ADD_TIME, handle_add_time, schema=_ADD_TIME_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_DISMISS_TIMER, handle_dismiss, schema=_TIMER_ID_SCHEMA
+    )
+    hass.services.async_register(
+        DOMAIN, SERVICE_RESTART_TIMER, handle_restart, schema=_RESTART_SCHEMA
+    )
+
+
+def _unregister_services(hass: HomeAssistant) -> None:
+    """Remove the timer control services."""
+    for service in (
+        SERVICE_PAUSE_TIMER,
+        SERVICE_RESUME_TIMER,
+        SERVICE_CANCEL_TIMER,
+        SERVICE_ADD_TIME,
+        SERVICE_DISMISS_TIMER,
+        SERVICE_RESTART_TIMER,
+    ):
+        hass.services.async_remove(DOMAIN, service)
+
+
+async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload when the chosen satellites change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry and put the satellite handlers back as found."""
+    data = hass.data[DOMAIN].pop(entry.entry_id, {})
+    if (bridge := data.get("bridge")) is not None:
+        bridge.stop()
+
+    _unregister_services(hass)
+    _unregister_dismiss_intent(hass)
+
+    await _async_unregister_frontend(hass, data.get("resource_id"))
+
+    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

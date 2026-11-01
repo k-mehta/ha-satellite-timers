@@ -1,0 +1,59 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile all integration modules
+        run: python -m compileall -q custom_components/satellite_timers
+      - name: Validate JSON metadata
+        run: |
+          python -m json.tool custom_components/satellite_timers/manifest.json > /dev/null
+          python -m json.tool hacs.json > /dev/null
+          python -m json.tool custom_components/satellite_timers/strings.json > /dev/null
+          python -m json.tool custom_components/satellite_timers/translations/en.json > /dev/null
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("custom_components/satellite_timers/manifest.json").read_text())
+          keys = list(manifest)
+          # Hassfest requires: domain, name, then the rest alphabetical.
+          assert keys[0] == "domain" and keys[1] == "name", f"manifest keys out of order: {keys}"
+          assert keys[2:] == sorted(keys[2:]), f"manifest keys out of order: {keys}"
+          for required in ("codeowners", "documentation", "issue_tracker", "version"):
+              assert required in manifest, f"manifest missing {required}"
+          hacs = json.loads(Path("hacs.json").read_text())
+          assert hacs["name"] == manifest["name"]
+          assert hacs["homeassistant"] == manifest["min_hass_version"]
+          PY
+      - name: Install PyYAML for services metadata check
+        run: python3 -c "import yaml" 2>/dev/null || pip install -q pyyaml
+      - name: Validate services metadata
+        run: python3 -c "import yaml; d = yaml.safe_load(open('custom_components/satellite_timers/services.yaml')); assert set(d) == {'pause_timer', 'resume_timer', 'cancel_timer', 'add_time', 'dismiss_timer', 'restart_timer'}, sorted(d)"
+      - name: Check timer-screen card syntax
+        run: node --check custom_components/satellite_timers/www/timer-screen-card.js
+      - name: Run bridge smoke tests
+        run: |
+          python3 test_bridge.py
+          python3 test_sensor_device_info.py

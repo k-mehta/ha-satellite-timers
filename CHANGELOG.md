@@ -5,7 +5,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
 
-## [Unreleased]
+## [0.1.11] - 2026-11-02
 
 ### Added
 
@@ -99,7 +99,9 @@ Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
   (`active` / `paused` / `finished`), one sensor per timer, with the
   timer-screen Lovelace card bundled in.
 
-[Unreleased]: https://github.com/k-mehta/ha-satellite-timers/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/k-mehta/ha-satellite-timers/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/k-mehta/ha-satellite-timers/releases/tag/v0.1.11
+[0.1.10]: https://github.com/k-mehta/ha-satellite-timers/releases/tag/v0.1.10
 [0.1.9]: https://github.com/k-mehta/ha-satellite-timers/releases/tag/v0.1.9
 [0.1.8]: https://github.com/k-mehta/ha-satellite-timers/releases/tag/v0.1.8
 [0.1.7]: https://github.com/k-mehta/ha-satellite-timers/releases/tag/v0.1.7

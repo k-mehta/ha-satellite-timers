@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # The auto-tag workflow starts a release this way: a tag pushed with
+  # GITHUB_TOKEN does not trigger other workflows, so auto-tag dispatches
+  # this workflow on the new tag instead.
+  workflow_dispatch:
 
 permissions:
   contents: read

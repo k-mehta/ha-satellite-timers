@@ -10,10 +10,9 @@ const CANCEL_ARM_MS = 4000;
 const ENTER_ANIMATION_MS = 240;
 // Space reserved below each dial for its always-visible buttons, so the
 // dial never overlaps them. The tallest button row is 80px plus a 12px
-// gap and a little slack.
-const CONTROLS_RESERVE_PX = 100;
-// Padding around the screen, all sides (used in the dial sizing below).
-const SCREEN_PADDING_PX = 24;
+// gap and a little slack. It is a CSS variable on .screen (100px on the
+// hub) so the desktop and mobile layouts can reserve less for their
+// shorter buttons.
 
 function displayName(stateObj) {
   const attrs = (stateObj && stateObj.attributes) || {};
@@ -96,15 +95,131 @@ function shortName(name) {
   return name.slice(0, 17) + "…";
 }
 
-// How many columns the landscape grid uses. One to three timers stay in
-// a single row; four split into a 2x2 square so the dials stay big;
-// five and up use three columns, rows as needed. Portrait ignores this
-// — the vertical stack is the only layout there.
-function gridColumns(count) {
+// How many columns the landscape grid uses, by device category. On the
+// hub one to three timers stay in a single row; four split into a 2x2
+// square so the dials stay big; five and up use three columns, rows as
+// needed. Desktop is denser: up to four in a row, four columns past
+// that. Mobile keeps the hub mapping in landscape; portrait ignores
+// this — the vertical stack is the only layout there.
+function gridColumns(count, category) {
+  if (category === "desktop") {
+    if (count <= 1) return 1;
+    if (count <= 4) return count;
+    return 4;
+  }
   if (count <= 1) return 1;
   if (count <= 3) return count;
   if (count === 4) return 2;
   return 3;
+}
+
+// -- Device detection (SHARED MECHANISM) ----------------------------------
+//
+// The same detection runs in the AnyList recipe card
+// (k-mehta/ha-anylist-recipe-card) and the Satellite Timers card
+// (k-mehta/ha-satellite-timers). It is ONE mechanism, copied verbatim
+// into each card file: each card is a single standalone file with no
+// imports, so the code cannot be shared by import — the two copies must
+// stay identical. If you change the signals, the precedence, or the
+// category names here, change them in the other card too, and update
+// ADAPTIVE-LAYOUT.md (which is also identical in both repos).
+//
+// Signals (all read from the browser the card is running in):
+//   viewport width/height — the strongest signal; the layout follows
+//     the viewport, not the device name.
+//   pointer type — matchMedia("(pointer: coarse)") is a finger/touch
+//     screen; "(pointer: fine)" is a mouse/trackpad.
+//   touch — "ontouchstart" in window, or navigator.maxTouchPoints > 0.
+//   user agent — only as a tiebreaker for phones/tablets, never alone:
+//     a desktop browser can spoof it, and a kiosk can strip it.
+//
+// Precedence (first match wins):
+//   1. A phone/tablet user agent ("Mobi", "Android", "iPhone", "iPad",
+//      "iPod") is mobile.
+//   2. A viewport narrower than 768px is mobile (a narrow desktop
+//      window gets the single-column layout too — the layout follows
+//      the viewport).
+//   3. A coarse pointer on anything but a huge landscape screen is
+//      mobile (phones and tablets).
+//   4. A coarse pointer on a landscape screen at least 1600px wide is
+//      the hub: the kitchen kiosk is a 1920x1200 touch display.
+//   5. A fine pointer is desktop.
+//   6. With no pointer information: a touch screen that is landscape
+//      and at least 1600px wide is the hub; a viewport at least 1024px
+//      wide is desktop; anything else is mobile.
+//
+// Known limits (every fallback still renders a usable layout, never a
+// broken one):
+//   - A desktop touchscreen at 1920x1200 reads as the hub. That is
+//     fine: the hub layout is just big targets on a wide screen.
+//   - A phone in desktop mode (no mobile user agent) still reads as
+//     mobile by width (rule 2).
+//   - The hub is recognised by size + touch + landscape, not by name:
+//     if the kiosk display changes size, the thresholds above are the
+//     place to adjust.
+//
+// Orientation is separate from category: landscape is width >= height,
+// portrait is width < height. The category picks the control sizes and
+// the base layout; orientation picks the grid (e.g. one column in
+// portrait, two in landscape on mobile).
+
+const HUB_MIN_WIDTH_PX = 1600;
+const MOBILE_MAX_WIDTH_PX = 768;
+const DESKTOP_MIN_WIDTH_PX = 1024;
+const MOBILE_USER_AGENT = /Mobi|Android|iPhone|iPad|iPod/i;
+
+// The device the card is running on, from a plain environment object
+// (width/height in CSS pixels, pointer flags, touch flag, user agent).
+// Pure — no browser access — so it is unit-testable in node. Returns
+// { category: "hub" | "desktop" | "mobile", orientation:
+// "landscape" | "portrait" }.
+function detectDevice(env) {
+  const width = Number((env && env.width) || 0);
+  const height = Number((env && env.height) || 0);
+  const orientation = width >= height ? "landscape" : "portrait";
+  const userAgent = String((env && env.userAgent) || "");
+  const coarse = Boolean(env && env.coarsePointer);
+  const fine = Boolean(env && env.finePointer);
+  const touch = Boolean(env && env.touch);
+  let category;
+  if (MOBILE_USER_AGENT.test(userAgent)) category = "mobile";
+  else if (width < MOBILE_MAX_WIDTH_PX) category = "mobile";
+  else if (coarse && !(width >= HUB_MIN_WIDTH_PX && orientation === "landscape"))
+    category = "mobile";
+  else if (coarse) category = "hub";
+  else if (fine) category = "desktop";
+  else if (touch && width >= HUB_MIN_WIDTH_PX && orientation === "landscape")
+    category = "hub";
+  else if (width >= DESKTOP_MIN_WIDTH_PX) category = "desktop";
+  else category = "mobile";
+  return { category, orientation };
+}
+
+// The environment the card is actually running in, read from the
+// browser. Returns null outside a browser (node tests), where the card
+// keeps its base layout and detectDevice is never called.
+function readDeviceEnv() {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return null;
+  }
+  const coarse =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches;
+  const fine =
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: fine)").matches;
+  const touch =
+    "ontouchstart" in window ||
+    (typeof navigator.maxTouchPoints === "number" &&
+      navigator.maxTouchPoints > 0);
+  return {
+    width: window.innerWidth,
+    height: window.innerHeight,
+    coarsePointer: coarse,
+    finePointer: fine,
+    touch,
+    userAgent: navigator.userAgent || "",
+  };
 }
 
 const CARD_CSS = `
@@ -118,6 +233,7 @@ const CARD_CSS = `
     flex-direction: column;
     gap: 16px;
     background: transparent;
+    --controls-reserve: 100px;
   }
   /* The hub display is landscape (1920x1200): timers sit in a grid —
      one row of up to three, then a balanced grid (at most three
@@ -129,6 +245,7 @@ const CARD_CSS = `
     .screen.cols-1 { grid-template-columns: repeat(1, 1fr); }
     .screen.cols-2 { grid-template-columns: repeat(2, 1fr); }
     .screen.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .screen.cols-4 { grid-template-columns: repeat(4, 1fr); }
     .dial { min-width: 0; }
     .empty { grid-column: 1 / -1; }
   }
@@ -147,7 +264,7 @@ const CARD_CSS = `
     to { opacity: 1; transform: scale(1); }
   }
   .dial-button {
-    height: min(calc(100% - ${CONTROLS_RESERVE_PX}px), calc(100vmin - 48px));
+    height: min(calc(100% - var(--controls-reserve)), calc(100vmin - 48px));
     aspect-ratio: 1;
     max-width: 100%;
     padding: 0;
@@ -172,9 +289,9 @@ const CARD_CSS = `
      specificity, so the later rule wins for the properties it sets. */
   @media (orientation: landscape) {
     .dial-button {
-      width: min(100%, calc(100vh - ${CONTROLS_RESERVE_PX + 2 * SCREEN_PADDING_PX}px));
+      width: min(100%, calc(100vh - var(--controls-reserve) - 48px));
       height: auto;
-      max-height: calc(100% - ${CONTROLS_RESERVE_PX}px);
+      max-height: calc(100% - var(--controls-reserve));
     }
   }
   .dial-button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 4px; border-radius: 50%; }
@@ -241,6 +358,28 @@ const CARD_CSS = `
   }
   .empty[hidden] { display: none; }
   .empty svg { width: 72px; height: 72px; opacity: 0.6; margin-bottom: 12px; }
+  /* -- Adaptive layout --------------------------------------------------
+     The card detects its device (see detectDevice) and carries the
+     category + orientation as classes on .screen: dev-hub, dev-desktop
+     or dev-mobile, and orient-landscape or orient-portrait. The rules
+     above ARE the hub layout (1920x1200 kitchen kiosk: big dials, big
+     touch targets); the rules below only adjust for desktop and mobile.
+     A card with no device classes (no browser environment) renders the
+     hub layout. */
+  /* Desktop: a mouse is precise, so the buttons shrink and the grid
+     gets denser — up to four dials in a row (see gridColumns). The
+     reserve below each dial shrinks with the buttons. */
+  .screen.dev-desktop { --controls-reserve: 68px; }
+  .screen.dev-desktop .controls button { min-height: 56px; font-size: 18px; padding: 8px; }
+  .screen.dev-desktop .empty { font-size: clamp(18px, 3vmin, 26px); }
+  /* Mobile: touch targets stay large (a finger is not a mouse) and the
+     buttons stay reachable. In portrait the dials stack; each dial
+     keeps a minimum height so its time stays readable, and the screen
+     scrolls when five timers need more room than the phone has. */
+  .screen.dev-mobile { --controls-reserve: 76px; }
+  .screen.dev-mobile .controls button { min-height: 64px; font-size: 18px; }
+  .screen.dev-mobile.orient-portrait { overflow-y: auto; }
+  .screen.dev-mobile.orient-portrait .dial { min-height: 230px; }
 `;
 
 class TimerScreenCard extends HTMLElement {
@@ -257,6 +396,8 @@ class TimerScreenCard extends HTMLElement {
     this._dialEls = new Map();
     this._screenEl = null;
     this._emptyEl = null;
+    this._device = null; // { category, orientation } from detectDevice, or null outside a browser.
+    this._resizeBound = null;
     this.attachShadow({ mode: "open" });
     this.shadowRoot.addEventListener("click", (event) => this._onClick(event));
   }
@@ -295,10 +436,69 @@ class TimerScreenCard extends HTMLElement {
   connectedCallback() {
     this._stopTick();
     this._tick = setInterval(() => this._updateTimes(), 500);
+    // The layout follows the viewport: a resize or an orientation
+    // change re-detects the device and re-syncs the grid.
+    if (
+      typeof window !== "undefined" &&
+      typeof window.addEventListener === "function" &&
+      !this._resizeBound
+    ) {
+      this._resizeBound = () => this._onResize();
+      window.addEventListener("resize", this._resizeBound);
+    }
   }
 
   disconnectedCallback() {
     this._stopTick();
+    if (
+      typeof window !== "undefined" &&
+      this._resizeBound &&
+      typeof window.removeEventListener === "function"
+    ) {
+      window.removeEventListener("resize", this._resizeBound);
+      this._resizeBound = null;
+    }
+  }
+
+  _onResize() {
+    // Re-sync only when the device actually changed: a category change
+    // moves the grid columns, an orientation change moves the layout.
+    const before = this._device;
+    this._applyDevice();
+    const after = this._device;
+    if (
+      before &&
+      after &&
+      (before.category !== after.category ||
+        before.orientation !== after.orientation)
+    ) {
+      this._sync();
+    }
+  }
+
+  // Detect the device and carry it as classes on the screen element:
+  // dev-hub, dev-desktop or dev-mobile, plus orient-landscape or
+  // orient-portrait. The CSS keys the adaptive layout off these
+  // classes; the base rules are the hub layout. Outside a browser
+  // (node tests) there is no environment to read, so the classes are
+  // left off and the base layout stands.
+  _applyDevice() {
+    if (!this._screenEl) return;
+    const env = readDeviceEnv();
+    if (!env) return;
+    const device = detectDevice(env);
+    this._device = device;
+    this._screenEl.classList.remove(
+      "dev-hub",
+      "dev-desktop",
+      "dev-mobile",
+      "orient-landscape",
+      "orient-portrait"
+    );
+    this._screenEl.classList.add(
+      `dev-${device.category}`,
+      `orient-${device.orientation}`
+    );
   }
 
   _stopTick() {
@@ -334,6 +534,7 @@ class TimerScreenCard extends HTMLElement {
 
   _sync() {
     if (!this._screenEl) return;
+    this._applyDevice();
     const now = Date.now();
     const live = new Set(this._timers.map((t) => t.timer_id));
 
@@ -364,8 +565,10 @@ class TimerScreenCard extends HTMLElement {
     }
 
     this._emptyEl.hidden = this._timers.length > 0;
-    this._screenEl.classList.remove("cols-1", "cols-2", "cols-3");
-    this._screenEl.classList.add(`cols-${gridColumns(this._timers.length)}`);
+    this._screenEl.classList.remove("cols-1", "cols-2", "cols-3", "cols-4");
+    this._screenEl.classList.add(
+      `cols-${gridColumns(this._timers.length, this._device ? this._device.category : undefined)}`
+    );
     this._flip(before);
   }
 
@@ -599,6 +802,8 @@ if (typeof module !== "undefined" && module.exports) {
     progressFraction,
     discoverTimers,
     gridColumns,
+    detectDevice,
+    readDeviceEnv,
     TimerScreenCard,
   };
 }

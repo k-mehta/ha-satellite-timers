@@ -130,6 +130,16 @@ dismiss it by tapping the dial ("Tap to dismiss" is written in the
 ring) or by voice. Put it as the only card on a panel-mode view:
 Add card → Manual → paste `type: custom:timer-screen`.
 
+The card adapts to the device it runs on — hub kiosk, desktop, or
+phone/tablet, portrait or landscape — and re-detects on resize or
+rotation. The hub (1920×1200 landscape touch display) keeps the big
+dials and kitchen-grade targets above; a desktop gets a denser grid
+(up to four timers in a row) with smaller buttons; a phone gets
+readable dials that scroll vertically instead of shrinking (at least
+230 px tall in portrait) and 64 px buttons. See
+[ADAPTIVE-LAYOUT.md](ADAPTIVE-LAYOUT.md) for the detection mechanism
+(shared with the AnyList recipe card) and the layout per device.
+
 The sensors also give automations something to trigger on: a sensor
 turning `active` means a timer started; no `active`, `paused` or
 `finished` sensors means all timers are done.

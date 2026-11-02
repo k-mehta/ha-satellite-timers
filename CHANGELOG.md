@@ -7,6 +7,20 @@ Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
 
 ## [Unreleased]
 
+### Added
+
+- Adaptive layout for the timer-screen card: it detects whether it
+  runs on the hub kiosk (1920×1200 touch display), a desktop, or a
+  phone/tablet, in portrait or landscape, and changes control sizes and
+  layout for that device (see ADAPTIVE-LAYOUT.md). The hub layout is
+  unchanged (big dials, 80 px Cancel); desktop gets a denser grid (up
+  to four timers in a row) with 56 px buttons; mobile keeps the hub
+  grid with 64 px buttons, and in portrait the dials stay at least
+  230 px tall with the screen scrolling instead of shrinking them.
+  Detection re-runs on resize/rotation. The detection mechanism is
+  shared verbatim with the AnyList recipe card
+  (`k-mehta/ha-anylist-recipe-card`).
+
 ## [0.1.10] - 2026-11-01
 
 ### Fixed

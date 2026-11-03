@@ -5,6 +5,19 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
 
+## [0.1.12] - 2026-11-02
+
+### Fixed
+
+- Dismissing a finished timer now tells the satellite to stop ringing.
+  Previously dismiss only cleared the dashboard sensor: the satellite
+  keeps ringing until its timer handler hears a CANCELLED event, and
+  Home Assistant never sends one for a timer that already finished
+  (it pops the timer from the TimerManager the moment it goes off).
+  Dismiss now sends CANCELLED for that timer to the satellite's
+  handler, so tapping the dial (or saying "dismiss the timer") silences
+  the alarm as well as clearing the sensor.
+
 ## [0.1.11] - 2026-11-02
 
 ### Added

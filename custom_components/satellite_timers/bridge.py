@@ -339,12 +339,20 @@ class SatelliteTimerBridge:
     def dismiss_timer(self, timer_id: str) -> TimerSnapshot:
         """Drop a finished timer's record so its sensor disappears.
 
+        Dismissing also tells the satellite to stop ringing: the
+        satellite only stops its alarm when its timer handler hears
+        a CANCELLED event, and nothing else sends one for a timer
+        that already finished (Home Assistant pops it from the
+        TimerManager the moment it goes off). Clearing only the
+        bridge's record leaves the satellite ringing.
+
         Raises KeyError when there is no such timer at all, and ValueError
         when the timer is still running (cancel it instead — a running
         timer has not finished, so there is nothing to dismiss).
         """
         finished = self._finished.pop(timer_id, None)
         if finished is not None:
+            self._stop_satellite_ringing(finished)
             self._notify_listeners()
             return finished
 
@@ -352,6 +360,66 @@ class SatelliteTimerBridge:
         if tm is not None and timer_id in tm.timers:
             raise ValueError(f"Timer {timer_id} is still running")
         raise KeyError(timer_id)
+
+    def _stop_satellite_ringing(self, finished: TimerSnapshot) -> None:
+        """Tell the satellite its finished timer is over, so it stops ringing.
+
+        The satellite's timer handler is what starts the alarm when it
+        hears FINISHED, and only a CANCELLED event for the same timer
+        stops it. Home Assistant never sends one for a timer that
+        already finished, so the bridge sends it here, rebuilding a
+        finished TimerInfo from its own record. A failure to reach the
+        satellite never breaks the dismiss itself (the sensor is
+        already cleared) — it is logged instead.
+        """
+        if finished.device_id is None:
+            return
+        try:
+            from homeassistant.components.intent.timers import (
+                TimerEventType,
+                TimerInfo,
+            )
+        except ImportError:
+            _LOGGER.warning(
+                "Could not import TimerInfo/TimerEventType; the satellite "
+                "for finished timer %s was not told to stop ringing",
+                finished.timer_id,
+            )
+            return
+
+        tm = timer_manager(self._hass)
+        if tm is None:
+            return
+        handler = tm.handlers.get(finished.device_id)
+        if handler is None:
+            return
+
+        now_ns = time.monotonic_ns()
+        timer = TimerInfo(
+            id=finished.timer_id,
+            name=finished.name or None,
+            seconds=finished.total_seconds,
+            device_id=finished.device_id,
+            start_hours=None,
+            start_minutes=None,
+            start_seconds=None,
+            created_at=now_ns,
+            updated_at=now_ns,
+            language=finished.language,
+        )
+        # A finished timer: no time left, not ticking. finish() sets
+        # seconds to 0 and is_active to False while keeping the
+        # created duration, matching what the TimerManager produced.
+        timer.finish()
+        try:
+            handler(TimerEventType.CANCELLED, timer)
+        except Exception:
+            _LOGGER.warning(
+                "Could not tell the satellite for finished timer %s to "
+                "stop ringing",
+                finished.timer_id,
+                exc_info=True,
+            )
 
     def restart_timer(
         self, timer_id: str, minutes: int = 0, seconds: int = 0

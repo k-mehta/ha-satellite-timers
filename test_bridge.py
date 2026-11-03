@@ -13,8 +13,10 @@ import importlib.util
 import sys
 import time
 import types
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path
 
 # ---------------------------------------------------------------- stubs
@@ -31,6 +33,64 @@ ha_pkg = types.ModuleType("homeassistant")
 ha_pkg.core = ha_core
 sys.modules["homeassistant"] = ha_pkg
 sys.modules["homeassistant.core"] = ha_core
+
+
+class _FakeTimerEventType(StrEnum):
+    STARTED = "started"
+    UPDATED = "updated"
+    CANCELLED = "cancelled"
+    FINISHED = "finished"
+
+
+@dataclass
+class _FakeTimerInfo:
+    """Stand-in for Home Assistant's TimerInfo (enough for the bridge)."""
+
+    id: str
+    name: str | None
+    seconds: int
+    device_id: str | None
+    start_hours: int | None
+    start_minutes: int | None
+    start_seconds: int | None
+    created_at: int
+    updated_at: int
+    language: str
+    is_active: bool = True
+    _created_seconds: int = field(default=0, repr=False)
+
+    def __post_init__(self):
+        self._created_seconds = self.seconds
+
+    @property
+    def seconds_left(self):
+        if not self.is_active:
+            return self.seconds
+        now = time.monotonic_ns()
+        seconds_running = int((now - self.updated_at) / 1e9)
+        return max(0, self.seconds - seconds_running)
+
+    @property
+    def created_seconds(self):
+        return self._created_seconds
+
+    def finish(self):
+        self.seconds = 0
+        self.updated_at = time.monotonic_ns()
+        self.is_active = False
+
+
+ha_components = types.ModuleType("homeassistant.components")
+ha_intent = types.ModuleType("homeassistant.components.intent")
+ha_timers = types.ModuleType("homeassistant.components.intent.timers")
+ha_timers.TimerEventType = _FakeTimerEventType
+ha_timers.TimerInfo = _FakeTimerInfo
+ha_components.intent = ha_intent
+ha_intent.timers = ha_timers
+ha_pkg.components = ha_components
+sys.modules["homeassistant.components"] = ha_components
+sys.modules["homeassistant.components.intent"] = ha_intent
+sys.modules["homeassistant.components.intent.timers"] = ha_timers
 
 BRIDGE_PATH = Path(__file__).parent / "custom_components" / "satellite_timers" / "bridge.py"
 spec = importlib.util.spec_from_file_location("bridge_under_test", BRIDGE_PATH)
@@ -125,10 +185,13 @@ check("supported: handlers not a dict",
 
 # --- tap: original first, listener notified ---------------------------
 calls: list[str] = []
+cancelled_timers: list = []
 
 
 def original_handler(event_type, timer):
     calls.append(f"original:{event_type}")
+    if str(event_type) == "cancelled":
+        cancelled_timers.append(timer)
 
 
 mgr.handlers["dev1"] = original_handler
@@ -236,6 +299,19 @@ check("dismiss returns the finished snapshot",
 snap = b.snapshot(datetime.now(timezone.utc))
 check("dismissed timer leaves the snapshot", "01MNO" not in snap)
 check("other finished timer stays", "01ABC" in snap)
+# Dismissing a finished timer must tell the satellite to stop ringing:
+# the handler hears CANCELLED for that timer id, with a finished
+# TimerInfo (not active, nothing left, original duration kept).
+check("dismiss tells the satellite handler (cancelled event)",
+      "original:cancelled" in calls)
+check("dismiss cancelled the right timer",
+      len(cancelled_timers) == 1 and cancelled_timers[0].id == "01MNO")
+check("dismissed timer info is a finished timer",
+      cancelled_timers[0].is_active is False
+      and cancelled_timers[0].seconds_left == 0
+      and cancelled_timers[0].created_seconds == 120)
+check("dismissed timer info keeps the name",
+      cancelled_timers[0].name == "Eggs")
 
 try:
     b.dismiss_timer("01DEF")  # Tea is still running (paused, but live)

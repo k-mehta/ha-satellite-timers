@@ -89,6 +89,24 @@ def _write_dismiss_sentences(path: Path) -> None:
     path.write_text(DISMISS_SENTENCES_YAML, encoding="utf-8")
 
 
+def _describe_finished(snapshot: TimerSnapshot) -> str:
+    """One finished timer, as spoken back: name + start time.
+
+    "Pasta started 6:02 PM" — the start time is what tells two timers
+    with the same name apart (TIMER-11). Without a start time the name
+    alone is listed.
+    """
+    label = snapshot.name or "Timer"
+    if snapshot.started_at is not None:
+        when = (
+            snapshot.started_at.astimezone()
+            .strftime("%I:%M %p")
+            .lstrip("0")
+        )
+        return f"{label} started {when}"
+    return label
+
+
 class DismissFinishedTimerIntentHandler(intent.IntentHandler):
     """Intent handler for dismissing a finished timer by voice.
 
@@ -96,6 +114,17 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
     timer has finished). A running timer is never dismissed by this intent
     — the response says so and points at "cancel" instead, because
     dismissing means "clear the done state", not "stop a running timer".
+
+    TIMER-11 (lists-and-asks, never silently picks): when several
+    finished timers match the name — or several have finished with no
+    name given — the handler does NOT pick one. It lists them by name
+    and start time ("Pasta started 6:02 PM, Pasta started 6:20 PM")
+    and asks which one, pointing at the Timers view for the
+    unambiguous tap. (The built-in cancel intent for RUNNING timers
+    already refuses to pick: Home Assistant raises
+    MultipleTimersMatchedError when several match by name. What core
+    does not do is list them — that listing for running timers is a
+    follow-up, since it would need replacing a core intent handler.)
     """
 
     intent_type = INTENT_DISMISS_TIMER
@@ -137,8 +166,14 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
             if len(matches) == 1:
                 target = matches[0]
             elif len(matches) > 1:
+                # TIMER-11: list them and ask — never silently pick one.
+                listed = "; ".join(
+                    _describe_finished(snapshot) for snapshot in matches
+                )
                 raise intent.IntentHandleError(
-                    f"There is more than one finished timer called {name}"
+                    f"There is more than one finished timer called "
+                    f"{name}: {listed}. I can't tell which one you mean "
+                    f"— dismiss the one you want from the Timers view"
                 )
             elif bridge.has_live_timer(device_id, str(name)):
                 raise intent.IntentHandleError(
@@ -154,8 +189,12 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
         elif not finished:
             raise intent.IntentHandleError("There are no finished timers to dismiss")
         else:
+            listed = "; ".join(
+                _describe_finished(snapshot) for snapshot in finished
+            )
             raise intent.IntentHandleError(
-                "There are several finished timers — say which one to dismiss"
+                f"There are several finished timers: {listed}. "
+                f"Say which one to dismiss"
             )
 
         bridge.dismiss_timer(target.timer_id)

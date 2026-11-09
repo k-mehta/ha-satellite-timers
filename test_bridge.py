@@ -153,6 +153,14 @@ class FakeTimerManager:
         timer = FakeTimerInfo(timer_id, name or "", total, device_id)
         timer.language = language
         self.timers[timer_id] = timer
+        # Like HA's TimerManager (intent/timers.py): the STARTED event
+        # fires synchronously inside start_timer, before the id is
+        # returned — so a listener reading a snapshot during the call
+        # must already see the service-started mark. A fake that
+        # never calls the handler cannot catch ordering bugs.
+        handler = self.handlers.get(device_id)
+        if handler is not None and not conversation_command:
+            handler("started", timer)
         return timer_id
 
 
@@ -340,7 +348,21 @@ timer4 = FakeTimerInfo("01PQR", "Rice", 300, "dev1")
 mgr.timers["01PQR"] = timer4
 mgr.timers.pop("01PQR")
 mgr.handlers["dev1"]("finished", timer4)
+# The restart's new timer must be marked service-started during the
+# synchronous STARTED notification too (same in-flight flag path as
+# start_timer): the first snapshot captured after the new id appears
+# is the one taken inside that notification.
+during_r: list[dict] = []
+b.add_change_listener(
+    lambda: during_r.append(
+        {tid: s.started_via_service
+         for tid, s in b.snapshot(datetime.now(timezone.utc)).items()}
+    )
+)
 over_id = b.restart_timer("01PQR", minutes=5)
+first_with_new = next(c for c in during_r if over_id in c)
+check("restart marks service-started during the notification",
+      first_with_new.get(over_id) is True)
 over = b.snapshot(datetime.now(timezone.utc))[over_id]
 check("restart with override uses the override", over.total_seconds == 300)
 check("restart with override keeps the name", over.name == "Rice")
@@ -382,6 +404,372 @@ check("empty devices: start returns True", b3.start() is True)
 check("empty devices: handlers untouched", mgr2.handlers is orig2)
 check("empty devices: snapshot empty",
       b3.snapshot(datetime.now(timezone.utc)) == {})
+
+# --- start_timer (BRIDGE-1) ----------------------------------------------
+# The fake TimerManager must refuse a device with no handler, like the
+# real one (is_timer_device): a satellite that cannot take timers is
+# "unreachable", and the service must fail loudly.
+class _TimersNotSupportedError(Exception):
+    def __init__(self, device_id):
+        super().__init__(f"Device {device_id} does not support timers")
+        self.device_id = device_id
+
+
+ha_timers.TimersNotSupportedError = _TimersNotSupportedError
+
+
+_orig_start_timer = FakeTimerManager.start_timer
+
+
+def _guarded_start_timer(self, device_id, hours, minutes, seconds,
+                         language, name=None, conversation_command=None):
+    if (not conversation_command) and (device_id not in self.handlers):
+        raise _TimersNotSupportedError(device_id)
+    return _orig_start_timer(
+        self, device_id, hours, minutes, seconds, language,
+        name=name, conversation_command=conversation_command)
+
+
+FakeTimerManager.start_timer = _guarded_start_timer
+
+mgr_s = FakeTimerManager()
+hass_s = FakeHass(mgr_s)
+mgr_s.handlers["dev1"] = original_handler
+b_s = bridge.SatelliteTimerBridge(hass_s, ["dev1"])
+check("start_timer bridge starts", b_s.start() is True)
+new_id = b_s.start_timer("dev1", "Pasta", 600)
+check("start_timer returns an id", isinstance(new_id, str) and new_id)
+snap = b_s.snapshot(datetime.now(timezone.utc))
+check("start_timer timer is live", new_id in snap)
+check("start_timer keeps the name", snap[new_id].name == "Pasta")
+check("start_timer keeps the duration", snap[new_id].total_seconds == 600)
+check("start_timer is active", snap[new_id].is_active is True)
+check("start_timer marks service-started",
+      snap[new_id].started_via_service is True)
+# The mark must ALREADY be visible DURING the synchronous STARTED
+# notification, not only after start_timer returns: the timer-jump
+# automation reads the first state_changed event, which fires inside
+# that notification. Capture the snapshot from inside a listener and
+# check the very first capture made during the call.
+during: list[dict] = []
+b_s.add_change_listener(
+    lambda: during.append(
+        {tid: s.started_via_service
+         for tid, s in b_s.snapshot(datetime.now(timezone.utc)).items()}
+    )
+)
+during_id = b_s.start_timer("dev1", "Soup", 300)
+check("in-notification snapshot marks service-started",
+      bool(during) and during[0].get(during_id) is True)
+check("in-notification snapshot is the first capture, not a later one",
+      len(during) >= 1 and during_id in during[0])
+# A voice-cancelled service-started timer drops its mark (it must not
+# stay in _service_started forever).
+mgr_s.timers.pop(during_id)
+mgr_s.handlers["dev1"]("cancelled",
+                       FakeTimerInfo(during_id, "Soup", 300, "dev1"))
+check("cancelled service-started timer drops its mark",
+      during_id not in b_s._service_started)
+check("start_timer records started_at",
+      snap[new_id].started_at is not None
+      and abs((snap[new_id].finishes_at - snap[new_id].started_at)
+              .total_seconds() - 600) < 2)
+# Duplicates are accepted: same name, different id (TIMER-11).
+dup_id = b_s.start_timer("dev1", "Pasta", 300)
+check("start_timer accepts duplicate names", dup_id != new_id)
+snap = b_s.snapshot(datetime.now(timezone.utc))
+pastas = [s for s in snap.values() if s.name == "Pasta"]
+check("duplicate names both live", len(pastas) == 2)
+check("duplicate names distinct start times",
+      pastas[0].started_at != pastas[1].started_at)
+try:
+    b_s.start_timer("dev1", "Pasta", 0)
+    check("start_timer rejects zero duration", False)
+except ValueError:
+    check("start_timer rejects zero duration", True)
+try:
+    b_s.start_timer("dev9", "Pasta", 60)
+    check("start_timer rejects unconfigured device", False)
+except ValueError:
+    check("start_timer rejects unconfigured device", True)
+b_s2 = bridge.SatelliteTimerBridge(hass_s, ["dev1", "dev9"])
+check("start_timer bridge with unreachable device starts",
+      b_s2.start() is True)
+try:
+    b_s2.start_timer("dev9", "Pasta", 60)
+    check("start_timer raises for a device with no handler", False)
+except _TimersNotSupportedError:
+    check("start_timer raises for a device with no handler", True)
+b_s.stop()
+b_s2.stop()
+
+# --- persistence (BRIDGE-2) ----------------------------------------------
+import asyncio as _asyncio
+
+_LOOP = _asyncio.new_event_loop()
+
+
+class FakeStore:
+    """HA Store stand-in: async_load / async_save over a plain dict."""
+
+    def __init__(self, data=None):
+        self.data = data
+
+    async def async_load(self):
+        return self.data
+
+    async def async_save(self, data):
+        self.data = data
+
+
+class FakeHassWithTasks(FakeHass):
+    def async_create_task(self, coro):
+        return _LOOP.run_until_complete(coro)
+
+
+mgr_p = FakeTimerManager()
+hass_p = FakeHassWithTasks(mgr_p)
+mgr_p.handlers["dev1"] = original_handler
+store_p = FakeStore()
+b_p = bridge.SatelliteTimerBridge(hass_p, ["dev1"])
+check("persistence: load with no data restores 0",
+      _LOOP.run_until_complete(b_p.async_load_persisted(store_p)) == 0)
+check("persistence: bridge starts", b_p.start() is True)
+pasta_id = b_p.start_timer("dev1", "Pasta", 3600)
+rice_id = b_p.start_timer("dev1", "Rice", 600)
+rice_timer = mgr_p.timers[rice_id]
+rice_timer.pause()  # a paused timer, as in the item-68 fixture
+eggs = FakeTimerInfo("01EGG", "Eggs", 120, "dev1")
+mgr_p.timers["01EGG"] = eggs
+mgr_p.timers.pop("01EGG")
+mgr_p.handlers["dev1"]("finished", eggs)
+check("persistence: store was written",
+      isinstance(store_p.data, dict)
+      and len(store_p.data.get("timers", [])) == 3)
+by_id = {t["timer_id"]: t for t in store_p.data["timers"]}
+check("persistence: active timer stored active",
+      by_id[pasta_id]["state"] == "active")
+check("persistence: paused timer stored paused",
+      by_id[rice_id]["state"] == "paused"
+      and by_id[rice_id]["seconds_left"] == 600)
+check("persistence: finished timer stored finished",
+      by_id["01EGG"]["state"] == "finished")
+check("persistence: service mark stored",
+      by_id[pasta_id]["started_via_service"] is True)
+check("persistence: started_at stored",
+      by_id[pasta_id]["started_at"] is not None)
+
+# A fresh bridge with an EMPTY TimerManager restores all three.
+mgr_p2 = FakeTimerManager()
+hass_p2 = FakeHassWithTasks(mgr_p2)
+mgr_p2.handlers["dev1"] = original_handler
+b_p2 = bridge.SatelliteTimerBridge(hass_p2, ["dev1"])
+check("persistence: restore returns 3",
+      _LOOP.run_until_complete(b_p2.async_load_persisted(store_p)) == 3)
+check("persistence: restored bridge starts", b_p2.start() is True)
+snap2 = b_p2.snapshot(datetime.now(timezone.utc))
+check("persistence: all 3 timers back", len(snap2) == 3)
+check("persistence: restored Pasta active",
+      snap2[pasta_id].is_active is True and not snap2[pasta_id].is_finished)
+check("persistence: restored Rice paused",
+      snap2[rice_id].is_active is False and not snap2[rice_id].is_finished)
+check("persistence: restored Rice keeps remaining",
+      snap2[rice_id].seconds_left == 600)
+check("persistence: restored Eggs finished",
+      snap2["01EGG"].is_finished is True)
+check("persistence: restored Pasta keeps started_at",
+      snap2[pasta_id].started_at is not None)
+check("persistence: restored Pasta keeps service mark",
+      snap2[pasta_id].started_via_service is True)
+
+# Restored-timer controls work without the TimerManager (BRIDGE-2).
+paused = b_p2.pause_restored(pasta_id)
+check("restored pause freezes the timer", paused.is_active is False)
+resumed = b_p2.resume_restored(pasta_id)
+check("restored resume restarts the countdown",
+      resumed.is_active is True and resumed.finishes_at is not None)
+before = b_p2.snapshot(datetime.now(timezone.utc))[pasta_id].finishes_at
+b_p2.add_time_restored(pasta_id, 60)
+after = b_p2.snapshot(datetime.now(timezone.utc))[pasta_id].finishes_at
+check("restored add_time extends the finish",
+      (after - before).total_seconds() == 60)
+b_p2.cancel_restored(rice_id)
+snap2 = b_p2.snapshot(datetime.now(timezone.utc))
+check("restored cancel drops the timer", rice_id not in snap2)
+check("restored cancel keeps the others", pasta_id in snap2)
+try:
+    b_p2.pause_restored(rice_id)
+    check("restored op on a dropped timer raises KeyError", False)
+except KeyError:
+    check("restored op on a dropped timer raises KeyError", True)
+
+# A stored active timer whose finishes_at has passed restores as
+# finished (it went off while Home Assistant was down — TIMER-12).
+past = datetime.now(timezone.utc) - timedelta(minutes=5)
+store_past = FakeStore({
+    "version": 1,
+    "timers": [{
+        "timer_id": "01OLD", "name": "Soup", "device_id": "dev1",
+        "state": "active", "total_seconds": 600, "seconds_left": 0,
+        "finishes_at": past.isoformat(), "finished_at": None,
+        "started_at": (past - timedelta(seconds=600)).isoformat(),
+        "language": "en", "started_via_service": False,
+    }],
+})
+mgr_p3 = FakeTimerManager()
+hass_p3 = FakeHassWithTasks(mgr_p3)
+mgr_p3.handlers["dev1"] = original_handler
+b_p3 = bridge.SatelliteTimerBridge(hass_p3, ["dev1"])
+check("expired restore returns 1",
+      _LOOP.run_until_complete(b_p3.async_load_persisted(store_past)) == 1)
+b_p3.start()
+snap3 = b_p3.snapshot(datetime.now(timezone.utc))
+check("expired active restores as finished",
+      snap3["01OLD"].is_finished is True)
+check("expired restore keeps the true finish time",
+      snap3["01OLD"].finished_at == past)
+
+# --- P8-1: device churn must not erase persisted timers ---------------
+# The load path is the P8-1 scenario: storage holds timers for dev1,
+# the bridge now mirrors dev2 (re-pair / HA restore changed the device
+# id). The records must be kept in storage across saves, with no
+# sensor surfacing for the unknown device.
+now_p8 = datetime.now(timezone.utc)
+store_churn = FakeStore({
+    "version": 1,
+    "timers": [
+        {"timer_id": "01CHURN-A", "name": "ChurnActive", "device_id": "dev1",
+         "state": "active", "total_seconds": 600, "seconds_left": 500,
+         "finishes_at": (now_p8 + timedelta(seconds=500)).isoformat(),
+         "finished_at": None,
+         "started_at": (now_p8 - timedelta(seconds=100)).isoformat(),
+         "language": "en", "started_via_service": False},
+        {"timer_id": "01CHURN-F", "name": "ChurnDone", "device_id": "dev1",
+         "state": "finished", "total_seconds": 300, "seconds_left": 0,
+         "finishes_at": None,
+         "finished_at": (now_p8 - timedelta(minutes=2)).isoformat(),
+         "started_at": (now_p8 - timedelta(seconds=300)).isoformat(),
+         "language": "en", "started_via_service": True},
+    ],
+})
+mgr_c = FakeTimerManager()
+hass_c = FakeHassWithTasks(mgr_c)
+mgr_c.handlers["dev1"] = original_handler
+b_c = bridge.SatelliteTimerBridge(hass_c, ["dev2"])
+check("churn: load keeps unknown-device records",
+      _LOOP.run_until_complete(b_c.async_load_persisted(store_churn)) == 2)
+check("churn: bridge starts", b_c.start() is True)
+check("churn: no sensor surfaces for the unknown device",
+      b_c.snapshot(datetime.now(timezone.utc)) == {})
+b_c._notify_listeners()  # first save after the churn
+kept = {t["timer_id"] for t in store_churn.data["timers"]}
+check("churn: first save after churn preserves both records",
+      kept == {"01CHURN-A", "01CHURN-F"})
+# A second bridge loading the same store keeps them too, and a save
+# from it still preserves them.
+mgr_c2 = FakeTimerManager()
+hass_c2 = FakeHassWithTasks(mgr_c2)
+b_c2 = bridge.SatelliteTimerBridge(hass_c2, ["dev2"])
+check("churn: reload keeps unknown-device records",
+      _LOOP.run_until_complete(b_c2.async_load_persisted(store_churn)) == 2)
+b_c2.start()
+b_c2._notify_listeners()
+kept2 = {t["timer_id"] for t in store_churn.data["timers"]}
+check("churn: second save still preserves both records",
+      kept2 == {"01CHURN-A", "01CHURN-F"})
+# Retention bound: a finished record over 7 days old is pruned on
+# load; one 6 days old is kept.
+old = datetime.now(timezone.utc) - timedelta(days=8)
+recent = datetime.now(timezone.utc) - timedelta(days=6)
+store_old = FakeStore({
+    "version": 1,
+    "timers": [
+        {"timer_id": "01OLD8", "name": "Old", "device_id": "dev1",
+         "state": "finished", "total_seconds": 60, "seconds_left": 0,
+         "finishes_at": None, "finished_at": old.isoformat(),
+         "started_at": (old - timedelta(seconds=60)).isoformat(),
+         "language": "en", "started_via_service": False},
+        {"timer_id": "01OLD6", "name": "Recent", "device_id": "dev1",
+         "state": "finished", "total_seconds": 60, "seconds_left": 0,
+         "finishes_at": None, "finished_at": recent.isoformat(),
+         "started_at": (recent - timedelta(seconds=60)).isoformat(),
+         "language": "en", "started_via_service": False},
+    ],
+})
+mgr_c3 = FakeTimerManager()
+hass_c3 = FakeHassWithTasks(mgr_c3)
+b_c3 = bridge.SatelliteTimerBridge(hass_c3, ["dev2"])
+check("churn: load prunes the 8-day-old record, keeps the 6-day one",
+      _LOOP.run_until_complete(b_c3.async_load_persisted(store_old)) == 1
+      and "01OLD6" in b_c3._finished and "01OLD8" not in b_c3._finished)
+b_c3.start()
+b_c3._notify_listeners()
+check("churn: save after prune keeps only the 6-day record",
+      {t["timer_id"] for t in store_old.data["timers"]} == {"01OLD6"})
+b_c.stop()
+b_c2.stop()
+b_c3.stop()
+
+# A live timer wins over its stored record on load.
+mgr_p4 = FakeTimerManager()
+hass_p4 = FakeHassWithTasks(mgr_p4)
+mgr_p4.handlers["dev1"] = original_handler
+live = FakeTimerInfo("01LIVE", "Live", 600, "dev1")
+mgr_p4.timers["01LIVE"] = live
+store_live = FakeStore({
+    "version": 1,
+    "timers": [{
+        "timer_id": "01LIVE", "name": "Stale", "device_id": "dev1",
+        "state": "paused", "total_seconds": 600, "seconds_left": 100,
+        "finishes_at": None, "finished_at": None, "started_at": None,
+        "language": "en", "started_via_service": False,
+    }],
+})
+b_p4 = bridge.SatelliteTimerBridge(hass_p4, ["dev1"])
+check("live timer wins over its stored record",
+      _LOOP.run_until_complete(b_p4.async_load_persisted(store_live)) == 0)
+b_p.stop()
+b_p2.stop()
+b_p3.stop()
+b_p4.stop()
+
+# --- missed-timer replay (TIMER-12 / BRIDGE-3) ---------------------------
+mgr_r = FakeTimerManager()
+hass_r = FakeHass(mgr_r)
+replayed: list = []
+
+
+def handler_v1(event_type, timer):
+    replayed.append(("v1", str(event_type), timer.id))
+
+
+def handler_v2(event_type, timer):
+    replayed.append(("v2", str(event_type), timer.id))
+
+
+mgr_r.handlers["dev1"] = handler_v1
+b_r = bridge.SatelliteTimerBridge(hass_r, ["dev1"])
+check("replay: bridge starts", b_r.start() is True)
+t_r = FakeTimerInfo("01REP", "Pasta", 300, "dev1")
+mgr_r.timers["01REP"] = t_r
+mgr_r.timers.pop("01REP")
+mgr_r.handlers["dev1"]("finished", t_r)
+check("replay: satellite hears FINISHED when the timer goes off",
+      ("v1", "finished", "01REP") in replayed)
+# The satellite reconnects (re-registers its handler) with the finished
+# timer still undismissed: it must hear FINISHED again.
+mgr_r.handlers["dev1"] = handler_v2
+check("replay: reconnect re-asserts the finished timer",
+      ("v2", "finished", "01REP") in replayed)
+check("replay: exactly one re-assertion per reconnect",
+      [e for e in replayed if e[0] == "v2"] == [("v2", "finished", "01REP")])
+# Once dismissed, a reconnect hears nothing.
+b_r.dismiss_timer("01REP")
+mgr_r.handlers["dev1"] = handler_v1
+check("replay: nothing re-asserted after dismiss",
+      [e for e in replayed if e[0] == "v1"
+       and e[1] == "finished"] == [("v1", "finished", "01REP")])
+b_r.stop()
 
 print()
 if failures:

@@ -3,12 +3,14 @@
 Voice timers set on a satellite live in Home Assistant's memory only, so no
 card or automation can see them. This integration reads them through the
 bridge in ``bridge.py`` and exposes one sensor per timer, which a dial card
-can then show. It never starts, pauses or cancels a timer on its own:
-voice behaviour is completely unchanged. It also registers services
-(pause_timer, resume_timer, cancel_timer, add_time, dismiss_timer,
-restart_timer) so a dashboard card can control a timer by its id, and a
-"dismiss the pasta timer" voice intent (see ``intents.py``) for the
-finished timers the built-in sentences cannot reach.
+can then show. It registers services (pause_timer, resume_timer,
+cancel_timer, add_time, dismiss_timer, restart_timer, start_timer) so a
+dashboard card can control a timer by its id and start new timers by name
+and duration, and a "dismiss the pasta timer" voice intent (see
+``intents.py``) for the finished timers the built-in sentences cannot
+reach. The bridge persists timers to HA storage and restores them on
+start, so timers survive a restart — the bridge, not the satellite, is
+the source of truth for timer state.
 """
 
 from __future__ import annotations
@@ -27,9 +29,11 @@ from homeassistant.components.lovelace.const import LOVELACE_DATA
 from homeassistant.components.lovelace.resources import ResourceStorageCollection
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent as intent_helpers
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.collection import ItemNotFound
@@ -48,6 +52,7 @@ from .const import (
     SERVICE_PAUSE_TIMER,
     SERVICE_RESTART_TIMER,
     SERVICE_RESUME_TIMER,
+    SERVICE_START_TIMER,
 )
 from .intents import DismissFinishedTimerIntentHandler, async_ensure_dismiss_sentences
 
@@ -112,6 +117,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         device_ids = timer_devices(hass)
 
     bridge = SatelliteTimerBridge(hass, device_ids)
+    try:
+        restored = await bridge.async_load_persisted()
+    except Exception:  # persistence is best effort; sensors must not fail
+        _LOGGER.warning("Could not restore persisted timers", exc_info=True)
+        restored = 0
+    if restored:
+        _LOGGER.info("Restored %d timers from storage", restored)
     if not bridge.start():
         return False
 
@@ -200,6 +212,56 @@ async def _async_unregister_frontend(
         pass
 
 
+_START_TIMER_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): cv.string,
+        vol.Required("duration"): vol.Coerce(int),
+        vol.Optional("satellite"): cv.string,
+    }
+)
+
+
+def _resolve_satellite_device(
+    hass: HomeAssistant, bridge: SatelliteTimerBridge, satellite: str | None
+) -> str:
+    """The device id a start_timer call targets (BRIDGE-1).
+
+    ``satellite`` is an entity id (e.g. the kitchen satellite's entity).
+    Without one, the default is the kitchen satellite when one can be
+    recognised by name, else the first configured satellite. Raises
+    HomeAssistantError naming the satellite and the voice alternative
+    when nothing usable resolves.
+    """
+    devices = bridge.devices
+    if not devices:
+        raise HomeAssistantError(
+            "No satellite is configured for timers — say 'Okay Nabu, "
+            "set a timer' instead"
+        )
+    if satellite:
+        ent_reg = er.async_get(hass)
+        entity = ent_reg.async_get(satellite)
+        if entity is None or entity.device_id is None:
+            raise HomeAssistantError(
+                f"Satellite {satellite} was not found — say 'Okay Nabu, "
+                "set a timer' instead"
+            )
+        if entity.device_id not in devices:
+            raise HomeAssistantError(
+                f"Satellite {satellite} is not a configured timer "
+                "satellite — say 'Okay Nabu, set a timer' instead"
+            )
+        return entity.device_id
+    if len(devices) == 1:
+        return next(iter(devices))
+    device_reg = dr.async_get(hass)
+    for device_id in sorted(devices):
+        device = device_reg.async_get(device_id)
+        if device is not None and device.name and "kitchen" in device.name.lower():
+            return device_id
+    return sorted(devices)[0]
+
+
 def _register_services(
     hass: HomeAssistant, entry: ConfigEntry, bridge: SatelliteTimerBridge
 ) -> None:
@@ -208,50 +270,121 @@ def _register_services(
     The services act on a timer by its id (the id a bridge sensor carries
     in its ``timer_id`` attribute), so they work even when several timers
     share a name — the voice intents cannot tell those apart. Only timers
-    on the satellites this entry mirrors can be controlled.
+    on the satellites this entry mirrors can be controlled. A timer the
+    bridge restored from storage after a restart (BRIDGE-2) is no longer
+    in the TimerManager, so pause/resume/cancel/add_time fall back to
+    the bridge's own restored-timer methods for those.
     """
 
     def resolve(timer_id: str):
+        """A live timer (TimerManager) or a restored one (bridge).
+
+        Returns ("live", tm, timer) or ("restored", None, snapshot).
+        Raises HomeAssistantError when the timer is nowhere to be found
+        or is not on a configured satellite.
+        """
         tm = timer_manager(hass)
+        if tm is not None:
+            timer = tm.timers.get(timer_id)
+            if timer is not None:
+                if timer.device_id not in bridge.devices:
+                    raise HomeAssistantError(
+                        "Timer is not on a configured satellite"
+                    )
+                return ("live", tm, timer)
+        snapshot = bridge.restored_snapshot(timer_id)
+        if snapshot is not None:
+            return ("restored", None, snapshot)
         if tm is None:
             raise HomeAssistantError("Assist timer manager is not available")
-        timer = tm.timers.get(timer_id)
-        if timer is None:
-            raise HomeAssistantError(f"Timer {timer_id} not found")
-        if timer.device_id not in bridge.devices:
-            raise HomeAssistantError("Timer is not on a configured satellite")
-        return tm, timer
+        raise HomeAssistantError(f"Timer {timer_id} not found")
 
     async def handle_pause(call) -> None:
-        tm, timer = resolve(call.data["timer_id"])
+        kind, tm, timer = resolve(call.data["timer_id"])
         try:
-            tm.pause_timer(timer.id)
+            if kind == "live":
+                tm.pause_timer(timer.id)
+            else:
+                bridge.pause_restored(timer.timer_id)
         except TimerNotFoundError:
-            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except KeyError:
+            # A restored timer dropped between resolve() and the action
+            # (e.g. a concurrent double-cancel): a clean "not found",
+            # not a 500.
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
 
     async def handle_resume(call) -> None:
-        tm, timer = resolve(call.data["timer_id"])
+        kind, tm, timer = resolve(call.data["timer_id"])
         try:
-            tm.unpause_timer(timer.id)
+            if kind == "live":
+                tm.unpause_timer(timer.id)
+            else:
+                bridge.resume_restored(timer.timer_id)
         except TimerNotFoundError:
-            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except KeyError:
+            # A restored timer dropped between resolve() and the action
+            # (e.g. a concurrent double-cancel): a clean "not found",
+            # not a 500.
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
 
     async def handle_cancel(call) -> None:
-        tm, timer = resolve(call.data["timer_id"])
+        kind, tm, timer = resolve(call.data["timer_id"])
         try:
-            tm.cancel_timer(timer.id)
+            if kind == "live":
+                tm.cancel_timer(timer.id)
+            else:
+                bridge.cancel_restored(timer.timer_id)
         except TimerNotFoundError:
-            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except KeyError:
+            # A restored timer dropped between resolve() and the action
+            # (e.g. a concurrent double-cancel): a clean "not found",
+            # not a 500.
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
 
     async def handle_add_time(call) -> None:
-        tm, timer = resolve(call.data["timer_id"])
+        kind, tm, timer = resolve(call.data["timer_id"])
         total = call.data["minutes"] * 60 + call.data["seconds"]
         if total == 0:
             return
         try:
-            tm.add_time(timer.id, total)
+            if kind == "live":
+                tm.add_time(timer.id, total)
+            else:
+                bridge.add_time_restored(timer.timer_id, total)
         except TimerNotFoundError:
-            raise HomeAssistantError(f"Timer {timer.id} not found") from None
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except KeyError:
+            # A restored timer dropped between resolve() and the action
+            # (e.g. a concurrent double-cancel): a clean "not found",
+            # not a 500.
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
 
     async def handle_dismiss(call) -> None:
         try:
@@ -284,6 +417,36 @@ def _register_services(
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
 
+    async def handle_start(call) -> dict:
+        """Start a timer by name and duration in SECONDS (BRIDGE-1).
+
+        Returns the created timer sensor's entity id, so the caller can
+        tell duplicate names apart. A chip passes the RECIPE NAME as the
+        name. Satellite unreachable (or unknown) fails LOUDLY and names
+        the voice alternative — never a silent success.
+        """
+        name = str(call.data["name"]).strip()
+        if not name:
+            raise HomeAssistantError("Timer name is required")
+        duration = call.data["duration"]
+        if duration < 1:
+            raise HomeAssistantError(
+                "Duration must be at least 1 second"
+            )
+        satellite = call.data.get("satellite")
+        device_id = _resolve_satellite_device(hass, bridge, satellite)
+        try:
+            timer_id = bridge.start_timer(device_id, name, duration)
+        except TimersNotSupportedError:
+            label = satellite or "the kitchen satellite"
+            raise HomeAssistantError(
+                f"Satellite {label} is not reachable right now — say "
+                f"'Okay Nabu, set a {name} timer' instead"
+            ) from None
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
+        return {"entity_id": f"sensor.satellite_timer_{timer_id.lower()}"}
+
     hass.services.async_register(
         DOMAIN, SERVICE_PAUSE_TIMER, handle_pause, schema=_TIMER_ID_SCHEMA
     )
@@ -302,6 +465,13 @@ def _register_services(
     hass.services.async_register(
         DOMAIN, SERVICE_RESTART_TIMER, handle_restart, schema=_RESTART_SCHEMA
     )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_START_TIMER,
+        handle_start,
+        schema=_START_TIMER_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
 
 def _unregister_services(hass: HomeAssistant) -> None:
@@ -313,6 +483,7 @@ def _unregister_services(hass: HomeAssistant) -> None:
         SERVICE_ADD_TIME,
         SERVICE_DISMISS_TIMER,
         SERVICE_RESTART_TIMER,
+        SERVICE_START_TIMER,
     ):
         hass.services.async_remove(DOMAIN, service)
 

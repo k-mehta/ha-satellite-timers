@@ -144,6 +144,24 @@ The sensors also give automations something to trigger on: a sensor
 turning `active` means a timer started; no `active`, `paused` or
 `finished` sensors means all timers are done.
 
+## Sound
+
+The satellite plays its own alarm when a timer finishes — the
+bridge only decides how loud it should be. Configure it in the
+integration's options (Settings → Devices & Services → Satellite
+Timers → Configure): timer volume (0–100, default 100), quiet hours
+(default 22:00–07:00) with a quiet-hours volume (default 30% of the
+timer volume), and escalation (default on: the alarm starts at 40%
+of its target and rises 20 points every 10 seconds, reaching full
+volume in 30 seconds). A finished timer's sensor carries the
+computed level as `sound_volume_pct` (and `quiet_hours`) attributes,
+for a speaker or automation that honours them. Stopping is always
+available: tap the finished dial, or say "dismiss the pasta timer".
+
+No speaker is specified or assumed by this integration — until a
+speaker exists and something honours these attributes, the policy
+is configuration only and live sound verification stays open.
+
 ## Troubleshooting
 
 - **"Custom element not found: timer-screen"** after install: hard-refresh

@@ -23,7 +23,7 @@ import importlib.util
 import sys
 import types
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -87,6 +87,16 @@ _module(
 pkg = types.ModuleType("satellite_timers")
 pkg.__path__ = [str(COMPONENTS)]
 sys.modules["satellite_timers"] = pkg
+
+# sensor.py imports .const and .sound relatively — load those first.
+for _name in ("const", "sound"):
+    _spec = importlib.util.spec_from_file_location(
+        f"satellite_timers.{_name}", COMPONENTS / f"{_name}.py"
+    )
+    assert _spec is not None and _spec.loader is not None
+    _mod = importlib.util.module_from_spec(_spec)
+    sys.modules[f"satellite_timers.{_name}"] = _mod
+    _spec.loader.exec_module(_mod)
 
 spec = importlib.util.spec_from_file_location(
     "satellite_timers.sensor", COMPONENTS / "sensor.py"
@@ -229,6 +239,112 @@ check(
 check(
     "entity_id is a valid HA entity id",
     getattr(sensor, "entity_id", "").startswith("sensor.satellite_timer_"),
+)
+
+# 6. DESIGN-5 (Phase 7): a FINISHED timer carries the sound policy
+#    attributes; an active timer does not. The expected volume is
+#    computed from the sound module at the same instant — the policy
+#    math itself (including the quiet-hours boundary) is covered by
+#    test_sound.py with fixed times; this case proves the sensor wires
+#    the finished timer to the policy. The numbers are the policy, not
+#    a measurement — no speaker is confirmed (S1 unresolved).
+def make_finished_sensor(device, finished_at):
+    hass = FakeHass(device)
+    sys.modules[
+        "homeassistant.helpers.device_registry"
+    ].async_get = lambda _hass: FakeDeviceRegistry(device)
+    snapshot = bridge_mod.TimerSnapshot(
+        timer_id="01K9TESTTIMERID0000000002",
+        name="Pasta",
+        device_id="kitchen-hub-device-id",
+        is_active=False,
+        total_seconds=600,
+        seconds_left=0,
+        finishes_at=finished_at,
+        is_finished=True,
+        finished_at=finished_at,
+    )
+    return sensor_mod.SatelliteTimerSensor(hass, snapshot)
+
+
+sound_mod = sys.modules["satellite_timers.sound"]
+finished_at = datetime.now(timezone.utc)
+finished = make_finished_sensor(kitchen_hub, finished_at)
+check("finished sensor state is finished", finished._attr_native_value == "finished")
+finished_attrs = finished._attr_extra_state_attributes
+check(
+    "finished sensor carries sound_volume_pct",
+    finished_attrs.get("sound_volume_pct")
+    == sound_mod.current_sound_volume_pct(
+        datetime.now(timezone.utc), finished_at, {}
+    ),
+)
+check(
+    "finished sensor carries quiet_hours",
+    finished_attrs.get("quiet_hours")
+    == sound_mod.is_quiet_hours(datetime.now(timezone.utc), "22:00", "07:00"),
+)
+check(
+    "active sensor carries no sound attributes",
+    "sound_volume_pct" not in sensor._attr_extra_state_attributes
+    and "quiet_hours" not in sensor._attr_extra_state_attributes,
+)
+
+# 7. DESIGN-5 follow-up (Phase 7): quiet hours are LOCAL wall-clock
+#    hours, not UTC. The sensor used to pass datetime.now(timezone.utc)
+#    to the policy, so on a hub in America/Los_Angeles a 22:00-07:00
+#    window ran 14:00-23:00 local and sounded at full volume overnight.
+#    A `now` in local quiet hours while UTC is outside them must report
+#    quiet, and vice versa. Local here is a fixed -07:00 offset (PDT);
+#    the wall-clock reading is what matters, not the zone name. The
+#    sensor's update_from_snapshot takes `now` so this pins the caller
+#    without a live hub (the policy math itself is test_sound.py).
+def make_finished_pair(device, finished_at):
+    hass = FakeHass(device)
+    sys.modules[
+        "homeassistant.helpers.device_registry"
+    ].async_get = lambda _hass: FakeDeviceRegistry(device)
+    snapshot = bridge_mod.TimerSnapshot(
+        timer_id="01K9TESTTIMERID0000000003",
+        name="Pasta",
+        device_id="kitchen-hub-device-id",
+        is_active=False,
+        total_seconds=600,
+        seconds_left=0,
+        finishes_at=finished_at,
+        is_finished=True,
+        finished_at=finished_at,
+    )
+    return sensor_mod.SatelliteTimerSensor(hass, snapshot), snapshot
+
+
+LOCAL = timezone(timedelta(hours=-7))
+# Local 02:00 is inside 22:00-07:00 while UTC is 09:00 (outside).
+now_local_quiet = datetime(2026, 11, 8, 2, 0, tzinfo=LOCAL)
+quiet_sensor, quiet_snapshot = make_finished_pair(kitchen_hub, now_local_quiet)
+quiet_sensor.update_from_snapshot(quiet_snapshot, write=False, now=now_local_quiet)
+quiet_attrs = quiet_sensor._attr_extra_state_attributes
+check(
+    "local quiet + UTC loud: quiet_hours is true",
+    quiet_attrs.get("quiet_hours") is True,
+)
+check(
+    "local quiet + UTC loud: volume is the quiet target, ramped from 40%",
+    # 30% of the 100 target, 40% of that at once (elapsed 0).
+    quiet_attrs.get("sound_volume_pct") == 12,
+)
+# Local 16:00 is outside 22:00-07:00 while UTC is 23:00 (inside).
+now_local_loud = datetime(2026, 11, 8, 16, 0, tzinfo=LOCAL)
+loud_sensor, loud_snapshot = make_finished_pair(kitchen_hub, now_local_loud)
+loud_sensor.update_from_snapshot(loud_snapshot, write=False, now=now_local_loud)
+loud_attrs = loud_sensor._attr_extra_state_attributes
+check(
+    "local loud + UTC quiet: quiet_hours is false",
+    loud_attrs.get("quiet_hours") is False,
+)
+check(
+    "local loud + UTC quiet: volume is the full target, ramped from 40%",
+    loud_attrs.get("sound_volume_pct") == 40,
 )
 
 print("\nAll sensor device-info checks passed.")

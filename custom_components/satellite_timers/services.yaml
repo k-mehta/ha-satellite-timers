@@ -55,6 +55,25 @@ dismiss_timer:
       description: The timer_id attribute of the bridge sensor for the timer.
       required: true
       example: "01K8..."
+start_timer:
+  name: Start timer
+  description: Start a timer on a satellite by name and duration. Returns the created timer sensor's entity id. Duplicate names are accepted. A chip-started timer does not trigger the timer-jump automation.
+  fields:
+    name:
+      name: Name
+      description: The timer's display name. A recipe chip passes the recipe name.
+      required: true
+      example: "Pasta"
+    duration:
+      name: Duration
+      description: How long the timer runs, in SECONDS.
+      required: true
+      example: 600
+    satellite:
+      name: Satellite
+      description: The satellite entity id (e.g. the kitchen satellite). Omit to use the default satellite.
+      required: false
+      example: "assist_satellite.kitchen"
 restart_timer:
   name: Restart timer
   description: Start a finished timer again, for the same duration unless minutes or seconds override it.

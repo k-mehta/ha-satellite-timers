@@ -5,6 +5,21 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
 
+## [0.1.14] - 2026-11-09
+
+### Fixed
+
+- Release pipeline: the CI "Validate services metadata" step asserted
+  `services.yaml` has exactly the six pre–Phase 3 services, but Phase 3
+  added `start_timer`, so the check failed and blocked the v0.1.13
+  release. The assertion now includes `start_timer`. No integration
+  code change — v0.1.14 ships the same contents as v0.1.13 (the
+  `start_timer` service, timer persistence across restarts, sound
+  policy, Timers nav strip, on-screen timer creation, Undo restoring
+  remaining time, design tokens, and the P8-1 / P8-2 / P8-3 / P8-4 /
+  P8-5 / P8-6 / P8-16 and TIMER-1 / TIMER-3 / TIMER-7 / TIMER-9 /
+  TIMER-11 fixes).
+
 ## [0.1.13] - 2026-11-09
 
 ### Added

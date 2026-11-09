@@ -53,7 +53,7 @@ jobs:
       - name: Install PyYAML for services metadata check
         run: python3 -c "import yaml" 2>/dev/null || pip install -q pyyaml
       - name: Validate services metadata
-        run: python3 -c "import yaml; d = yaml.safe_load(open('custom_components/satellite_timers/services.yaml')); assert set(d) == {'pause_timer', 'resume_timer', 'cancel_timer', 'add_time', 'dismiss_timer', 'restart_timer'}, sorted(d)"
+        run: python3 -c "import yaml; d = yaml.safe_load(open('custom_components/satellite_timers/services.yaml')); assert set(d) == {'pause_timer', 'resume_timer', 'cancel_timer', 'add_time', 'dismiss_timer', 'restart_timer', 'start_timer'}, sorted(d)"
       - name: Check timer-screen card syntax
         run: node --check custom_components/satellite_timers/www/timer-screen-card.js
       - name: Run timer-screen card node tests

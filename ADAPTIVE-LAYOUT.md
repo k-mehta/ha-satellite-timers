@@ -3,7 +3,7 @@
 Both dashboard cards — the AnyList recipe card
 (`k-mehta/ha-anylist-recipe-card`) and the Satellite Timers card
 (`k-mehta/ha-satellite-timers`) — use **one** device-detection
-mechanism and the same three device categories. This file is identical
+mechanism and the same four device categories. This file is identical
 in both repos; if you change the detection or the layout rules, change
 them in both places.
 
@@ -11,9 +11,10 @@ them in both places.
 
 | Category | What it is | How it is recognised |
 | --- | --- | --- |
-| `hub` | The kitchen kiosk: a Chromium kiosk on Raspberry Pi OS, 1920×1200 touch display, landscape | Touch screen, landscape, at least 1600 px wide |
-| `desktop` | A large screen with a mouse or trackpad | Fine pointer (mouse), or a wide screen with no pointer information |
-| `mobile` | A phone or tablet, portrait or landscape | Mobile user agent, or a narrow viewport, or a touch screen that is not hub-sized |
+| `hub` | The kitchen kiosk: a Chromium kiosk on Raspberry Pi OS, 1920×1200 touch display, landscape — or the same panel rotated (1200×1920 portrait) | The exact panel signature, either orientation |
+| `desktop` | A large screen with a mouse or trackpad (including touchscreen laptops) | Fine pointer at 1024 px or wider, or a wide screen with no pointer information |
+| `tablet` | A touch tablet, either orientation | Tablet user agent, or a touch screen 768–1024 px wide |
+| `mobile` | A phone, portrait or landscape | Mobile user agent, a narrow viewport, or a coarse pointer with no fine pointer |
 
 Orientation is separate from category: **landscape** is width ≥
 height, **portrait** is width < height. The category picks the control
@@ -35,24 +36,35 @@ Each card reads four signals from the browser it is running in:
   alone: a desktop browser can spoof it, and a kiosk can strip it.
 
 Precedence (first match wins) — the unified §3.7 rule (Phase 3,
-TIMER-2; consolidated spec rev 2):
+TIMER-2; consolidated spec rev 2), as reordered by P8-16:
 
-1. The exact 1920×1200 panel signature (landscape) is the hub,
-   whatever pointers are present: the kiosk has a mouse attached, so
-   a fine pointer must never demote it to desktop.
-2. A phone/tablet user agent (`Mobi`, `Android`, `iPhone`, `iPad`,
-   `iPod`) is mobile.
-3. A viewport narrower than 768 px is mobile.
-4. Touch — or a coarse pointer, which IS a touch screen even when the
-   touch flag mis-reports — on a landscape screen at least 1600 px
-   wide is the hub.
-5. A coarse pointer on anything else is mobile (phones and tablets).
-6. A fine pointer is desktop. Bare width ≥1600 px + landscape NEVER
+1. The exact panel signature FIRST, either orientation: 1920×1200
+   (landscape wall) or 1200×1920 (the same panel rotated — O2-01).
+   The signature holds whatever pointer the browser reports.
+2. An iPad user agent is a tablet; an Android tablet ("Android"
+   with no "Mobi"/"Mobile" token, viewport at least 768 px) is a
+   tablet.
+3. A phone/tablet user agent (`Mobi`, `Android`, `iPhone`, `iPod`)
+   is mobile.
+4. A viewport narrower than 768 px is mobile.
+5. A touch screen in the tablet band (768-1024 px wide, either
+   orientation) is a tablet.
+6. A fine pointer at 1024 px or wider is desktop — a touchscreen
+   laptop has a mouse or trackpad, so fine wins over coarse here
+   (P8-16; OQ-7 decided: 1366×768 touch laptop is desktop, and a
+   1080×1920 portrait touch laptop is desktop too, O2-07).
+7. A coarse pointer with no fine pointer is mobile (phones and
+   touch-only tablets outside the band).
+8. A fine pointer is desktop. Bare width ≥1600 px + landscape NEVER
    implies hub on its own — that rule is FORBIDDEN (§3.7): it
    classifies every 1920×1080 / 1680×1050 / 1600×900 desktop monitor
    as a hub.
-7. With no pointer information: a viewport at least 1024 px wide is
+9. With no pointer information: a viewport at least 1024 px wide is
    desktop; anything else is mobile.
+
+The old rule 8 (touch + width ≥ 1600 + landscape = hub) is DELETED:
+it existed only to misclassify touchscreen laptops as the hub, and
+the kiosk is already caught by rule 1 above.
 
 The detection is a pure function, `detectDevice(env)`, that takes
 `{ width, height, coarsePointer, finePointer, touch, userAgent }` and
@@ -60,27 +72,31 @@ returns `{ category, orientation }`. It has no browser access, so it
 is unit-testable in node. `readDeviceEnv()` reads the live browser
 and returns `null` outside a browser, where the card keeps its base
 layout. The card applies the result as classes on its root element —
-`dev-hub`, `dev-desktop` or `dev-mobile`, plus `orient-landscape` or
-`orient-portrait` — and the CSS keys the adaptive layout off them. It
-re-detects on resize, so rotating a phone or resizing a window swaps
-the layout live.
+`dev-hub`, `dev-desktop`, `dev-tablet` or `dev-mobile`, plus
+`orient-landscape` or `orient-portrait` — and the CSS keys the adaptive
+layout off them. `isKioskMode(search)` is a separate pure function:
+kiosk mode adds a `kiosk` class of its own (the nav strip shows in
+kiosk mode always, even on desktop). It re-detects on resize, so
+rotating a phone or resizing a window swaps the layout live.
 
 Known limits (every fallback still renders a usable layout, never a
 broken one):
 
 - A 1920×1200 laptop (rare) reads as the hub: it is indistinguishable
   from the wall panel by size alone. That is the documented residual
-  misclassification (§3.7).
-- A desktop touchscreen at 1920×1200 reads as the hub. That is fine:
-  the hub layout is just big targets on a wide screen.
-- A desktop touchscreen at 1920×1080 reads as the hub (touch +
-  hub-size). That is the current behaviour in all three cards.
+  misclassification (§3.7). The same holds for a 1200×1920 laptop
+  (the rotated signature).
 - A phone in desktop mode (no mobile user agent) still reads as
-  mobile by width (rule 3).
-- The hub is recognised by size + touch + landscape, not by name: if
-  the kiosk display changes size, the thresholds above (1600 px hub
-  minimum, 768 px mobile maximum, 1024 px desktop minimum) are the
-  place to adjust.
+  mobile by width (rule 4).
+- A touchscreen laptop at 1366×768 (coarse, outside the tablet band)
+  with NO fine pointer still reads as mobile — a laptop without a
+  mouse/trackpad is indistinguishable from a touch-only screen
+  outside the band by these signals alone.
+- The hub is recognised by the exact panel signature, not by name:
+  if the kiosk display changes size, the signature constants
+  (1920×1200) are the place to adjust. Pi 5 pointer reporting with a
+  mouse attached was never measured on the device (spec §13 item 17)
+  — rule 1 exists so the hub layout does not depend on it.
 
 ## One mechanism, two copies
 

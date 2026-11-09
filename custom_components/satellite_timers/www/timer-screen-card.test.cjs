@@ -40,10 +40,15 @@ function parseHtml(html) {
       continue;
     }
     const el = new FakeElement(tag);
-    for (const [, name, value] of attrs.matchAll(/([\w-]+)="([^"]*)"/g)) {
-      const decoded = decodeEntities(value);
+    // Attributes may be name="value" or bare (hidden, disabled):
+    // a bare `hidden` sets the hidden property, as the browser does.
+    for (const attrMatch of attrs.matchAll(/([\w-]+)(?:="([^"]*)")?/g)) {
+      const name = attrMatch[1];
+      const decoded = decodeEntities(attrMatch[2] ?? "");
       if (name === "class") {
         for (const cls of decoded.split(/\s+/)) if (cls) el.classList.add(cls);
+      } else if (name === "hidden") {
+        el.hidden = true;
       } else if (name.startsWith("data-")) {
         const key = name
           .slice(5)
@@ -65,7 +70,22 @@ class FakeElement {
     this.tagName = String(tagName).toUpperCase();
     this.children = [];
     this.parentNode = null;
-    this.style = {};
+    // Inline styles, modelled on CSSStyleDeclaration just far enough
+    // for the card: setProperty/removeProperty/getPropertyValue for
+    // custom properties (the --dial-max fit var), plus plain property
+    // assignment (the ring's strokeDashoffset).
+    this.style = {
+      _props: {},
+      setProperty(name, value) {
+        this._props[name] = String(value);
+      },
+      removeProperty(name) {
+        delete this._props[name];
+      },
+      getPropertyValue(name) {
+        return this._props[name] || "";
+      },
+    };
     this.dataset = {};
     this.attributes = {};
     this._classSet = new Set();
@@ -191,7 +211,10 @@ class FakeElement {
   }
 
   getBoundingClientRect() {
-    return { left: 0, top: 0, width: 0, height: 0 };
+    // Tests may pin a rect (this._rect) to drive the scroll-badge
+    // gate; otherwise the element sits at the origin with no size.
+    if (this._rect) return { ...this._rect };
+    return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
   }
 }
 
@@ -245,7 +268,9 @@ const {
   startedAtMs,
   discoverTimers,
   gridColumns,
+  dialFit,
   detectDevice,
+  isKioskMode,
   readDeviceEnv,
   readRecipeContext,
   NAV_STRIP_VIEWS,
@@ -716,7 +741,7 @@ test("startedAtMs prefers the sensor attribute, else derives it (TIMER-11)", () 
   assert.equal(startedAtMs(finished, now, null), now - 780 * 1000);
 });
 
-test("detectDevice: unified §3.7 rule — panel signature first, bare width never hub (TIMER-2)", () => {
+test("detectDevice: unified §3.7 rule — panel signature first, bare width never hub (TIMER-2, P8-16)", () => {
   const base = {
     userAgent:
       "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -743,10 +768,14 @@ test("detectDevice: unified §3.7 rule — panel signature first, bare width nev
     detectDevice({ ...base, width: 1680, height: 1050, coarsePointer: false, finePointer: true, touch: false }),
     { category: "desktop", orientation: "landscape" }
   );
-  // Touch + hub-size below the panel signature is still the hub.
+  // P8-16: the old rule 8 (touch + hub-size = hub) is DELETED. A
+  // 1920x1080 touchscreen with a coarse pointer and NO fine pointer
+  // is mobile now — the kiosk itself is caught by rule 1 (the exact
+  // panel signature), not by size + touch. This assertion used to
+  // expect hub; it changed with the rule.
   assert.deepEqual(
     detectDevice({ ...base, width: 1920, height: 1080, coarsePointer: true, finePointer: false, touch: true }),
-    { category: "hub", orientation: "landscape" }
+    { category: "mobile", orientation: "landscape" }
   );
   // A coarse pointer on a tablet-size landscape screen is a tablet
   // (DESIGN-9: 1024x768 must NOT fall to desktop — and not to
@@ -754,6 +783,46 @@ test("detectDevice: unified §3.7 rule — panel signature first, bare width nev
   assert.deepEqual(
     detectDevice({ ...base, width: 1024, height: 768, coarsePointer: true, finePointer: false, touch: true }),
     { category: "tablet", orientation: "landscape" }
+  );
+  // P8-16 / OQ-7 DECIDED: a touchscreen laptop has a fine pointer
+  // (mouse/trackpad) AS WELL as a coarse one, and fine wins — so a
+  // 1366x768 touch laptop is a desktop, not a mobile.
+  assert.deepEqual(
+    detectDevice({ ...base, width: 1366, height: 768, coarsePointer: true, finePointer: true, touch: true }),
+    { category: "desktop", orientation: "landscape" }
+  );
+  // O2-07: the same for a portrait touch laptop (1080x1920).
+  assert.deepEqual(
+    detectDevice({ ...base, width: 1080, height: 1920, coarsePointer: true, finePointer: true, touch: true }),
+    { category: "desktop", orientation: "portrait" }
+  );
+});
+
+test("detectDevice: the rotated panel (1200x1920) is the portrait hub (O2-01)", () => {
+  // The wall rotated is the SAME panel, so rule 1 catches it in
+  // either orientation — it gets the hub layout (with the portrait
+  // reflow), not the phone layout.
+  assert.deepEqual(
+    detectDevice({ width: 1200, height: 1920, coarsePointer: true, touch: true, userAgent: "" }),
+    { category: "hub", orientation: "portrait" }
+  );
+  assert.deepEqual(
+    detectDevice({ width: 1200, height: 1920, finePointer: true, userAgent: "" }),
+    { category: "hub", orientation: "portrait" }
+  );
+  assert.deepEqual(
+    detectDevice({ width: 1200, height: 1920, userAgent: "" }),
+    { category: "hub", orientation: "portrait" }
+  );
+  // 1080x1920 is NOT the panel: a fine pointer is a desktop (O2-07),
+  // and a coarse-only touch screen is a tablet only inside the band.
+  assert.equal(
+    detectDevice({ width: 1080, height: 1920, finePointer: true, userAgent: "" }).category,
+    "desktop"
+  );
+  assert.equal(
+    detectDevice({ width: 1080, height: 1920, coarsePointer: true, touch: true, userAgent: "" }).category,
+    "mobile"
   );
 });
 
@@ -913,8 +982,13 @@ test("a dial tap clears a pending Cancel arm (TIMER-9)", async () => {
   );
 });
 
-test("cancelling shows a 5 s Undo toast; Undo re-creates the timer (TIMER-13)", async () => {
-  const hass = fakeHass([timerState("t1", "Pasta", "active", { duration: 900 })]);
+test("cancelling shows a 5 s Undo toast; Undo re-creates the timer with the REMAINING time (TIMER-13, F-T1)", async () => {
+  // Paused with 180 s left of a 900 s timer: Undo must bring back
+  // 180 s, not a fresh 900 s. (The old test asserted the full
+  // duration here; that was the F-T1 defect.)
+  const hass = fakeHass([
+    timerState("t1", "Pasta", "paused", { remaining: 180, duration: 900 }),
+  ]);
   const card = new TimerScreenCard();
   card.setConfig({});
   card.hass = hass;
@@ -937,9 +1011,32 @@ test("cancelling shows a 5 s Undo toast; Undo re-creates the timer (TIMER-13)", 
   await sleep(20);
   assert.deepEqual(hass.calls, [
     ["satellite_timers", "cancel_timer", { timer_id: "t1" }],
-    ["satellite_timers", "start_timer", { name: "Pasta", duration: 900 }],
+    ["satellite_timers", "start_timer", { name: "Pasta", duration: 180 }],
   ]);
   assert.equal(toast.hidden, true);
+});
+
+test("Undo never restores less than 1 s (F-T1 floor)", () => {
+  const card = timerCard([]);
+  // A timer cancelled at 0 s remaining still comes back (as 1 s).
+  card._showUndoToast({
+    name: "Tea",
+    duration: 600,
+    state: "active",
+    finishesAt: new Date(Date.now() - 5000).toISOString(),
+    remaining: 0,
+  });
+  assert.deepEqual(card._undoTimer, { name: "Tea", duration: 1 });
+  card._hideToast();
+  // And a timer with time left stores exactly that remainder.
+  card._showUndoToast({
+    name: "Pasta",
+    duration: 900,
+    state: "paused",
+    remaining: 240,
+  });
+  assert.deepEqual(card._undoTimer, { name: "Pasta", duration: 240 });
+  card._hideToast();
 });
 
 test("Back to recipe shows with ?from_recipe= and navigates back at the same step (TIMER-10)", () => {
@@ -1035,18 +1132,25 @@ test("detectDevice: tablet category — band, iPad, Android tablet (DESIGN-9)", 
     detectDevice({ width: 1025, height: 768, coarsePointer: true, touch: true }).category,
     "mobile"
   );
-  // Open question OQ-7: a touchscreen laptop at 1366x768 (coarse,
-  // outside the tablet band) still reads as mobile — recorded, not
-  // silently decided.
+  // P8-16 / OQ-7 DECIDED: a touchscreen laptop at 1366x768 WITH a
+  // fine pointer (mouse/trackpad) is a desktop — fine wins over
+  // coarse. Without a fine pointer the same screen is still mobile:
+  // a laptop without a mouse is indistinguishable from a touch-only
+  // screen outside the tablet band by these signals alone.
+  assert.equal(
+    detectDevice({ width: 1366, height: 768, coarsePointer: true, finePointer: true, touch: true }).category,
+    "desktop"
+  );
   assert.equal(
     detectDevice({ width: 1366, height: 768, coarsePointer: true, touch: true }).category,
     "mobile"
   );
-  // A huge portrait touch screen is mobile, not the hub (the hub is
-  // landscape) — and not a tablet either (1200px is outside the band).
+  // O2-01: the rotated panel (1200x1920) is the portrait HUB, not
+  // mobile — rule 1 catches the signature in either orientation.
+  // This assertion used to expect mobile; it changed with the rule.
   assert.equal(
     detectDevice({ width: 1200, height: 1920, coarsePointer: true, touch: true }).category,
-    "mobile"
+    "hub"
   );
 });
 
@@ -1146,10 +1250,22 @@ test("Phase 7 follow-up (Fix 3): the strip renders first in the screen, Timers a
   assert.equal(screen.children[0], strip, "the strip is first in the DOM (tab order)");
   const buttons = card.shadowRoot.querySelectorAll(".nav-strip-button");
   assert.equal(buttons.length, 4);
+  // The Timers button carries the scroll badge (P8-5) — a "↓" span
+  // after the label — so its textContent reads "Timers↓".
   assert.deepEqual(
     buttons.map((button) => button.textContent),
-    ["Home", "Timers", "Photos", "Recipes"]
+    ["Home", "Timers↓", "Photos", "Recipes"]
   );
+  // The badge is on the Timers button only, and hidden until a dial
+  // sits below the fold (P8-4 gate — no window here, so hidden).
+  const badges = card.shadowRoot.querySelectorAll(".nav-scroll-badge");
+  assert.equal(badges.length, 1);
+  assert.equal(badges[0].hidden, true);
+  assert.equal(badges[0].textContent, "↓");
+  assert.ok(buttons[1].innerHTML.includes("nav-scroll-badge"));
+  assert.ok(!buttons[0].innerHTML.includes("nav-scroll-badge"));
+  assert.ok(!buttons[2].innerHTML.includes("nav-scroll-badge"));
+  assert.ok(!buttons[3].innerHTML.includes("nav-scroll-badge"));
   assert.deepEqual(
     buttons.map((button) => button.dataset.path),
     ["/family-hub", "/family-hub/timers", "/family-hub/family-photos", "/family-hub/recipes"]
@@ -1200,7 +1316,7 @@ test("Phase 7 follow-up (Fix 3): a strip tap navigates (pushState + location-cha
   await sleep(0);
 });
 
-test("Phase 7 follow-up (Fix 3): strip CSS — fixed to the viewport bottom, hidden on desktop", () => {
+test("Phase 7 follow-up (Fix 3): strip CSS — fixed to the viewport bottom, hidden on desktop unless kiosk", () => {
   // Fixed in both orientations (not sticky): the screen is a scroll
   // container and the card can grow past the viewport, so a sticky
   // strip would sit at the content end, below the fold at scroll top.
@@ -1213,8 +1329,18 @@ test("Phase 7 follow-up (Fix 3): strip CSS — fixed to the viewport bottom, hid
   assert.ok(
     CARD_CSS.includes("padding-bottom: calc(24px + var(--nav-strip-height, 84px));")
   );
-  // Desktop only: hidden (HA tabs already exist and work there).
+  // Desktop only when NOT in kiosk mode: hidden (HA tabs already exist
+  // and work there). In kiosk mode the strip shows ALWAYS — HA tabs
+  // do not exist there (the kiosk-desktop hole).
   assert.match(CARD_CSS, /\.screen\.dev-desktop \.nav-strip \{ display: none; \}/);
+  assert.match(
+    CARD_CSS,
+    /\.screen\.dev-desktop\.kiosk \.nav-strip \{ display: block; \}/
+  );
+  assert.match(
+    CARD_CSS,
+    /\.screen\.dev-desktop\.kiosk \{ --nav-strip-height: 84px; \}/
+  );
   // Active state: the accent background, heavier weight.
   assert.ok(
     CARD_CSS.includes(
@@ -1231,14 +1357,330 @@ test("Phase 7 follow-up (Fix 3): strip CSS — fixed to the viewport bottom, hid
     CARD_CSS,
     /\.screen\.dev-mobile \.nav-strip-button \{ min-height: 48px; padding: 8px 6px; font-size: 16px; white-space: nowrap; \}/
   );
-  // The strip never overlaps the scroll hint or the Undo toast: both
-  // clear it by the strip's height.
-  assert.ok(
-    CARD_CSS.includes("bottom: calc(16px + var(--nav-strip-height, 84px));")
-  );
+  // P8-5: the scroll indicator is a badge on the Timers strip button
+  // now, not a floating pill — no .scroll-hint rule may remain, and
+  // the badge is corner-positioned with pointer-events none so it
+  // never eats a tap or changes the button's size.
+  assert.doesNotMatch(CARD_CSS, /\.scroll-hint/);
+  assert.doesNotMatch(CARD_CSS, /More timers below/);
+  assert.match(CARD_CSS, /\.nav-scroll-badge \{/);
+  assert.ok(CARD_CSS.includes("position: absolute;"));
+  assert.ok(CARD_CSS.includes("pointer-events: none;"));
+  assert.ok(CARD_CSS.includes(".nav-scroll-badge[hidden] { display: none; }"));
+  // The Undo toast clears the strip on every category that shows it
+  // (desktop+kiosk included).
   assert.ok(CARD_CSS.includes(".screen.dev-hub ~ .toast { bottom: 108px; }"));
   assert.ok(CARD_CSS.includes(".screen.dev-tablet ~ .toast { bottom: 100px; }"));
   assert.ok(CARD_CSS.includes(".screen.dev-mobile ~ .toast { bottom: 84px; }"));
+  assert.ok(CARD_CSS.includes(".screen.dev-desktop.kiosk ~ .toast { bottom: 108px; }"));
   // Reduced motion: the press feedback is instant.
   assert.match(CARD_CSS, /\.nav-strip-button:active \{ transform: none; \}/);
+});
+
+// -- Fix round: P8-3/P8-6 dial fit, P8-4/P8-5 scroll badge, P8-16,
+// kiosk-desktop strip, F-T1 (tests above), P8-7 ----------------------
+// The height-budget dial cap: --dial-max = floor((viewport − padding
+// − gaps − extra) / rows) − controls reserve. Hub padding is 132px
+// (24 top + 24 bottom + 84 strip), gaps 16px, hub reserve 100px.
+
+test("dialFit: hub numbers — 1 timer 968px, 4–5 timers 426px, 12 timers 155px (P8-3/P8-6)", () => {
+  assert.deepEqual(dialFit(1, 1, 1200, 100, 84), { dialMax: 968, many: false });
+  assert.deepEqual(dialFit(2, 2, 1200, 100, 84), { dialMax: 968, many: false });
+  assert.deepEqual(dialFit(3, 3, 1200, 100, 84), { dialMax: 968, many: false });
+  assert.deepEqual(dialFit(4, 2, 1200, 100, 84), { dialMax: 426, many: false });
+  assert.deepEqual(dialFit(5, 3, 1200, 100, 84), { dialMax: 426, many: false });
+  assert.deepEqual(dialFit(12, 3, 1200, 100, 84), { dialMax: 155, many: false });
+  // Monotone: the cap never grows as rows grow.
+  let prev = Infinity;
+  for (const [count, cols] of [[1, 1], [2, 2], [3, 3], [4, 2], [5, 3], [9, 3], [12, 3]]) {
+    const { dialMax } = dialFit(count, cols, 1200, 100, 84);
+    assert.ok(dialMax <= prev, `${count} timers: ${dialMax} > ${prev}`);
+    prev = dialMax;
+  }
+});
+
+test("dialFit: below the 140px floor the view goes many-mode regardless of count (P8-6)", () => {
+  // 13 timers at the hub: 5 rows, 100px cap — under the floor.
+  assert.deepEqual(dialFit(13, 3, 1200, 100, 84), { dialMax: null, many: true });
+  assert.deepEqual(dialFit(20, 3, 1200, 100, 84), { dialMax: null, many: true });
+  // Desktop-landscape 1920x1080 (reserve 76, no strip): 12 fit, 20 do not.
+  assert.deepEqual(dialFit(12, 4, 1080, 76, 0), { dialMax: 257, many: false });
+  assert.deepEqual(dialFit(20, 4, 1080, 76, 0), { dialMax: null, many: true });
+});
+
+test("dialFit: the Back-to-recipe bar takes its row out of the budget (TIMER-10)", () => {
+  // 1 timer + back bar: 80px (64px button + one gap) less room.
+  assert.deepEqual(dialFit(1, 1, 1200, 100, 84, 80), { dialMax: 888, many: false });
+  assert.deepEqual(dialFit(1, 1, 1200, 100, 84, 0), { dialMax: 968, many: false });
+});
+
+test("dialFit: nothing to fit — no timers, or no viewport", () => {
+  assert.deepEqual(dialFit(0, 1, 1200, 100, 84), { dialMax: null, many: false });
+  assert.deepEqual(dialFit(5, 3, 0, 100, 84), { dialMax: null, many: false });
+  assert.deepEqual(dialFit(5, 3, null, 100, 84), { dialMax: null, many: false });
+});
+
+function hubDialMax(count) {
+  stubWindow(HUB_WINDOW);
+  try {
+    const states = [];
+    for (let i = 0; i < count; i++) {
+      states.push(timerState(`t${i}`, `Timer ${i}`, "active", { remaining: 3600 }));
+    }
+    const card = timerCard(states);
+    const screen = card.shadowRoot.querySelector(".screen");
+    return {
+      dialMax: screen.style.getPropertyValue("--dial-max"),
+      many: screen.classList.contains("many"),
+      cols: screen.className,
+    };
+  } finally {
+    clearWindow();
+  }
+}
+
+test("_applyDialFit sets --dial-max on the hub screen and flips many-mode at 13 (P8-3/P8-6)", () => {
+  assert.deepEqual(hubDialMax(1).dialMax, "968px");
+  assert.equal(hubDialMax(1).many, false);
+  assert.deepEqual(hubDialMax(4).dialMax, "426px");
+  assert.deepEqual(hubDialMax(5).dialMax, "426px");
+  assert.deepEqual(hubDialMax(12).dialMax, "155px");
+  assert.equal(hubDialMax(12).many, false);
+  const thirteen = hubDialMax(13);
+  assert.equal(thirteen.dialMax, "");
+  assert.equal(thirteen.many, true);
+  // 12 timers shrink to 155px dials: under the 260px threshold, so
+  // the screen takes the many-mode text scale (44px time) — otherwise
+  // the 72px time bursts out of the ring (seen live in the n-12
+  // screenshot). 5 timers at 426px keep the full 72px time.
+  assert.ok(hubDialMax(12).cols.includes("small-dials"));
+  assert.ok(!hubDialMax(5).cols.includes("small-dials"));
+  assert.match(CARD_CSS, /\.screen\.small-dials \.time \{ font-size: 44px; \}/);
+  assert.match(CARD_CSS, /\.screen\.small-dials \.name \{ font-size: 18px; \}/);
+  // The landscape dial rule consumes the var as a third min() term.
+  assert.match(
+    CARD_CSS,
+    /width: min\(100%, calc\(100vh - var\(--controls-reserve\) - 48px\), var\(--dial-max, 100000px\)\);/
+  );
+});
+
+test("_applyDialFit clears small-dials on rotation to portrait", () => {
+  stubWindow(HUB_WINDOW);
+  try {
+    const states = [];
+    for (let i = 0; i < 12; i++) {
+      states.push(timerState(`t${i}`, `Timer ${i}`, "active", { remaining: 3600 }));
+    }
+    const card = timerCard(states);
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("small-dials"));
+    stubWindow(PHONE_WINDOW);
+    card._onResize();
+    assert.ok(!screen.classList.contains("small-dials"));
+    assert.equal(screen.style.getPropertyValue("--dial-max"), "");
+  } finally {
+    clearWindow();
+  }
+});
+
+test("_applyDialFit does not set --dial-max in portrait (fit is landscape-only)", () => {
+  stubWindow(PHONE_WINDOW);
+  try {
+    const card = timerCard(fiveTimers());
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.equal(screen.style.getPropertyValue("--dial-max"), "");
+  } finally {
+    clearWindow();
+  }
+});
+
+// The controls reserve is the space below the ring: 12px .controls
+// margin-top + button min-height + the 8px margin-top of the (usually
+// empty) .error div. The hub's 100 already included the 8px; desktop/
+// tablet/mobile were 8px short per row, so those views scrolled 8px
+// (measured live at 1366x768: docH 776 vs vh 768) with nothing hidden.
+// These expectations pin the corrected reserves per category, and the
+// CSS --controls-reserve vars must match them (they size the button
+// and centre the .dial-text overlay on the ring).
+function categoryDialMax(count, win) {
+  stubWindow(win);
+  try {
+    const states = [];
+    for (let i = 0; i < count; i++) {
+      states.push(timerState(`t${i}`, `Timer ${i}`, "active", { remaining: 3600 }));
+    }
+    const card = timerCard(states);
+    const screen = card.shadowRoot.querySelector(".screen");
+    return screen.style.getPropertyValue("--dial-max");
+  } finally {
+    clearWindow();
+  }
+}
+
+const DESKTOP_1080_WINDOW = {
+  ...DESKTOP_WINDOW,
+  width: 1920,
+  height: 1080,
+};
+const MOBILE_LANDSCAPE_WINDOW = {
+  width: 1366,
+  height: 768,
+  coarse: true,
+  fine: false,
+  touch: true,
+  userAgent: HUB_WINDOW.userAgent,
+};
+const TABLET_WINDOW = {
+  width: 1024,
+  height: 768,
+  coarse: true,
+  fine: false,
+  touch: true,
+  userAgent: HUB_WINDOW.userAgent,
+};
+
+test("_applyDialFit reserves include the empty .error margin on desktop/tablet/mobile (P8-3/P8-6)", () => {
+  // Mobile 1366x768, 2 timers, 1 row: (768 - 108) - 84 = 576.
+  assert.equal(categoryDialMax(2, MOBILE_LANDSCAPE_WINDOW), "576px");
+  // Mobile, 5 timers, 2 rows: floor((768 - 108 - 16) / 2) - 84 = 238.
+  assert.equal(categoryDialMax(5, MOBILE_LANDSCAPE_WINDOW), "238px");
+  // Desktop 1920x1080 no-kiosk, 2 timers, 1 row: (1080 - 48) - 76 = 956.
+  assert.equal(categoryDialMax(2, DESKTOP_1080_WINDOW), "956px");
+  // Desktop, 5 timers, 2 rows: floor((1080 - 48 - 16) / 2) - 76 = 432.
+  assert.equal(categoryDialMax(5, DESKTOP_1080_WINDOW), "432px");
+  // Tablet 1024x768, 2 timers, 1 row: (768 - 124) - 84 = 560.
+  assert.equal(categoryDialMax(2, TABLET_WINDOW), "560px");
+  // The CSS vars carry the same reserves (button sizing + overlay
+  // centring read them, not the JS table).
+  assert.match(CARD_CSS, /\.screen\.dev-desktop \{ --controls-reserve: 76px;/);
+  assert.match(CARD_CSS, /\.screen\.dev-tablet \{ --controls-reserve: 84px;/);
+  assert.match(CARD_CSS, /\.screen\.dev-mobile \{ --controls-reserve: 84px;/);
+});
+
+// -- Scroll badge gating (P8-4/P8-5) --------------------------------------
+// The badge shows only while a DIAL sits below the fold. Rects are
+// pinned on the fake elements (see getBoundingClientRect): the screen
+// rect sets the fold, the dial rects decide.
+
+function badgeCard() {
+  stubWindow(HUB_WINDOW);
+  const card = timerCard([
+    timerState("t1", "Pasta", "active", { remaining: 600 }),
+    timerState("t2", "Rice", "active", { remaining: 300 }),
+  ]);
+  const screen = card.shadowRoot.querySelector(".screen");
+  screen._rect = { top: 0, bottom: 1200, left: 0, right: 1920, width: 1920, height: 1200 };
+  const dials = [...card._dialEls.values()];
+  return { card, screen, dials };
+}
+
+test("the scroll badge stays hidden when every dial is in view (P8-4)", () => {
+  const { card, dials } = badgeCard();
+  try {
+    for (const d of dials) {
+      d._rect = { top: 100, bottom: 1100, left: 0, right: 600, width: 600, height: 1000 };
+    }
+    card._updateScrollBadge();
+    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, true);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the scroll badge shows when a dial extends below the viewport fold (P8-4)", () => {
+  const { card, dials } = badgeCard();
+  try {
+    dials[0]._rect = { top: 100, bottom: 1100, left: 0, right: 600, width: 600, height: 1000 };
+    dials[1]._rect = { top: 1100, bottom: 1350, left: 0, right: 600, width: 600, height: 250 };
+    card._updateScrollBadge();
+    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, false);
+    // Scrolled to the bottom, the last dial is fully visible again.
+    dials[1]._rect = { top: 900, bottom: 1150, left: 0, right: 600, width: 600, height: 250 };
+    card._updateScrollBadge();
+    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, true);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the scroll badge stays hidden when only the screen (not a dial) extends below the fold (P8-4)", () => {
+  // The 1-timer regression: the controls row overflowed, the screen
+  // rect ran past the viewport, and the old gate showed "More timers
+  // below" with no timers below at all.
+  const { card, screen, dials } = badgeCard();
+  try {
+    screen._rect = { top: 0, bottom: 1284, left: 0, right: 1920, width: 1920, height: 1284 };
+    for (const d of dials) {
+      d._rect = { top: 100, bottom: 1050, left: 0, right: 600, width: 600, height: 950 };
+    }
+    card._updateScrollBadge();
+    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, true);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("the scroll badge uses the screen's own bottom as the fold in internal-scroll mode (P8-4)", () => {
+  const { card, screen, dials } = badgeCard();
+  try {
+    // Screen shorter than the viewport, scrolling internally: a dial
+    // below the screen's visible bottom (800) is below the fold even
+    // though it is above the viewport bottom (1200).
+    screen._rect = { top: 0, bottom: 800, left: 0, right: 1920, width: 1920, height: 800 };
+    dials[0]._rect = { top: 100, bottom: 700, left: 0, right: 600, width: 600, height: 600 };
+    dials[1]._rect = { top: 700, bottom: 950, left: 0, right: 600, width: 600, height: 250 };
+    card._updateScrollBadge();
+    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, false);
+  } finally {
+    clearWindow();
+  }
+});
+
+// -- Kiosk mode (NAV-1 kiosk-desktop hole) ---------------------------------
+
+test("isKioskMode: only the ?kiosk query counts", () => {
+  assert.equal(isKioskMode("?kiosk"), true);
+  assert.equal(isKioskMode("?kiosk=true"), true);
+  assert.equal(isKioskMode("?foo=1&kiosk&bar=2"), true);
+  assert.equal(isKioskMode(""), false);
+  assert.equal(isKioskMode("?foo=1"), false);
+  assert.equal(isKioskMode("?kiosk-mode=1"), false);
+  assert.equal(isKioskMode("?notkiosk"), false);
+  assert.equal(isKioskMode(null), false);
+  assert.equal(isKioskMode(undefined), false);
+});
+
+test("a desktop viewport in kiosk mode carries the kiosk class (strip stays); without it, it does not", () => {
+  stubWindow(DESKTOP_WINDOW);
+  globalThis.window.location = { search: "?kiosk" };
+  try {
+    const card = timerCard(fiveTimers());
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-desktop"));
+    assert.ok(screen.classList.contains("kiosk"));
+  } finally {
+    clearWindow();
+  }
+  stubWindow(DESKTOP_WINDOW);
+  try {
+    const card = timerCard(fiveTimers());
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-desktop"));
+    assert.ok(!screen.classList.contains("kiosk"));
+  } finally {
+    clearWindow();
+  }
+});
+
+// -- P8-7: DOM-removal latency, unit bound ---------------------------------
+// The card removes a dial synchronously in the hass setter's _sync —
+// the re-render itself adds no delay. (The rig probe measures the
+// full tap → sensor-gone → DOM-gone path, where HA propagation is the
+// remaining term.)
+
+test("removing a timer removes its dial from the DOM synchronously (P8-7 unit bound)", () => {
+  const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+  assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 1);
+  card.hass = fakeHass([]);
+  assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 0);
 });

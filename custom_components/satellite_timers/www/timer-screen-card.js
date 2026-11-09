@@ -9,11 +9,18 @@
 //            so it can use the full grid-cell width. The flex row also
 //            carries min-width: 0 — the 50-char unbroken name used to
 //            overflow 4 sizes in true kiosk for exactly that reason.
-//   TIMER-2  detectDevice follows the unified §3.7 rule: the exact
-//            1920x1200 panel signature FIRST, then touch+hub-size,
-//            then coarse, then fine. Bare width >=1600 + landscape
-//            -> hub is FORBIDDEN. (Live repro is a §13 item: headless
-//            cannot present touch + fine pointer simultaneously.)
+//   TIMER-2  detectDevice follows the unified §3.7 rule as reordered
+//            by P8-16: the exact 1920x1200 panel signature FIRST, in
+//            EITHER orientation (1920x1200 landscape, or 1200x1920
+//            portrait — the same panel rotated, O2-01), then tablet
+//            user agents, then mobile UA, then width <768, then the
+//            tablet band, then fine + width >=1024 -> desktop, then
+//            coarse without fine -> mobile. The old rule 8 (touch +
+//            width >=1600 + landscape -> hub) is DELETED: it existed
+//            only to misclassify touchscreen laptops as the hub. Bare
+//            width >=1600 + landscape -> hub is FORBIDDEN. (Live repro
+//            is a §13 item: headless cannot present touch + fine
+//            pointer simultaneously — see pointer_diag.mjs.)
 //   TIMER-3  Finished timers show "Done — N min ago", counting up
 //            from finished_at on the tick (same as HOME-3).
 //   TIMER-4  Viewport-split creation: the hub is voice-only + a hint;
@@ -48,7 +55,9 @@
 //            whenever it next looks). Missed-timer announcement is
 //            bridge-side (replay on satellite reconnect).
 //   TIMER-13 Cancelling shows an Undo toast for 5 s; Undo re-creates
-//            the timer via start_timer with the same name + duration.
+//            the timer via start_timer with the same name and the
+//            REMAINING time at cancel (min 1 s) — not the full
+//            duration (F-T1).
 //   TIMER-14 "A few more minutes" is voice-only (add_time): the empty
 //            state names that path. There is NO on-screen +1 min
 //            button (deliberate user choice).
@@ -56,9 +65,22 @@
 //            path (no LLM needed); verified in the rig via
 //            conversation/process with no LLM configured.
 //
-// Design tokens (Phase 0, design-tokens.css/json — read-only here):
-// the values below are inlined from those tokens, as the token file
-// requires (cards render in shadow DOM and cannot @import the CSS).
+// Design tokens (DESIGN-1): the values below are INLINED from
+// design-tokens.json at the repo root (human-readable twin:
+// design-tokens.css) — the card renders in shadow DOM and cannot
+// @import the stylesheet at runtime, so the JSON is the source of
+// truth and this file is its copy, enforced by
+// www/design-tokens.test.cjs (change a value in the JSON and the card
+// changes in the same commit, or the test fails). The vendored JSON
+// is a copy of pi-family-hub's dashboard/design-tokens.json —
+// refresh both files together when the tokens change upstream.
+// Mapping: timer palette = color-timer-*, error = color-error /
+// color-danger, muted = color-muted, dark surfaces = color-ink,
+// borders = color-line, type = font-dial-*, targets, radii, spacing,
+// shadows and motion = their token names. Two deliberate splits:
+// body text stays HA's --primary-text-color (#212121), not the ink
+// token, and the screen stays transparent (no screen-bg token) —
+// both are HA-theme behaviour, recorded in the parity test.
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 88;
 
@@ -227,6 +249,69 @@ function gridColumns(count, category) {
   return 3;
 }
 
+// -- height-budget dial cap (P8-3 / P8-6) ----------------------------------
+//
+// The dial used to size by width only (the smaller of the column width
+// and 100vh − controls − padding), so it knew nothing about how many
+// rows exist: 1 timer scrolled 84px, 3 fit, 5 scrolled 368px, 12
+// scrolled 1820px — non-monotonic, and 4 timers (2x2, dial 936px)
+// were the worst unmeasured state. The fix caps the dial by the HEIGHT
+// budget: the viewport height minus the screen's vertical padding
+// (24px top + 24px bottom + the nav strip's height), minus the gaps
+// between rows, minus any full-width extra row (the "Back to recipe"
+// bar, 64px + one gap), divided by the row count, minus the controls
+// reserve below each dial. The result is --dial-max, a CSS var on
+// .screen that the landscape dial rule takes as a third min() term.
+// Dials then shrink as rows grow (1 timer -> 968px, 4-5 timers ->
+// 426px, 12 timers -> 155px at the hub) and docH stays <= viewport
+// for counts <= 12. If --dial-max would fall below the many-mode dial
+// size (140px), fitting is impossible and the view switches to
+// many-mode behaviour (scroll + compact finished rows) regardless of
+// count — at the hub that lands at 13 timers, the same threshold as
+// the old count rule. The fit requirement is scoped to landscape:
+// phone portrait is expected to scroll (TIMER-7), and the cap only
+// applies inside the landscape media query, so portrait is untouched.
+const DIAL_FIT_MIN_PX = 140; // many-mode dial size; the fit floor
+// Below this fitted diameter the 72px time (TIMER-6) no longer fits
+// inside the ring — "59:55" at 72px is ~200px wide — so the screen
+// takes the many-mode text scale instead (44px time, 18px name,
+// 16px state/hint; same values as .screen.many). 260px leaves room
+// for the time plus the chord margin; the 426px dials at 4–5 timers
+// keep the full 72px time.
+const SMALL_DIAL_MAX_PX = 260;
+const SCREEN_PAD_TOP_PX = 24;
+const SCREEN_PAD_BOTTOM_PX = 24;
+const GRID_GAP_PX = 16;
+
+// Pure — unit-testable in node. Returns { dialMax } in px, or
+// { dialMax: null, many: true } when the fit is impossible, or
+// { dialMax: null, many: false } when there is nothing to fit (no
+// timers, or no viewport to fit into).
+function dialFit(count, cols, viewportHeight, controlsReserve, navStripHeight, extraPx) {
+  if (
+    !count ||
+    count <= 0 ||
+    !cols ||
+    cols <= 0 ||
+    !viewportHeight ||
+    viewportHeight <= 0
+  )
+    return { dialMax: null, many: false };
+  const rows = Math.ceil(count / cols);
+  const verticalPad =
+    SCREEN_PAD_TOP_PX + SCREEN_PAD_BOTTOM_PX + (navStripHeight || 0);
+  const rowBudget = Math.floor(
+    (viewportHeight -
+      verticalPad -
+      GRID_GAP_PX * (rows - 1) -
+      (extraPx || 0)) /
+      rows
+  );
+  const dialMax = rowBudget - controlsReserve;
+  if (dialMax < DIAL_FIT_MIN_PX) return { dialMax: null, many: true };
+  return { dialMax, many: false };
+}
+
 // -- scroll persistence (DESIGN-7, Phase 7) ------------------------------
 //
 // The screensaver return must restore the EXACT state, not just the
@@ -289,10 +374,13 @@ function serializeTimerScroll(state) {
 //     a desktop browser can spoof it, and a kiosk can strip it.
 //
 // Precedence (first match wins) — the unified §3.7 rule (TIMER-2),
-// with the DESIGN-9 tablet category (Phase 7):
-//   1. The exact 1920x1200 panel signature is the hub, whatever
-//      pointers are present: the kiosk has a mouse attached, so a
-//      fine pointer must never demote it to desktop.
+// with the DESIGN-9 tablet category (Phase 7), as reordered by P8-16:
+//   1. The exact panel signature FIRST, either orientation: 1920x1200
+//      (landscape wall) or 1200x1920 (the same panel rotated — O2-01).
+//      The signature holds whatever pointer the browser reports
+//      (headless reports none; a mouse reports fine). This is what
+//      makes the hub layout engage in the rig, where no touch is
+//      reported.
 //   2. An iPad user agent is a tablet; an Android tablet ("Android"
 //      with no "Mobi"/"Mobile" token, viewport at least 768px) is a
 //      tablet.
@@ -303,38 +391,43 @@ function serializeTimerScroll(state) {
 //      the viewport).
 //   5. A touch screen in the tablet band (768-1024px wide, either
 //      orientation) is a tablet.
-//   6. Touch on a landscape screen at least 1600px wide is the hub
-//      (the kiosk has a mouse, so a fine pointer is present too).
-//   7. A coarse pointer on anything else is mobile (phones/tablets
-//      outside the band); a coarse pointer that reaches this far on
-//      a hub-size landscape screen is the hub (step 8), so a
-//      touch-less hub-size screen with a mouse attached still reads
-//      as the hub.
-//   8. A fine pointer is desktop. Bare width >=1600 + landscape
-//      NEVER implies hub on its own — that rule is FORBIDDEN (§3.7):
-//      it classifies every 1920x1080 / 1680x1050 / 1600x900 desktop
-//      monitor as a hub.
+//   6. A fine pointer at 1024px or wider is desktop — a touchscreen
+//      laptop has a mouse or trackpad, so fine wins over coarse here
+//      (P8-16; OQ-7 decided: 1366x768 touch laptop is desktop, and a
+//      1080x1920 portrait touch laptop is desktop too, O2-07).
+//   7. A coarse pointer with no fine pointer is mobile (phones and
+//      touch-only tablets outside the band).
+//   8. A fine pointer is desktop.
 //   9. With no pointer information: a viewport at least 1024px wide
 //      is desktop; anything else is mobile.
+//
+// The old rule 8 (touch + width >= 1600 + landscape = hub) is DELETED:
+// it existed only to misclassify touchscreen laptops as the hub, and
+// the kiosk is already caught by rule 1 above.
 //
 // Known limits (every fallback still renders a usable layout, never a
 // broken one):
 //   - A 1920x1200 laptop (rare) reads as the hub: it is
 //     indistinguishable from the wall panel by size alone. That is
-//     the documented residual misclassification (§3.7).
-//   - A desktop touchscreen at 1920x1080 reads as the hub (touch +
-//     hub-size). That is the current behaviour in all three cards.
+//     the documented residual misclassification (§3.7). The same
+//     holds for a 1200x1920 laptop (the rotated signature).
 //   - A phone in desktop mode (no mobile user agent) still reads as
 //     mobile by width (rule 4).
 //   - A touchscreen laptop at 1366x768 (coarse, outside the tablet
-//     band) still reads as mobile — open question OQ-7 (Phase 7 log).
+//     band) with NO fine pointer still reads as mobile — a laptop
+//     without a mouse/trackpad is indistinguishable from a tablet
+//     outside the band by these signals alone.
+//   - Pi 5 pointer reporting with a mouse attached was never measured
+//     on the device (spec §13 item 17) — rule 1 exists so the hub
+//     layout does not depend on it.
 //
 // Orientation is separate from category: landscape is width >= height,
 // portrait is width < height. The category picks the control sizes and
 // the base layout; orientation picks the grid (e.g. one column in
 // portrait, two in landscape on mobile).
 
-const HUB_MIN_WIDTH_PX = 1600;
+const HUB_PANEL_WIDTH_PX = 1920;
+const HUB_PANEL_HEIGHT_PX = 1200;
 const MOBILE_MAX_WIDTH_PX = 768;
 const DESKTOP_MIN_WIDTH_PX = 1024;
 const MOBILE_USER_AGENT = /Mobi|Android|iPhone|iPad|iPod/i;
@@ -342,8 +435,6 @@ const TABLET_MAX_WIDTH_PX = 1024;
 const TABLET_USER_AGENT = /iPad/i;
 const ANDROID_USER_AGENT = /Android/i;
 const MOBILE_TOKEN = /Mobi/i;
-const HUB_PANEL_WIDTH_PX = 1920;
-const HUB_PANEL_HEIGHT_PX = 1200;
 
 // The device the card is running on, from a plain environment object
 // (width/height in CSS pixels, pointer flags, touch flag, user agent).
@@ -359,10 +450,15 @@ function detectDevice(env) {
   const fine = Boolean(env && env.finePointer);
   const touch = Boolean(env && env.touch);
   let category;
+  // Rule 1 — the kitchen panel, either orientation: the exact
+  // 1920x1200 signature is the hub in landscape, and the same panel
+  // rotated (1200x1920) is the hub in portrait (O2-01 — the portrait
+  // wall needs its OWN layout, not the phone layout). A 1920x1200
+  // laptop reads as hub too — the documented residual (spec §3.7):
+  // the panel signature is the only discriminator.
   if (
-    width === HUB_PANEL_WIDTH_PX &&
-    height === HUB_PANEL_HEIGHT_PX &&
-    orientation === "landscape"
+    (width === HUB_PANEL_WIDTH_PX && height === HUB_PANEL_HEIGHT_PX) ||
+    (width === HUB_PANEL_HEIGHT_PX && height === HUB_PANEL_WIDTH_PX)
   )
     category = "hub";
   // A tablet user agent is a tablet, whatever the viewport: an iPad
@@ -389,19 +485,38 @@ function detectDevice(env) {
     width <= TABLET_MAX_WIDTH_PX
   )
     category = "tablet";
-  else if (coarse && !(width >= HUB_MIN_WIDTH_PX && orientation === "landscape"))
-    category = "mobile";
-  // A touch screen that is hub-sized and landscape IS the hub, even
-  // when a mouse is also attached: the kiosk has a mouse, so a fine
-  // pointer is present too, and checking fine first would mis-detect
-  // the hub as a desktop. Touch + hub size wins over fine pointer.
-  else if (touch && width >= HUB_MIN_WIDTH_PX && orientation === "landscape")
-    category = "hub";
-  else if (coarse) category = "hub";
+  // A device with a fine pointer is desktop-class (P8-16): a
+  // touchscreen laptop has a mouse or trackpad, so fine wins over
+  // coarse here — a 1366x768 touch laptop is a desktop (OQ-7), and a
+  // 1080x1920 portrait touch laptop is a desktop too (O2-07), not a
+  // phone. The old rule 8 (touch + width >= 1600 + landscape = hub)
+  // is DELETED: it existed only to misclassify touchscreen laptops
+  // as the hub, and the kiosk is already caught by rule 1 above.
+  else if (fine && width >= DESKTOP_MIN_WIDTH_PX) category = "desktop";
+  else if (coarse) category = "mobile";
   else if (fine) category = "desktop";
   else if (width >= DESKTOP_MIN_WIDTH_PX) category = "desktop";
   else category = "mobile";
   return { category, orientation };
+}
+
+// Whether the card is running in kiosk mode, from the URL query
+// string (pure — tested). The wall loads /family-hub?kiosk; a desktop
+// browser tab does not. Kiosk mode is what decides the nav strip:
+// the strip shows in kiosk mode ALWAYS and hides on desktop only when
+// NOT in kiosk mode (NAV-1 kiosk-desktop hole — HA tabs do not exist
+// in kiosk mode, so hiding the strip there leaves zero navigation).
+// The category itself does not change: a desktop-class viewport in
+// kiosk mode is still dev-desktop, it just keeps its strip.
+function isKioskMode(search) {
+  const query = String(
+    (search === null || search === undefined ? "" : search) || ""
+  );
+  if (!query) return false;
+  const params = query.replace(/^\?/, "").split("&");
+  return params.some(
+    (part) => part === "kiosk" || part.indexOf("kiosk=") === 0
+  );
 }
 
 // The environment the card is actually running in, read from the
@@ -428,6 +543,11 @@ function readDeviceEnv() {
     finePointer: fine,
     touch,
     userAgent: navigator.userAgent || "",
+    kiosk: isKioskMode(
+      typeof window.location === "object" && window.location
+        ? window.location.search || ""
+        : ""
+    ),
   };
 }
 
@@ -475,10 +595,10 @@ const CARD_CSS = `
     overflow-y: auto;
     --controls-reserve: 100px;
     /* NAV-1: the nav strip's height on this device (84px hub, 76px
-       tablet, 60px mobile, 0px desktop-hidden). The screen reserves
-       it in bottom padding so the last row scrolls clear of the
-       fixed strip, and the scroll hint sits above it — both read the
-       var off .screen. */
+       tablet, 60px mobile, 0px desktop-hidden, 84px desktop+kiosk).
+       The screen reserves it in bottom padding so the last row
+       scrolls clear of the fixed strip; the Undo toast reads the
+       same var. */
     --nav-strip-height: 84px;
     padding-bottom: calc(24px + var(--nav-strip-height, 84px));
   }
@@ -496,7 +616,6 @@ const CARD_CSS = `
     .dial { min-width: 0; }
     .empty { grid-column: 1 / -1; }
     .back-bar { grid-column: 1 / -1; }
-    .scroll-hint { grid-column: 1 / -1; }
   }
   .dial {
     flex: 1 1 0;
@@ -532,18 +651,24 @@ const CARD_CSS = `
   }
   .dial-button:active { transform: scale(0.98); }
   /* In a landscape grid the dial is a circle, so its diameter is the
-     smaller of the column width and the height left after the screen
-     padding and the button row below it. Sizing by width (with
-     aspect-ratio) keeps the button square: sizing by height and
-     clamping the width left a tall empty button with a small circle
-     centred in it. The max-height is only a safety net for when the
-     card is not full-screen (Home Assistant chrome visible): in kiosk
-     mode the width cap already accounts for the same budget.
-     This sits after the base .dial-button rule on purpose — same
-     specificity, so the later rule wins for the properties it sets. */
+     smaller of the column width, the height left after the screen
+     padding and the button row below it, and --dial-max — the height
+     budget for the ROW count (P8-3/P8-6: _applyDialFit sets it from
+     the live viewport height, so the dials shrink as rows grow and
+     the view fits the viewport for counts <= 12 instead of sizing
+     by width alone). The var() fallback is effectively unbounded, so
+     a card with no fit computed (portrait, no window) behaves as
+     before. Sizing by width (with aspect-ratio) keeps the button
+     square: sizing by height and clamping the width left a tall
+     empty button with a small circle centred in it. The max-height
+     is only a safety net for when the card is not full-screen (Home
+     Assistant chrome visible): in kiosk mode the width cap already
+     accounts for the same budget. This sits after the base
+     .dial-button rule on purpose — same specificity, so the later
+     rule wins for the properties it sets. */
   @media (orientation: landscape) {
     .dial-button {
-      width: min(100%, calc(100vh - var(--controls-reserve) - 48px));
+      width: min(100%, calc(100vh - var(--controls-reserve) - 48px), var(--dial-max, 100000px));
       height: auto;
       max-height: calc(100% - var(--controls-reserve));
     }
@@ -586,7 +711,7 @@ const CARD_CSS = `
      top stroke and the hint is clipped by the button below. Padding
      the overlay by the reserve centres the text on the ring instead;
      the reserve matches the controls height per context (100px hub,
-     68px desktop, 76px mobile), so the alignment holds everywhere. */
+     76px desktop, 84px tablet/mobile), so the alignment holds everywhere. */
   .dial-text {
     position: absolute;
     inset: 0;
@@ -624,7 +749,7 @@ const CARD_CSS = `
     min-height: 80px;
     padding: 12px 8px;
     border-radius: 16px;
-    border: 1px solid #e0e0e0;
+    border: 1px solid #EDE8E3;
     background: var(--card-background-color, #fff);
     color: var(--primary-text-color, #212121);
     font-size: 22px;
@@ -667,7 +792,7 @@ const CARD_CSS = `
     min-width: 96px;
     padding: 12px 20px;
     border-radius: 16px;
-    border: 1px solid #e0e0e0;
+    border: 1px solid #EDE8E3;
     background: var(--card-background-color, #fff);
     color: #212121;
     font-size: 20px;
@@ -685,7 +810,7 @@ const CARD_CSS = `
     min-height: 64px;
     padding: 12px 24px;
     border-radius: 16px;
-    border: 1px solid #e0e0e0;
+    border: 1px solid #EDE8E3;
     background: var(--card-background-color, #fff);
     color: #212121;
     font-size: 22px;
@@ -695,14 +820,16 @@ const CARD_CSS = `
   /* -- Navigation strip (NAV-1) ---------------------------------------
      The persistent strip, FIRST in the DOM (tab order). Noun labels,
      Home first, the current view (Timers) with the accent background,
-     heavier weight, and aria-current. Hidden on DESKTOP only, where
-     HA tabs already exist and work; always shown on hub AND phone.
-     The button sizes and the strip heights match the recipe card
-     exactly (hub 64px / 24px, tablet 56px / 20px, mobile 48px / 16px
-     nowrap), so the strip is the same height on every view. The
-     background is the HA page background (#FAFAFA by default) — the
-     timer screen is transparent, so the strip must be opaque against
-     the page its dials scroll over.
+     heavier weight, and aria-current. Hidden on DESKTOP only when NOT
+     in kiosk mode, where HA tabs already exist and work; always shown
+     on hub AND phone, and on desktop IN kiosk mode (HA tabs do not
+     exist there — the kiosk-desktop hole). The button sizes and the
+     strip heights match the recipe card exactly (hub 64px / 24px,
+     tablet 56px / 20px, mobile 48px / 16px nowrap), so the strip is
+     the same height on every view. The background is the HA page
+     background (#FAFAFA by default) — the timer screen is
+     transparent, so the strip must be opaque against the page its
+     dials scroll over.
      Positioning: FIXED to the viewport bottom, in both orientations.
      The recipe card's strip is sticky — but its screen is not a
      scroll container, so sticky pins against the document. The timer
@@ -713,8 +840,7 @@ const CARD_CSS = `
      Fixed is viewport-relative in both scroll modes (the screen
      scrolling internally, and the document scrolling), and the screen
      reserves the strip's height in bottom padding so the last row
-     scrolls clear of it. The scroll hint uses the same fixed
-     mechanism (its live behaviour is the precedent). */
+     scrolls clear of it. */
   .nav-strip {
     position: fixed;
     bottom: 0;
@@ -732,7 +858,7 @@ const CARD_CSS = `
     min-height: 64px;
     padding: 12px 20px;
     border-radius: 16px;
-    border: 1px solid #e0e0e0;
+    border: 1px solid #EDE8E3;
     background: var(--card-background-color, #fff);
     box-shadow: 0 1px 2px rgba(28, 25, 23, 0.05), 0 8px 20px rgba(28, 25, 23, 0.06);
     color: var(--primary-text-color, #212121);
@@ -741,46 +867,42 @@ const CARD_CSS = `
     cursor: pointer;
     font-family: inherit;
     overflow-wrap: break-word;
+    /* Anchor for the scroll badge (P8-5): the badge is absolutely
+       positioned at this button's top-right corner. */
+    position: relative;
   }
   .nav-strip-button:hover { box-shadow: 0 2px 4px rgba(28, 25, 23, 0.06), 0 14px 28px rgba(28, 25, 23, 0.10); }
   .nav-strip-button:active { transform: scale(0.98); }
   .nav-strip-button.active { background: #C2410C; border-color: #C2410C; color: #fff; font-weight: 800; }
   .nav-strip-button:focus-visible { outline: 2px solid #C2410C; outline-offset: 2px; }
-  /* Visible scroll indicator (TIMER-7): shown only while the screen
-     can scroll further down. */
-  /* The scroll hint floats at the bottom of the VIEWPORT, not the
-     bottom of the screen (TIMER-7): the screen is taller than the
-     viewport when many timers are shown (the Lovelace view sizes the
-     card slot to content), so a hint that is a grid item at the end
-     of the screen sits below the fold exactly when it matters most.
-     position: sticky with bottom: 0 cannot fix that — a sticky element
-     cannot leave its own grid row, and the hint's row is the last
-     row. Fixed positioning takes it out of the grid flow entirely
-     (it also stops the screen growing by a row whenever the hint
-     shows). It hides when the card is scrolled off-screen — see
-     _updateScrollHint's in-view guard. */
-  .scroll-hint {
-    position: fixed;
-    /* Above the nav strip (NAV-1): the strip sits at the viewport
-       bottom, so the hint clears it by the strip's height + 16px.
-       On desktop the strip is hidden (--nav-strip-height: 0px) and
-       the hint stays at 16px. */
-    bottom: calc(16px + var(--nav-strip-height, 84px));
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 10;
-    /* Informational only: taps pass through to the dial underneath,
-       so the pill never eats a pause/resume tap on the last row. */
-    pointer-events: none;
+  /* Visible scroll indicator (TIMER-7 / P8-5): a "↓" badge on the
+     Timers strip button, shown only while a dial sits below the
+     viewport fold (P8-4 gate — see _updateScrollBadge). The strip is
+     already fixed chrome, so the indicator overlaps nothing — the
+     old floating pill sat over the middle column's dial and its
+     controls by construction. Corner-positioned, so it never changes
+     the button's size or wraps its label (the strip buttons are
+     tight at 360px); pointer-events none, so taps still hit the
+     button underneath. */
+  .nav-scroll-badge {
+    position: absolute;
+    top: -10px;
+    right: 6px;
+    min-width: 28px;
+    height: 28px;
+    padding: 0 6px;
+    box-sizing: border-box;
+    border-radius: 999px;
     background: #1C1917;
     color: #fff;
     font-size: 18px;
     font-weight: 700;
-    padding: 12px 24px;
-    border-radius: 16px;
+    line-height: 28px;
     text-align: center;
+    pointer-events: none;
+    z-index: 1;
   }
-  .scroll-hint[hidden] { display: none; }
+  .nav-scroll-badge[hidden] { display: none; }
   /* Compact finished rows (TIMER-7): past 12 timers a finished timer
      collapses to one short full-width row instead of a dial. */
   .compact-row { display: none; }
@@ -802,7 +924,7 @@ const CARD_CSS = `
     min-height: 64px;
     padding: 8px 16px;
     box-sizing: border-box;
-    border: 1px solid #e0e0e0;
+    border: 1px solid #EDE8E3;
     border-radius: 16px;
     background: var(--card-background-color, #fff);
     cursor: pointer;
@@ -822,7 +944,7 @@ const CARD_CSS = `
     min-height: 56px;
     padding: 8px 20px;
     border-radius: 16px;
-    border: 1px solid #e0e0e0;
+    border: 1px solid #EDE8E3;
     background: var(--card-background-color, #fff);
     color: #212121;
     font-size: 20px;
@@ -839,6 +961,13 @@ const CARD_CSS = `
     .screen.many .time { font-size: 44px; }
     .screen.many .name { font-size: 18px; }
     .screen.many .state, .screen.many .hint { font-size: 16px; }
+    /* Small FITTED dials (not many-mode, but shrunk by --dial-max
+       below SMALL_DIAL_MAX_PX — 155px at 12 timers on the hub) take
+       the same text scale: the 72px time is ~200px wide and bursts
+       out of a 155px ring. The class is set by _applyDialFit. */
+    .screen.small-dials .time { font-size: 44px; }
+    .screen.small-dials .name { font-size: 18px; }
+    .screen.small-dials .state, .screen.small-dials .hint { font-size: 16px; }
   }
   /* Cancel Undo toast (TIMER-13): overlaid on the card, never in the
      grid flow, so it cannot shift the dials when it appears. */
@@ -879,6 +1008,7 @@ const CARD_CSS = `
   .screen.dev-hub ~ .toast { bottom: 108px; }
   .screen.dev-tablet ~ .toast { bottom: 100px; }
   .screen.dev-mobile ~ .toast { bottom: 84px; }
+  .screen.dev-desktop.kiosk ~ .toast { bottom: 108px; }
   /* -- Adaptive layout --------------------------------------------------
      The card detects its device (see detectDevice) and carries the
      category + orientation as classes on .screen: dev-hub, dev-desktop,
@@ -890,22 +1020,30 @@ const CARD_CSS = `
   /* Desktop: a mouse is precise, so the buttons shrink and the grid
      gets denser — up to four dials in a row (see gridColumns). The
      reserve below each dial shrinks with the buttons. */
-  .screen.dev-desktop { --controls-reserve: 68px; --nav-strip-height: 0px; }
+  .screen.dev-desktop { --controls-reserve: 76px; --nav-strip-height: 0px; }
   .screen.dev-desktop .controls button { min-height: 56px; font-size: 18px; padding: 8px; }
   .screen.dev-desktop .empty { font-size: clamp(18px, 3vmin, 26px); }
   .screen.dev-desktop .name { font-size: 20px; }
   .screen.dev-desktop .state, .screen.dev-desktop .hint { font-size: 16px; }
   .screen.dev-desktop .back-bar button { min-height: 56px; font-size: 18px; }
   /* Desktop: the nav strip is hidden (HA tabs already exist and work
-     there — NAV-1). */
+     there — NAV-1) ONLY when NOT in kiosk mode: in kiosk mode HA tabs
+     do not exist, so a desktop-class viewport in kiosk mode would have
+     ZERO navigation with the strip hidden (the kiosk-desktop hole).
+     The strip therefore shows in kiosk mode ALWAYS (the ".kiosk"
+     override below); desktop+kiosk reserves the strip height (84px)
+     in --nav-strip-height so the last row scrolls clear of it, and
+     the Undo toast clears it too. */
   .screen.dev-desktop .nav-strip { display: none; }
+  .screen.dev-desktop.kiosk { --nav-strip-height: 84px; }
+  .screen.dev-desktop.kiosk .nav-strip { display: block; }
   /* Mobile: touch targets stay large (a finger is not a mouse) and the
      buttons stay reachable. In portrait the dials stack; each dial
      keeps a minimum height so its time stays readable, and the screen
      scrolls when five timers need more room than the phone has.
      Preset chips (TIMER-4) show on mobile and tablet — the hub is
      voice-only by deliberate choice. */
-  .screen.dev-mobile { --controls-reserve: 76px; --nav-strip-height: 60px; }
+  .screen.dev-mobile { --controls-reserve: 84px; --nav-strip-height: 60px; }
   .screen.dev-mobile .controls button { min-height: 64px; font-size: 18px; }
   .screen.dev-mobile.orient-portrait { overflow-y: auto; }
   /* Phase 7 follow-up (Fix 2): the finished dial's two sub-lines
@@ -936,7 +1074,7 @@ const CARD_CSS = `
      at 1m. Preset chips show here too (TIMER-4: phone/tablet get
      on-screen presets; hub is voice-only). The dial grid keeps the
      non-desktop rule (at most three columns — see gridColumns). */
-  .screen.dev-tablet { --controls-reserve: 76px; --nav-strip-height: 76px; }
+  .screen.dev-tablet { --controls-reserve: 84px; --nav-strip-height: 76px; }
   .screen.dev-tablet .controls button { min-height: 64px; font-size: 18px; }
   .screen.dev-tablet .empty { font-size: clamp(18px, 3vmin, 26px); }
   .screen.dev-tablet .name { font-size: 20px; }
@@ -982,12 +1120,13 @@ class TimerScreenCard extends HTMLElement {
     this._backBarEl = null;
     this._navStripEl = null; // NAV-1 strip (built in _ensureShell)
     this._lastNavigation = null; // Last path _navigate was asked for (test hook)
-    this._scrollHintEl = null;
+    this._scrollBadgeEl = null; // "↓" badge on the Timers strip button (P8-5), built in _ensureShell
     this._toastEl = null;
     this._toastTimer = null;
     this._undoTimer = null;
     this._presetBusy = false;
     this._device = null; // { category, orientation } from detectDevice, or null outside a browser.
+    this._manyMode = false; // dialFit() says the height budget cannot fit (P8-3/P8-6), or count > MANY_TIMERS.
     this._resizeBound = null;
     this._scrollBound = null;
     this._windowScrollBound = null;
@@ -1049,10 +1188,10 @@ class TimerScreenCard extends HTMLElement {
       this._resizeBound = () => this._onResize();
       window.addEventListener("resize", this._resizeBound);
     }
-    // The scroll hint (TIMER-7) also tracks the document scroll: when
+    // The scroll badge (TIMER-7) also tracks the document scroll: when
     // the Lovelace view sizes the card to content, the screen is
     // taller than the viewport and the page scrolls, not the screen —
-    // without this listener the hint would never update as the user
+    // without this listener the badge would never update as the user
     // scrolls down to the last dials. The same listener saves the
     // scroll position (DESIGN-7), so the screensaver return restores
     // the exact state.
@@ -1062,7 +1201,7 @@ class TimerScreenCard extends HTMLElement {
       !this._windowScrollBound
     ) {
       this._windowScrollBound = () => {
-        this._updateScrollHint();
+        this._updateScrollBadge();
         this._scheduleScrollSave();
       };
       window.addEventListener("scroll", this._windowScrollBound, {
@@ -1104,18 +1243,25 @@ class TimerScreenCard extends HTMLElement {
   _onResize() {
     // Re-sync only when the device actually changed: a category change
     // moves the grid columns, an orientation change moves the layout.
+    // A pure viewport resize (same category, same orientation) still
+    // re-fits the dials — --dial-max depends on the viewport height —
+    // and a many-mode flip from the new height re-syncs too, so the
+    // compact finished rows follow the fit.
     const before = this._device;
+    const manyBefore = this._manyMode;
     this._applyDevice();
     const after = this._device;
+    this._applyDialFit();
     if (
       before &&
       after &&
       (before.category !== after.category ||
-        before.orientation !== after.orientation)
+        before.orientation !== after.orientation ||
+        manyBefore !== this._manyMode)
     ) {
       this._sync();
     }
-    this._updateScrollHint();
+    this._updateScrollBadge();
   }
 
   // Detect the device and carry it as classes on the screen element:
@@ -1136,12 +1282,87 @@ class TimerScreenCard extends HTMLElement {
       "dev-tablet",
       "dev-mobile",
       "orient-landscape",
-      "orient-portrait"
+      "orient-portrait",
+      "kiosk"
     );
     this._screenEl.classList.add(
       `dev-${device.category}`,
       `orient-${device.orientation}`
     );
+    // Kiosk mode is a class of its own (not a device category): the
+    // nav strip shows in kiosk mode ALWAYS, even on desktop (NAV-1).
+    if (env.kiosk) this._screenEl.classList.add("kiosk");
+  }
+
+  // Height-budget dial cap (P8-3/P8-6): set --dial-max on .screen from
+  // the live viewport, row count and per-category reserves, or clear
+  // it when there is nothing to fit (portrait — the cap only applies
+  // inside the landscape media query — no window, or no timers). The
+  // many-mode flag is computed here too, so _sync and _onResize share
+  // one decision: count > MANY_TIMERS, or the fit floor.
+  _applyDialFit() {
+    if (!this._screenEl) return;
+    const device = this._device;
+    if (
+      !device ||
+      device.orientation !== "landscape" ||
+      typeof window === "undefined" ||
+      !window.innerHeight
+    ) {
+      this._screenEl.style.removeProperty("--dial-max");
+      this._screenEl.classList.remove("small-dials");
+      this._manyMode = this._timers.length > MANY_TIMERS;
+      return;
+    }
+    // The controls reserve is the space BELOW the ring in one dial:
+    // 12px .controls margin-top + the button min-height (80px hub,
+    // 56px desktop, 64px tablet/mobile) + the 8px margin-top of the
+    // (usually empty) .error div. The empty error div still takes its
+    // margin, so a reserve without it is 8px short per row and the
+    // view scrolls that much on desktop/tablet/mobile (measured live
+    // at 1366x768: docH 776 vs vh 768; the hub's 100 already included
+    // it: 12 + 80 + 8). The CSS --controls-reserve vars below must
+    // match these numbers: they size the button AND centre the
+    // .dial-text overlay on the ring.
+    const reserves = {
+      hub: { controls: 100, nav: 84 },
+      desktop: { controls: 76, nav: 0 },
+      tablet: { controls: 84, nav: 76 },
+      mobile: { controls: 84, nav: 60 },
+    };
+    const reserve = reserves[device.category] || reserves.hub;
+    // Desktop in kiosk mode keeps the strip (NAV-1), so it reserves
+    // the strip height like the hub instead of 0.
+    const nav =
+      device.category === "desktop" &&
+      this._screenEl.classList.contains("kiosk")
+        ? 84
+        : reserve.nav;
+    const cols = gridColumns(this._timers.length, device.category);
+    // The "Back to recipe" bar (TIMER-10) is a full-width grid row:
+    // 64px button + one 16px gap, taken out of the height budget.
+    const extra = this._recipeContext ? 80 : 0;
+    const fit = dialFit(
+      this._timers.length,
+      cols,
+      window.innerHeight,
+      reserve.controls,
+      nav,
+      extra
+    );
+    if (fit.dialMax !== null) {
+      this._screenEl.style.setProperty("--dial-max", `${fit.dialMax}px`);
+    } else {
+      this._screenEl.style.removeProperty("--dial-max");
+    }
+    // Small fitted dials take the many-mode text scale (see
+    // SMALL_DIAL_MAX_PX): without it the 72px time bursts out of a
+    // 155px ring at 12 timers.
+    this._screenEl.classList.toggle(
+      "small-dials",
+      fit.dialMax !== null && fit.dialMax < SMALL_DIAL_MAX_PX
+    );
+    this._manyMode = fit.many || this._timers.length > MANY_TIMERS;
   }
 
   _stopTick() {
@@ -1172,14 +1393,24 @@ class TimerScreenCard extends HTMLElement {
     this._navStripEl = document.createElement("nav");
     this._navStripEl.className = "nav-strip";
     this._navStripEl.setAttribute("aria-label", "Views");
+    // P8-5: the scroll indicator lives ON the strip — a "↓" badge on
+    // the Timers button (the strip is already fixed chrome, so the
+    // indicator overlaps nothing). It is aria-hidden: the badge is a
+    // visual cue only; the dials themselves are in the DOM and
+    // reachable by scrolling.
     this._navStripEl.innerHTML =
       '<div class="nav-strip-buttons">' +
       NAV_STRIP_VIEWS.map((view) => {
         const active = view.key === "timers";
-        return `<button type="button" class="nav-strip-button${active ? " active" : ""}" data-action="nav" data-path="${view.path}"${active ? ' aria-current="page"' : ""}>${view.label}</button>`;
+        const badge =
+          view.key === "timers"
+            ? '<span class="nav-scroll-badge" aria-hidden="true" hidden>↓</span>'
+            : "";
+        return `<button type="button" class="nav-strip-button${active ? " active" : ""}" data-action="nav" data-path="${view.path}"${active ? ' aria-current="page"' : ""}>${view.label}${badge}</button>`;
       }).join("") +
       "</div>";
     this._screenEl.appendChild(this._navStripEl);
+    this._scrollBadgeEl = this._navStripEl.querySelector(".nav-scroll-badge");
     this._backBarEl = document.createElement("div");
     this._backBarEl.className = "back-bar";
     this._backBarEl.hidden = true;
@@ -1203,11 +1434,6 @@ class TimerScreenCard extends HTMLElement {
       '<div class="empty-error" hidden></div>';
     this._screenEl.appendChild(this._emptyEl);
     this._emptyErrorEl = this._emptyEl.querySelector(".empty-error");
-    this._scrollHintEl = document.createElement("div");
-    this._scrollHintEl.className = "scroll-hint";
-    this._scrollHintEl.hidden = true;
-    this._scrollHintEl.textContent = "↓ More timers below — scroll for more";
-    this._screenEl.appendChild(this._scrollHintEl);
     this._toastEl = document.createElement("div");
     this._toastEl.className = "toast";
     this._toastEl.hidden = true;
@@ -1221,25 +1447,25 @@ class TimerScreenCard extends HTMLElement {
     }
     if (this._scrollBound === null && typeof this._screenEl.addEventListener === "function") {
       this._scrollBound = () => {
-        this._updateScrollHint();
+        this._updateScrollBadge();
         this._scheduleScrollSave();
       };
       this._screenEl.addEventListener("scroll", this._scrollBound);
     }
-    // The hint also re-evaluates when the screen itself changes size
+    // The badge also re-evaluates when the screen itself changes size
     // (TIMER-7): _sync runs while the Lovelace view is still sizing
-    // the card, so the first _updateScrollHint can measure a screen
+    // the card, so the first _updateScrollBadge can measure a screen
     // that is still at its minimum height — and nothing else fires
     // when the view later grows the card to its full height. The
     // observer fires on that growth (and on dial adds/removes), and
-    // it fires once on observe, so the hint is correct from the first
+    // it fires once on observe, so the badge is correct from the first
     // settled layout. (No ResizeObserver in node tests: skipped.)
     if (
       this._screenResizeObserver === null &&
       typeof ResizeObserver !== "undefined"
     ) {
       this._screenResizeObserver = new ResizeObserver(() =>
-        this._updateScrollHint()
+        this._updateScrollBadge()
       );
       this._screenResizeObserver.observe(this._screenEl);
     }
@@ -1255,6 +1481,9 @@ class TimerScreenCard extends HTMLElement {
   _sync() {
     if (!this._screenEl) return;
     this._applyDevice();
+    // Fit the dials to the height budget before building them: the
+    // many-mode flag decides the compact finished rows below.
+    this._applyDialFit();
     const now = Date.now();
     const live = new Set(this._timers.map((t) => t.timer_id));
 
@@ -1304,16 +1533,13 @@ class TimerScreenCard extends HTMLElement {
 
     this._emptyEl.hidden = this._timers.length > 0;
     this._backBarEl.hidden = !this._recipeContext;
-    // The scroll hint is a grid item: keep it after every dial so it
-    // renders at the bottom of the view, not above the dials.
-    this._screenEl.appendChild(this._scrollHintEl);
-    this._screenEl.classList.toggle("many", this._timers.length > MANY_TIMERS);
+    this._screenEl.classList.toggle("many", this._manyMode);
     this._screenEl.classList.remove("cols-1", "cols-2", "cols-3", "cols-4");
     this._screenEl.classList.add(
       `cols-${gridColumns(this._timers.length, this._device ? this._device.category : undefined)}`
     );
     this._flip(before);
-    this._updateScrollHint();
+    this._updateScrollBadge();
     this._restoreScroll();
   }
 
@@ -1396,37 +1622,43 @@ class TimerScreenCard extends HTMLElement {
     this._scrollRestored = done;
   }
 
-  _updateScrollHint() {
-    if (!this._screenEl || !this._scrollHintEl) return;
+  // Scroll indicator (TIMER-7 / P8-4 / P8-5): the "↓" badge on the
+  // Timers strip button shows only while at least one DIAL sits below
+  // the fold — not whenever the screen's rect extends below it. The
+  // old gate fired whenever the controls row overflowed (e.g. with 1
+  // timer), so the pill claimed "More timers below" when there were
+  // none. The fold is the lower of the viewport bottom and the
+  // screen's own bottom: in document-scroll mode the screen runs past
+  // the viewport, in internal-scroll mode the screen is shorter than
+  // the viewport and its own bottom is the fold. Either way the
+  // getBoundingClientRect() of a dial already accounts for scrolling,
+  // so one check covers both scroll modes — and once the user has
+  // scrolled to the bottom the last dial is fully visible and the
+  // badge hides itself. (No window in node tests: the badge stays
+  // hidden and the logic is skipped.)
+  _updateScrollBadge() {
+    if (!this._screenEl || !this._scrollBadgeEl) return;
     const el = this._screenEl;
-    // Two ways the Timers view can overflow (TIMER-7): the screen
-    // scrolls internally (its own overflow-y), or the Lovelace view
-    // sizes the card slot to content, so the screen grows taller than
-    // the viewport and the DOCUMENT scrolls instead — the case that
-    // actually happens in the rig and on the hub (measured: screen
-    // 1312px tall in a 1200px viewport, scrollHeight == clientHeight,
-    // document scrollHeight 1312). The old logic only measured the
-    // internal scroll, so the hint never showed even with 112px of
-    // dials below the fold. "Below the fold" is read off the screen's
-    // own rect, which works in both cases and needs no knowledge of
-    // which ancestor scrolls. (No window in node tests: the document
-    // part is skipped and the logic falls back to internal-only.)
-    const internalCanScroll = el.scrollHeight > el.clientHeight + 4;
-    const internalAtBottom =
-      el.scrollTop + el.clientHeight >= el.scrollHeight - 4;
-    let belowFold = false;
-    let inView = true;
+    let show = false;
     if (typeof window !== "undefined" && window.innerHeight) {
       const rect = el.getBoundingClientRect();
-      belowFold = rect.bottom > window.innerHeight + 4;
-      // The hint is fixed to the viewport, so it must also hide when
-      // the card itself is scrolled off-screen (below the fold in a
-      // multi-card view): otherwise it would float over other cards.
-      inView = rect.top < window.innerHeight && rect.bottom > 0;
+      const inView = rect.top < window.innerHeight && rect.bottom > 0;
+      if (inView) {
+        const foldY = Math.min(window.innerHeight, rect.bottom);
+        for (const dialEl of this._dialEls.values()) {
+          const r = dialEl.getBoundingClientRect();
+          if (
+            r &&
+            typeof r.bottom === "number" &&
+            r.bottom > foldY + 4
+          ) {
+            show = true;
+            break;
+          }
+        }
+      }
     }
-    const canScroll = (internalCanScroll || belowFold) && inView;
-    const atBottom = internalAtBottom && !belowFold;
-    this._scrollHintEl.hidden = !canScroll || atBottom;
+    this._scrollBadgeEl.hidden = !show;
   }
 
   _flip(before) {
@@ -1505,11 +1737,10 @@ class TimerScreenCard extends HTMLElement {
       "soon",
       !isFinished && timer.state === "active" && left > 0 && left <= FINISHING_SOON_SECONDS
     );
-    // Past 12 timers a finished timer collapses to a compact row (TIMER-7).
-    el.classList.toggle(
-      "compact-mode",
-      isFinished && this._timers.length > MANY_TIMERS
-    );
+    // Past 12 timers — or whenever the height budget cannot fit the
+    // dials (P8-3/P8-6) — a finished timer collapses to a compact row
+    // (TIMER-7).
+    el.classList.toggle("compact-mode", isFinished && this._manyMode);
 
     // The dial itself is the primary tap target — the biggest, most
     // forgiving thing on the screen. It pauses a running timer, resumes
@@ -1669,13 +1900,17 @@ class TimerScreenCard extends HTMLElement {
 
   _showUndoToast(timer) {
     // TIMER-13: cancelling offers a 5 s Undo; Undo re-creates the
-    // timer with the same name and duration via start_timer.
+    // timer with the same name and the REMAINING time at cancel
+    // (F-T1) — a 10-min timer cancelled with 3 min left comes back
+    // as a 3-min timer, not a fresh 10-min one. Min 1 s: a timer
+    // cancelled at 0 s remaining still comes back.
     if (!this._toastEl) return;
     if (this._toastTimer) {
       clearTimeout(this._toastTimer);
       this._toastTimer = null;
     }
-    this._undoTimer = { name: timer.name, duration: timer.duration };
+    const remaining = Math.max(1, remainingSeconds(timer, Date.now()));
+    this._undoTimer = { name: timer.name, duration: remaining };
     this._toastEl.innerHTML = "";
     const message = document.createElement("span");
     message.textContent = `${timer.name} timer cancelled`;
@@ -1880,7 +2115,9 @@ if (typeof module !== "undefined" && module.exports) {
     startedAtMs,
     discoverTimers,
     gridColumns,
+    dialFit,
     detectDevice,
+    isKioskMode,
     readDeviceEnv,
     readRecipeContext,
     NAV_STRIP_VIEWS,

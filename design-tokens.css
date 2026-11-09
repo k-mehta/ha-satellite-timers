@@ -1,0 +1,314 @@
+/* Family Hub design tokens — Phase 0 (DESIGN-1, consolidated spec rev 2).
+ *
+ * The single source of truth for every colour, size, space, radius,
+ * shadow and state mapping the cards use. The JSON twin is
+ * design-tokens.json (same values, machine-readable). The palette is
+ * verified by ~/workspace/ha-repro/phase0_contrast_check.py, which
+ * recomputes every ratio below from the hex values (WCAG 2.2 method:
+ * linearise sRGB, L = 0.2126R + 0.7152G + 0.0722B,
+ * ratio = (L1+0.05)/(L2+0.05)). Thresholds: AA normal text 4.5:1,
+ * large text 3:1, non-text (rings, tracks) 3:1.
+ *
+ * HOW CARDS CONSUME THIS (shadow DOM): a card cannot @import this file
+ * at runtime — each card inlines these values into its own <style> as
+ * its existing variables (--accent, --muted, --card, ...). The mapping
+ * from each --hub-* token to the per-card variable name is in the
+ * comment on the token. If a value here changes, the card that inlines
+ * it changes in the same commit; the JSON is the check that they match.
+ *
+ * STATUS KEY (per token): DECIDED = the spec fixes this value.
+ * CURRENT = carried over from the shipped card (no spec change).
+ * DECISION = Phase 0 decided it from the spec's ranges with the
+ * reasoning in the comment. PROPOSED = recommendation only, needs a
+ * Phase 7 sign-off (see open questions at the end of this file).
+ * No token without a spec source.
+ */
+
+:root {
+  /* ---- 1. Palette (26 tokens) ---- */
+  /* Screen background. CURRENT. Home + recipe cards, .screen. */
+  --hub-color-screen-bg: #FAF7F4;
+  /* Card surface (sections, nav buttons, dialogs). CURRENT. */
+  --hub-color-card: #FFFFFF;
+  /* Primary text. CURRENT. 16.39:1 on screen bg, 17.49:1 on card,
+     16.26:1 on paper, 14.89:1 on chip-bg (all AA normal). */
+  --hub-color-ink: #1C1917;
+  /* Secondary text. DECIDED (HOME-13, spec §3.3): replaces #78716C
+     (4.49:1 on screen bg, 4.46:1 on paper — FAILS AA normal).
+     7.15:1 on screen bg, 7.09:1 on paper, 7.63:1 on card. */
+  --hub-color-muted: #57534E;
+  /* Warm terracotta accent: primary buttons, focus outline, active
+     nav. CURRENT (home + recipe --accent). 4.85:1 on screen bg and
+     5.18:1 on card as text; white on it is 5.18:1 (see on-accent).
+     Also the timer running-ring colour (TIMER-5). */
+  --hub-color-accent: #C2410C;
+  /* Hairlines / borders. CURRENT (home + recipe --line). */
+  --hub-color-line: #EDE8E3;
+  /* Note paper. CURRENT (home --paper). */
+  --hub-color-paper: #FFF7D6;
+  /* Note paper rule line. CURRENT (home --paper-line). */
+  --hub-color-paper-line: #EFE3AC;
+  /* Chip / skeleton background. CURRENT (recipe --chip-bg).
+     Ink on it is 14.89:1; stars on it are 4.28:1 (see star note). */
+  --hub-color-chip-bg: #F1ECE6;
+  /* Rating stars. DECIDED (RECIPE-14, spec §3.3): replaces #D97706
+     (2.71:1 on chip-bg). 4.28:1 on chip-bg — PASSES non-text 3:1 but
+     FAILS AA normal 4.5:1, so it is compliant ONLY as a graphic with
+     the "4/5" text alternative RECIPE-14 requires. Never use for
+     text; never render stars without the text. */
+  --hub-color-star: #B45309;
+  /* Timer running ring. DECIDED (TIMER-5, spec §3.3): replaces HA
+     blue #03a9f4 (2.52:1). 4.96:1 on #FAFAFA (non-text 3:1). */
+  --hub-color-timer-running: #C2410C;
+  /* Timer "soon" ring (last 60 s) and finished ring. DECIDED
+     (TIMER-5, spec §3.3): replaces amber #fb8c00 (2.27:1).
+     4.81:1 on #FAFAFA (non-text 3:1). Same value as star/finished;
+     separate tokens so the states can diverge later. */
+  --hub-color-timer-soon: #B45309;
+  --hub-color-timer-finished: #B45309;
+  /* Timer ring track. DECIDED (TIMER-5, spec §3.3): replaces
+     #e0e0e0 (1.31:1). 4.41:1 on #FAFAFA (non-text 3:1). */
+  --hub-color-timer-track: #757575;
+  /* Error text / destructive actions. DECIDED (TIMER-5, spec §3.3):
+     replaces #db4437 (4.11:1) and home #B91C1C. 6.29:1 on #FAFAFA,
+     6.57:1 on card, 6.16:1 on screen bg (AA normal). */
+  --hub-color-error: #B71C1C;
+  /* Success. DECIDED in Phase 7 (OQ-1, was PROPOSED): #166534
+     passes AA normal as text (7.13:1 on card, 6.68:1 on screen bg)
+     and white on it is 7.13:1. Use for success text/icons only,
+     never as a large fill. First use: the recipe card's note/rating
+     "Saved." status lines. */
+  --hub-color-success: #166534;
+  /* Warning (semantic alias of the soon/finished amber). DECIDED
+     (TIMER-5 values, DESIGN-1 state mapping). */
+  --hub-color-warning: #B45309;
+  /* Danger (semantic alias of error). DECIDED (TIMER-5 values). */
+  --hub-color-danger: #B71C1C;
+  /* Text on accent fills (primary buttons, active nav).
+     5.18:1 on #C2410C (AA normal). CURRENT (home .primary). */
+  --hub-color-on-accent: #FFFFFF;
+  /* Text on error fills. 6.57:1 on #B71C1C (AA normal). */
+  --hub-color-on-error: #FFFFFF;
+  /* Text on success fills. 7.13:1 on #166534 (AA normal). DECIDED
+     with color-success in Phase 7 (OQ-1). */
+  --hub-color-on-success: #FFFFFF;
+  /* Text on warning fills. 5.02:1 on #B45309 (AA normal). */
+  --hub-color-on-warning: #FFFFFF;
+  /* Text on chip-bg (chips, skeleton rows). CURRENT (ink). 14.89:1. */
+  --hub-color-on-chip: #1C1917;
+  /* Text on note paper. CURRENT (ink). 16.26:1. */
+  --hub-color-on-paper: #1C1917;
+  /* Photo caption scrim. DECIDED (PHOTO-3, spec §3.3): >=65% black.
+     White text on 65% black over a worst-case white photo composites
+     to #595959 = 7.00:1. 50% black composites to #808080 = 3.95:1
+     and FAILS — never use below 65%. */
+  --hub-color-scrim: rgba(0, 0, 0, 0.65);
+  /* Paused timer ring: the running colour at reduced opacity.
+     CURRENT mechanism (timer card .ring.paused, opacity 0.45).
+     Effective colour over #FAFAFA is #E1A78F = 1.99:1 — BELOW the
+     3:1 non-text bar. Kept because the "Paused" label (not the ring)
+     carries the state; Phase 3 must decide (OQ-3). */
+  --hub-state-paused-opacity: 0.45;
+
+  /* ---- 2. Type scale ---- */
+  /* One system stack, no webfont (the hub must render identically
+     offline). CURRENT (home + recipe cards). */
+  --hub-font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --hub-line-height-body: 1.45; /* CURRENT */
+  --hub-line-height-clock: 1; /* CURRENT */
+  --hub-line-height-timer-name: 1.25; /* CURRENT */
+  /* Clock. DECIDED floor (DESIGN-2, spec §3.1): 29/59/117/176px at
+     0.5/1/2/3 m. Hub 176px is the comfortable top of the spec's
+     154–176px range (HOME-14) — the wall is read at 2 m and the
+     header has room. Desktop 48px is the spec §5 desktop minimum
+     (current value, kept). Tablet 64px is a Phase 0 DECISION: the
+     1 m floor is 59px and 64px is the current hub value reused.
+     Mobile 40px is CURRENT and clears the 0.5 m floor (29px). */
+  --hub-font-clock-hub: 176px;
+  --hub-font-clock-desktop: 48px;
+  --hub-font-clock-tablet: 64px;
+  --hub-font-clock-mobile: 40px;
+  /* Body. CURRENT (home + recipe .screen). */
+  --hub-font-body-hub: 24px;
+  --hub-font-body-desktop: 20px;
+  --hub-font-body-tablet: 20px; /* DECISION (OQ-4): tablet type =
+     desktop type except the clock; Phase 7 confirms against the
+     real tablet layout. */
+  --hub-font-body-mobile: 18px;
+  /* Section titles. CURRENT. Tablet = desktop (OQ-4). */
+  --hub-font-section-title-hub: 28px;
+  --hub-font-section-title-desktop: 24px;
+  --hub-font-section-title-tablet: 24px;
+  --hub-font-section-title-mobile: 22px;
+  /* Date line + weather. CURRENT. Tablet = desktop (OQ-4). */
+  --hub-font-date-hub: 28px;
+  --hub-font-date-desktop: 22px;
+  --hub-font-date-tablet: 22px;
+  --hub-font-date-mobile: 20px;
+  /* Timer names (Home rows). CURRENT. TIMER-1: full name, wraps to
+     two lines, never truncated; minimum 20px on hub (the 24px hub
+     value clears it). Desktop/tablet group the name with todo-name,
+     note-text and nav-button at 20px (the override is real — the
+     token's old "no desktop override" note was wrong, fixed Nov 9). */
+  --hub-font-timer-name-hub: 24px;
+  --hub-font-timer-name-desktop: 20px;
+  --hub-font-timer-name-tablet: 20px;
+  --hub-font-timer-name-mobile: 18px;
+  /* Timer detail lines (Home rows). CURRENT. Tablet = desktop. */
+  --hub-font-timer-detail-hub: 22px;
+  --hub-font-timer-detail-desktop: 18px;
+  --hub-font-timer-detail-tablet: 18px;
+  --hub-font-timer-detail-mobile: 17px;
+  /* Timer dial text (hub). DECIDED minima (TIMER-6): name >=20px,
+     state/hint >=18px, time >=72px. The 72px time inside the 137px
+     dial is an open tension for Phase 3 (OQ-2). */
+  --hub-font-dial-time-hub: 72px;
+  --hub-font-dial-name-hub: 20px;
+  --hub-font-dial-state-hub: 18px;
+  --hub-font-dial-hint-hub: 18px;
+  /* Recipe list-row meta. CURRENT size (17px); colour becomes muted
+     #57534E so it meets AA normal (RECIPE-14: meta at >=4.5:1). */
+  --hub-font-meta: 17px;
+  /* Recipe chips. CURRENT (60px hub / 44px desktop / 48px mobile
+     min-height is in targets below; 21px hub / 17px desktop+mobile). */
+  --hub-font-chip-hub: 21px;
+  --hub-font-chip-desktop: 17px;
+  --hub-font-chip-mobile: 17px;
+
+  /* ---- 3. Spacing scale (all values in current use) ---- */
+  --hub-space-1: 4px;
+  --hub-space-2: 8px;
+  --hub-space-3: 12px;
+  --hub-space-4: 16px;
+  --hub-space-5: 24px;
+  --hub-space-6: 28px;
+  --hub-space-7: 36px;
+  /* Screen padding (hub 28px 36px; mobile 16px). CURRENT. */
+  --hub-spacing-screen-pad-y: 28px;
+  --hub-spacing-screen-pad-x: 36px;
+  --hub-spacing-screen-pad-mobile: 16px;
+  /* Section padding (hub 28px; mobile 18px) and gaps. CURRENT. */
+  --hub-spacing-section-pad: 28px;
+  --hub-spacing-section-pad-mobile: 18px;
+  --hub-spacing-section-gap: 24px;
+  --hub-spacing-inner-gap: 16px;
+  --hub-spacing-row-gap: 12px;
+
+  /* ---- 4. Icon set ---- */
+  /* Sizes follow one rule: half the context's minimum target,
+     rounded up to the existing 24px search icon (RECIPE, the only
+     icon in current use — a 24px SVG magnifier). Hub 64->32,
+     tablet 56->28, phone 48->24, desktop 44->22 rounded to 24. */
+  --hub-icon-hub: 32px;
+  --hub-icon-tablet: 28px;
+  --hub-icon-phone: 24px;
+  --hub-icon-desktop: 24px;
+  /* Names in use or reserved. IN USE: search (24px SVG, recipe
+     card), star (text glyph ★, with "4/5" text), check (todo-check
+     glyph — HOME-19 adds a visible checkmark). RESERVED (named here
+     so Phase 1/7 do not invent ad-hoc names): home, timers, photos,
+     recipes (NAV-1 strip labels — text today), back, close (note
+     delete ×, >=48px target), plus (add-item), mic (voice hint
+     affordance, TIMER-4/RECIPE-20 — no mic UI renders today). */
+
+  /* ---- 5. Radius + elevation ---- */
+  --hub-radius-section: 20px; /* CURRENT (home .section) */
+  --hub-radius-row: 16px; /* CURRENT (home rows, nav buttons, timer controls) */
+  --hub-radius-input: 12px; /* CURRENT (note editor, todo-check) */
+  --hub-radius-chip: 999px; /* CURRENT (recipe chips are pills) */
+  --hub-radius-dial: 50%; /* CURRENT (timer dials are circles) */
+  /* Shadows. CURRENT (home + recipe cards, verbatim). */
+  --hub-shadow-card: 0 1px 2px rgba(28, 25, 23, 0.05), 0 8px 20px rgba(28, 25, 23, 0.06);
+  --hub-shadow-lift: 0 2px 4px rgba(28, 25, 23, 0.06), 0 14px 28px rgba(28, 25, 23, 0.10);
+  --hub-shadow-tab: 0 1px 3px rgba(28, 25, 23, 0.12);
+  --hub-shadow-accent: 0 2px 8px rgba(194, 65, 12, 0.35);
+
+  /* ---- 6. State-colour mapping (DESIGN-1) ---- */
+  /* running  -> timer-running  #C2410C (TIMER-5) */
+  /* paused   -> timer-running at 0.45 opacity + "Paused" label (OQ-3) */
+  /* finished -> timer-finished #B45309 (TIMER-5) */
+  /* soon     -> timer-soon #B45309 + pulse, last 60 s (DESIGN-8 guardrail) */
+  /* error    -> error #B71C1C (TIMER-5) */
+  /* offline / unavailable -> timer-track #757575, neutral treatment.
+     Phase 0 DECISION: no spec value exists (TIMER-15 is about the
+     offline voice path, not a colour); the track grey is the only
+     neutral already in the palette. */
+  /* done (todo) -> muted text + strikethrough (CURRENT) */
+  /* active view (nav strip "You are here", NAV-1) -> accent
+     background + on-accent text (Phase 1 renders it; colours here). */
+  --hub-state-running: var(--hub-color-timer-running);
+  --hub-state-paused: var(--hub-color-timer-running); /* always used
+     with --hub-state-paused-opacity: 0.45 (see palette) */
+  --hub-state-finished: var(--hub-color-timer-finished);
+  --hub-state-soon: var(--hub-color-timer-soon);
+  --hub-state-error: var(--hub-color-error);
+  --hub-state-offline: var(--hub-color-timer-track);
+  --hub-state-active-bg: var(--hub-color-accent);
+  --hub-state-active-fg: var(--hub-color-on-accent);
+
+  /* ---- Touch targets (spec §3.2 per-context table) ---- */
+  /* Wall 64–80px, tablet 56–64px, phone 48–56px, desktop 44–48px.
+     Current values that already comply: todo-check hub 64 /
+     desktop 48 / mobile 48; nav-button hub 64 / mobile 48;
+     timer controls hub 80 / desktop 56 / mobile 64. */
+  --hub-target-hub-min: 64px;
+  --hub-target-hub-max: 80px;
+  --hub-target-tablet-min: 56px;
+  --hub-target-tablet-max: 64px;
+  --hub-target-phone-min: 48px;
+  --hub-target-phone-max: 56px;
+  --hub-target-desktop-min: 44px;
+  --hub-target-desktop-max: 48px;
+  /* Timer dial minimum, hub. DECIDED (DESIGN-3, TIMER-6): the
+     measured current size, 137px. See OQ-2 for the 72px-time tension. */
+  --hub-target-dial-min-hub: 137px;
+  /* Recipe timer chips. DECIDED (RECIPE-15): >=56–64px hub,
+     >=48px phone. Current 43px hub / ~36px phone FAILS — Phase 4. */
+  --hub-target-time-chip-hub-min: 56px;
+  --hub-target-time-chip-phone-min: 48px;
+  /* Note delete ×. DECIDED (spec §3.2): >=48px. */
+  --hub-target-note-delete-min: 48px;
+  /* Recipe collection chips (min-height). CURRENT: 60px hub,
+     44px desktop, 48px mobile. */
+  --hub-target-chip-hub: 60px;
+  --hub-target-chip-desktop: 44px;
+  --hub-target-chip-mobile: 48px;
+
+  /* ---- Motion (bonus section; DESIGN-6, spec §3.5) ---- */
+  /* Soon-ring pulse and cancel-arm pulse: current code values. */
+  --hub-motion-soon-pulse: 1.6s ease-in-out infinite;
+  --hub-motion-cancel-arm-pulse: 0.8s ease-in-out infinite;
+  /* Screensaver enter/exit. DECIDED (spec §3.5). */
+  --hub-motion-screensaver-enter: 600ms fade;
+  --hub-motion-screensaver-exit: 300ms;
+  /* Reduced motion (WCAG 2.2): honour prefers-reduced-motion, no
+     non-essential animation. Transform/opacity-only animations. */
+}
+
+/* ---- Open questions (recorded, not silently decided) ----
+ * OQ-1  DECIDED in Phase 7: success green #166534 adopted (7.13:1
+ *       on card as text, 7.13:1 white-on-green); text/icons only,
+ *       never a large fill. First use: the recipe card's note/rating
+ *       "Saved." status lines. The home card has no success text to
+ *       colour (its feedback is the dark Undo toast + state change);
+ *       the timer card has none either.
+ * OQ-2  Dial time 72px (TIMER-6 minimum) vs dial minimum 137px
+ *       (DESIGN-3 measured size): a 72px "7:32" is wider than a
+ *       137px dial. Phase 3 reconciles with a live render — the dial
+ *       grows, the SVG scales, or the time wraps; the token values
+ *       stand as the spec's minima until then.
+ * OQ-3  Paused ring at 0.45 opacity composites to #E1A78F = 1.99:1
+ *       on #FAFAFA, below the 3:1 non-text bar. Kept as the current
+ *       mechanism because the "Paused" label carries the state.
+ *       Phase 3 decides: keep, or give paused its own >=3:1 colour.
+ * OQ-4  Tablet type scale = desktop values except clock 64px
+ *       (Phase 0 decision; no spec tablet type numbers exist).
+ *       Phase 7 confirms against the real tablet layout.
+ * OQ-5  Stars #B45309 = 4.28:1 on chip-bg: FAILS AA normal 4.5:1,
+ *       compliant only as non-text with the "4/5" text alternative.
+ *       Any star rendering without the text must darken the colour.
+ * OQ-6  No speaker is confirmed on the hub (spec §13 item 1, S1):
+ *       the sound standard (DESIGN-5) has no token here because there
+ *       is no confirmed audio path to tokenise. Tokens for timer
+ *       volume / quiet hours belong to Phase 7 once S1 is resolved.
+ */

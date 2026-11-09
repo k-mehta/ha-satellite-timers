@@ -1,0 +1,814 @@
+{
+ "elevation": {
+  "shadow-accent": {
+   "spec": "home + recipe --shadow-accent",
+   "status": "CURRENT",
+   "value": "0 2px 8px rgba(194, 65, 12, 0.35)"
+  },
+  "shadow-card": {
+   "spec": "home + recipe --shadow-card",
+   "status": "CURRENT",
+   "value": "0 1px 2px rgba(28, 25, 23, 0.05), 0 8px 20px rgba(28, 25, 23, 0.06)"
+  },
+  "shadow-lift": {
+   "spec": "home + recipe --shadow-lift",
+   "status": "CURRENT",
+   "value": "0 2px 4px rgba(28, 25, 23, 0.06), 0 14px 28px rgba(28, 25, 23, 0.10)"
+  },
+  "shadow-tab": {
+   "spec": "recipe --shadow-tab",
+   "status": "CURRENT",
+   "value": "0 1px 3px rgba(28, 25, 23, 0.12)"
+  }
+ },
+ "icon": {
+  "names": {
+   "in_use": [
+    "search (24px SVG magnifier, recipe card)",
+    "star (text glyph, with '4/5' text)",
+    "check (todo-check glyph \u2014 HOME-19 adds a visible checkmark)"
+   ],
+   "reserved": [
+    "home",
+    "timers",
+    "photos",
+    "recipes (NAV-1 strip labels \u2014 text today)",
+    "back",
+    "close (note delete x, >=48px target)",
+    "plus (add-item)",
+    "mic (voice hint affordance, TIMER-4/RECIPE-20 \u2014 no mic UI renders today)"
+   ]
+  },
+  "icon-desktop": {
+   "spec": "rule gives 22px (44px -> 22px), rounded up to 24px to match the existing search icon asset",
+   "status": "DECISION",
+   "value": "24px"
+  },
+  "icon-hub": {
+   "spec": "rule: half the context minimum target (64px -> 32px)",
+   "status": "DECISION",
+   "value": "32px"
+  },
+  "icon-phone": {
+   "spec": "rule: half the context minimum target (48px -> 24px); matches the existing 24px search SVG",
+   "status": "CURRENT",
+   "value": "24px"
+  },
+  "icon-tablet": {
+   "spec": "rule: half the context minimum target (56px -> 28px)",
+   "status": "DECISION",
+   "value": "28px"
+  }
+ },
+ "meta": {
+  "consumption": "Cards render in shadow DOM and cannot @import the CSS at runtime. Each card inlines these values into its own <style> under its existing variable names (mapping in the CSS comments). The JSON is the machine-readable twin; if a value changes here, the inlining card changes in the same commit.",
+  "contrast_method": "WCAG 2.2: linearise sRGB, L = 0.2126R + 0.7152G + 0.0722B, ratio = (L1+0.05)/(L2+0.05). Thresholds: AA normal text 4.5:1, large text 3:1, non-text 3:1. Verified by ~/workspace/ha-repro/phase0_contrast_check.py (all spec-claimed ratios reproduce exactly).",
+  "counts": {
+   "elevation": 4,
+   "icon": 4,
+   "motion": 5,
+   "palette": 26,
+   "radius": 5,
+   "spacing": 15,
+   "state": 8,
+   "targets": 15,
+   "type": 36,
+   "total": 118
+  },
+  "name": "Family Hub design tokens",
+  "phase": "Phase 0 (DESIGN-1)",
+  "spec": "consolidated-spec.md rev 2 (Nov 8, 2026)",
+  "spec_ids": [
+   "DESIGN-1",
+   "DESIGN-2",
+   "DESIGN-3",
+   "DESIGN-5",
+   "DESIGN-6",
+   "DESIGN-8",
+   "HOME-13",
+   "HOME-14",
+   "TIMER-5",
+   "TIMER-6",
+   "RECIPE-14",
+   "RECIPE-15",
+   "PHOTO-3",
+   "NAV-1"
+  ],
+  "status_key": {
+   "CURRENT": "carried over from the shipped card (no spec change)",
+   "DECIDED": "the spec fixes this value",
+   "DECISION": "Phase 0 decided it from the spec's ranges; reasoning in the note",
+   "PROPOSED": "recommendation only; needs a Phase 7 sign-off"
+  }
+ },
+ "motion": {
+  "motion-cancel-arm-pulse": {
+   "spec": "timer card .controls button.cancel.armed (DESIGN-6)",
+   "status": "CURRENT",
+   "value": "0.8s ease-in-out infinite"
+  },
+  "motion-screensaver-enter": {
+   "spec": "spec \u00a73.5 (DESIGN-6)",
+   "status": "DECIDED",
+   "value": "600ms fade"
+  },
+  "motion-screensaver-exit": {
+   "spec": "spec \u00a73.5 (DESIGN-6)",
+   "status": "DECIDED",
+   "value": "300ms"
+  },
+  "motion-soon-pulse": {
+   "spec": "timer card .dial.soon .ring (DESIGN-6)",
+   "status": "CURRENT",
+   "value": "1.6s ease-in-out infinite"
+  },
+  "rules": {
+   "spec": "spec \u00a73.5 (DESIGN-6, WCAG 2.2)",
+   "status": "DECIDED",
+   "value": "honour prefers-reduced-motion; no non-essential animation; transform/opacity-only"
+  }
+ },
+ "open_questions": [
+  {
+   "decider": "Phase 3",
+   "id": "OQ-2",
+   "question": "Dial time 72px (TIMER-6 minimum) vs dial minimum 137px (DESIGN-3 measured size): a 72px '7:32' is wider than a 137px dial.",
+   "recommendation": "Phase 3 reconciles with a live render (dial grows, SVG scales, or time wraps); token values stand as the spec minima until then."
+  },
+  {
+   "decider": "Phase 3",
+   "id": "OQ-3",
+   "question": "Paused ring at 0.45 opacity composites to #E1A78F = 1.99:1 on #FAFAFA, below the 3:1 non-text bar. Keep the current mechanism (the 'Paused' label carries the state) or give paused its own >=3:1 colour?",
+   "recommendation": "Keep for now; revisit only if a Phase 3 render shows the paused state unreadable without the label."
+  },
+  {
+   "decider": "Phase 7",
+   "id": "OQ-4",
+   "question": "Tablet type scale = desktop values except clock 64px (no spec tablet type numbers exist).",
+   "recommendation": "Confirmed as the Phase 0 default; Phase 7 revisits against the real tablet layout."
+  },
+  {
+   "decider": "Phase 4 (must not drop the text)",
+   "id": "OQ-5",
+   "question": "Stars #B45309 = 4.28:1 on chip-bg FAILS AA normal 4.5:1 and is compliant only as a non-text graphic with the '4/5' text alternative.",
+   "recommendation": "Keep the colour AND the text (RECIPE-14 already requires both); any star rendering without the text must darken the colour."
+  },
+  {
+   "decider": "Phase 7, blocked on S1",
+   "id": "OQ-6",
+   "question": "No speaker is confirmed on the hub (spec \u00a713 item 1, S1), so the sound standard (DESIGN-5) has no tokens here.",
+   "recommendation": "Timer-volume / quiet-hours tokens belong to Phase 7 once S1 (speaker path) is resolved."
+  }
+ ],
+ "palette": {
+  "color-accent": {
+   "contrast": {
+    "as_text_on_card": "5.18:1",
+    "as_text_on_screen_bg": "4.85:1",
+    "white_on_it": "5.18:1"
+   },
+   "spec": "home + recipe --accent; also TIMER-5 running ring",
+   "status": "CURRENT",
+   "value": "#C2410C"
+  },
+  "color-card": {
+   "contrast": {
+    "error_on_it": "6.57:1",
+    "ink_on_it": "17.49:1",
+    "muted_on_it": "7.63:1"
+   },
+   "spec": "home + recipe --card",
+   "status": "CURRENT",
+   "value": "#FFFFFF"
+  },
+  "color-chip-bg": {
+   "contrast": {
+    "ink_on_it": "14.89:1",
+    "stars_on_it": "4.28:1"
+   },
+   "spec": "recipe --chip-bg",
+   "status": "CURRENT",
+   "value": "#F1ECE6"
+  },
+  "color-danger": {
+   "spec": "TIMER-5 values; DESIGN-1 state mapping (semantic alias of error)",
+   "status": "DECIDED",
+   "value": "#B71C1C"
+  },
+  "color-error": {
+   "contrast": {
+    "on_#FAFAFA": "6.29:1",
+    "on_card": "6.57:1",
+    "on_screen_bg": "6.16:1",
+    "white_on_it": "6.57:1"
+   },
+   "spec": "TIMER-5, spec \u00a73.3 (replaces #db4437 at 4.11:1 and home #B91C1C)",
+   "status": "DECIDED",
+   "value": "#B71C1C"
+  },
+  "color-ink": {
+   "contrast": {
+    "on_card": "17.49:1",
+    "on_chip_bg": "14.89:1",
+    "on_paper": "16.26:1",
+    "on_screen_bg": "16.39:1"
+   },
+   "spec": "home + recipe --ink",
+   "status": "CURRENT",
+   "value": "#1C1917"
+  },
+  "color-line": {
+   "spec": "home + recipe --line",
+   "status": "CURRENT",
+   "value": "#EDE8E3"
+  },
+  "color-muted": {
+   "contrast": {
+    "on_card": "7.63:1",
+    "on_paper": "7.09:1",
+    "on_screen_bg": "7.15:1"
+   },
+   "spec": "HOME-13, spec \u00a73.3 (replaces #78716C at 4.49:1/4.46:1, FAILS AA)",
+   "status": "DECIDED",
+   "value": "#57534E"
+  },
+  "color-on-accent": {
+   "contrast": {
+    "on_accent": "5.18:1"
+   },
+   "spec": "home .primary button text",
+   "status": "CURRENT",
+   "value": "#FFFFFF"
+  },
+  "color-on-chip": {
+   "contrast": {
+    "on_chip_bg": "14.89:1"
+   },
+   "spec": "recipe chip text (ink)",
+   "status": "CURRENT",
+   "value": "#1C1917"
+  },
+  "color-on-error": {
+   "contrast": {
+    "on_error": "6.57:1"
+   },
+   "spec": "TIMER-5 error values",
+   "status": "DECIDED",
+   "value": "#FFFFFF"
+  },
+  "color-on-paper": {
+   "contrast": {
+    "on_paper": "16.26:1"
+   },
+   "spec": "home note text (ink)",
+   "status": "CURRENT",
+   "value": "#1C1917"
+  },
+  "color-on-success": {
+   "contrast": {
+    "on_success": "7.13:1"
+   },
+   "spec": "OQ-1 (with color-success)",
+   "status": "PROPOSED",
+   "value": "#FFFFFF"
+  },
+  "color-on-warning": {
+   "contrast": {
+    "on_warning": "5.02:1"
+   },
+   "spec": "TIMER-5 values",
+   "status": "DECIDED",
+   "value": "#FFFFFF"
+  },
+  "color-paper": {
+   "spec": "home --paper (note paper)",
+   "status": "CURRENT",
+   "value": "#FFF7D6"
+  },
+  "color-paper-line": {
+   "spec": "home --paper-line",
+   "status": "CURRENT",
+   "value": "#EFE3AC"
+  },
+  "color-screen-bg": {
+   "spec": "home + recipe .screen background",
+   "status": "CURRENT",
+   "used_by": [
+    "--screen background"
+   ],
+   "value": "#FAF7F4"
+  },
+  "color-scrim": {
+   "contrast": {
+    "white_on_50pct_over_white_photo": "3.95:1 FAILS (composites to #808080)",
+    "white_on_65pct_over_white_photo": "7.00:1 (composites to #595959)"
+   },
+   "spec": "PHOTO-3, spec \u00a73.3 (caption scrim >=65%)",
+   "status": "DECIDED",
+   "value": "rgba(0, 0, 0, 0.65)"
+  },
+  "color-star": {
+   "contrast": {
+    "on_chip_bg": "4.28:1"
+   },
+   "note": "4.28:1 FAILS AA normal 4.5:1; compliant ONLY as a non-text graphic with the '4/5' text alternative RECIPE-14 requires. Never use for text; never render stars without the text. See OQ-5.",
+   "spec": "RECIPE-14, spec \u00a73.3 (replaces #D97706 at 2.71:1)",
+   "status": "DECIDED",
+   "value": "#B45309"
+  },
+  "color-success": {
+   "contrast": {
+    "on_card": "7.13:1",
+    "on_screen_bg": "6.68:1",
+    "white_on_it": "7.13:1"
+   },
+   "note": "Decided in Phase 7 (OQ-1). Text/icons only, never a large fill. First use: the recipe card's note/rating \"Saved.\" status lines.",
+   "spec": "none \u2014 no success colour in spec or shipped cards (OQ-1)",
+   "status": "DECIDED",
+   "value": "#166534"
+  },
+  "color-timer-finished": {
+   "contrast": {
+    "on_#FAFAFA": "4.81:1 (non-text 3:1)"
+   },
+   "note": "Same value as soon/star; separate token so states can diverge.",
+   "spec": "TIMER-5, spec \u00a73.3 (replaces #fb8c00 at 2.27:1)",
+   "status": "DECIDED",
+   "value": "#B45309"
+  },
+  "color-timer-running": {
+   "contrast": {
+    "on_#FAFAFA": "4.96:1 (non-text 3:1)"
+   },
+   "spec": "TIMER-5, spec \u00a73.3 (replaces #03a9f4 at 2.52:1)",
+   "status": "DECIDED",
+   "value": "#C2410C"
+  },
+  "color-timer-soon": {
+   "contrast": {
+    "on_#FAFAFA": "4.81:1 (non-text 3:1)"
+   },
+   "spec": "TIMER-5, spec \u00a73.3 (replaces #fb8c00 at 2.27:1)",
+   "status": "DECIDED",
+   "value": "#B45309"
+  },
+  "color-timer-track": {
+   "contrast": {
+    "on_#FAFAFA": "4.41:1 (non-text 3:1)"
+   },
+   "spec": "TIMER-5, spec \u00a73.3 (replaces #e0e0e0 at 1.31:1)",
+   "status": "DECIDED",
+   "value": "#757575"
+  },
+  "color-warning": {
+   "contrast": {
+    "white_on_it": "5.02:1"
+   },
+   "spec": "TIMER-5 values; DESIGN-1 state mapping (semantic alias of soon/finished amber)",
+   "status": "DECIDED",
+   "value": "#B45309"
+  },
+  "state-paused-opacity": {
+   "contrast": {
+    "effective_#E1A78F_on_#FAFAFA": "1.99:1 \u2014 BELOW 3:1 non-text"
+   },
+   "note": "Kept because the 'Paused' label carries the state; Phase 3 decides (OQ-3).",
+   "spec": "timer card .ring.paused (running colour at 0.45 opacity)",
+   "status": "CURRENT",
+   "value": 0.45
+  }
+ },
+ "radius": {
+  "radius-chip": {
+   "spec": "recipe .chip (pill)",
+   "status": "CURRENT",
+   "value": "999px"
+  },
+  "radius-dial": {
+   "spec": "timer dials are circles",
+   "status": "CURRENT",
+   "value": "50%"
+  },
+  "radius-input": {
+   "spec": "note editor, todo-check",
+   "status": "CURRENT",
+   "value": "12px"
+  },
+  "radius-row": {
+   "spec": "home rows, nav buttons, timer controls",
+   "status": "CURRENT",
+   "value": "16px"
+  },
+  "radius-section": {
+   "spec": "home .section",
+   "status": "CURRENT",
+   "value": "20px"
+  }
+ },
+ "spacing": {
+  "space-1": {
+   "spec": "in current use (mobile header gap)",
+   "status": "CURRENT",
+   "value": "4px"
+  },
+  "space-2": {
+   "spec": "in current use",
+   "status": "CURRENT",
+   "value": "8px"
+  },
+  "space-3": {
+   "spec": "in current use (section-body gap, editor gap)",
+   "status": "CURRENT",
+   "value": "12px"
+  },
+  "space-4": {
+   "spec": "in current use (section gap, row gap)",
+   "status": "CURRENT",
+   "value": "16px"
+  },
+  "space-5": {
+   "spec": "in current use (grid gap, list-view gap)",
+   "status": "CURRENT",
+   "value": "24px"
+  },
+  "space-6": {
+   "spec": "in current use (screen padding-y)",
+   "status": "CURRENT",
+   "value": "28px"
+  },
+  "space-7": {
+   "spec": "in current use (screen padding-x)",
+   "status": "CURRENT",
+   "value": "36px"
+  },
+  "spacing-inner-gap": {
+   "spec": "home .section gap",
+   "status": "CURRENT",
+   "value": "16px"
+  },
+  "spacing-row-gap": {
+   "spec": "home .section-body gap",
+   "status": "CURRENT",
+   "value": "12px"
+  },
+  "spacing-screen-pad-mobile": {
+   "spec": "home .screen.dev-mobile padding",
+   "status": "CURRENT",
+   "value": "16px"
+  },
+  "spacing-screen-pad-x": {
+   "spec": "home + recipe .screen padding",
+   "status": "CURRENT",
+   "value": "36px"
+  },
+  "spacing-screen-pad-y": {
+   "spec": "home + recipe .screen padding",
+   "status": "CURRENT",
+   "value": "28px"
+  },
+  "spacing-section-gap": {
+   "spec": "home .grid gap",
+   "status": "CURRENT",
+   "value": "24px"
+  },
+  "spacing-section-pad": {
+   "spec": "home .section padding (recipe 28px 36px screen)",
+   "status": "CURRENT",
+   "value": "28px"
+  },
+  "spacing-section-pad-mobile": {
+   "spec": "home .screen.dev-mobile .section padding",
+   "status": "CURRENT",
+   "value": "18px"
+  }
+ },
+ "state": {
+  "state-active-bg": {
+   "spec": "NAV-1 'You are here' indicator (Phase 1 renders it)",
+   "status": "DECIDED",
+   "token": "color-accent",
+   "value": "var(--hub-color-accent)",
+   "resolves_to": "#C2410C"
+  },
+  "state-active-fg": {
+   "spec": "NAV-1 'You are here' indicator (Phase 1 renders it)",
+   "status": "DECIDED",
+   "token": "color-on-accent",
+   "value": "var(--hub-color-on-accent)",
+   "resolves_to": "#FFFFFF"
+  },
+  "state-error": {
+   "spec": "TIMER-5",
+   "status": "DECIDED",
+   "token": "color-error",
+   "value": "var(--hub-color-error)",
+   "resolves_to": "#B71C1C"
+  },
+  "state-finished": {
+   "spec": "TIMER-5",
+   "status": "DECIDED",
+   "token": "color-timer-finished",
+   "value": "var(--hub-color-timer-finished)",
+   "resolves_to": "#B45309"
+  },
+  "state-offline": {
+   "spec": "no spec value (TIMER-15 is about the offline voice path, not a colour); neutral treatment from the existing palette",
+   "status": "DECISION",
+   "token": "color-timer-track",
+   "value": "var(--hub-color-timer-track)",
+   "resolves_to": "#757575"
+  },
+  "state-paused": {
+   "note": "Effective #E1A78F = 1.99:1 on #FAFAFA (below 3:1); the 'Paused' label carries the state. OQ-3.",
+   "spec": "timer card .ring.paused",
+   "status": "CURRENT",
+   "token": "color-timer-running + state-paused-opacity 0.45",
+   "value": "var(--hub-color-timer-running)",
+   "resolves_to": "#C2410C"
+  },
+  "state-running": {
+   "spec": "TIMER-5",
+   "status": "DECIDED",
+   "token": "color-timer-running",
+   "value": "var(--hub-color-timer-running)",
+   "resolves_to": "#C2410C"
+  },
+  "state-soon": {
+   "spec": "TIMER-5 + DESIGN-8 (last 60 s, amber ring, orange time, pulse \u2014 verified working, \u00a712 guardrail)",
+   "status": "DECIDED",
+   "token": "color-timer-soon",
+   "value": "var(--hub-color-timer-soon)",
+   "resolves_to": "#B45309"
+  }
+ },
+ "targets": {
+  "target-chip-desktop": {
+   "spec": "recipe .screen.dev-desktop .chip min-height",
+   "status": "CURRENT",
+   "value": "44px"
+  },
+  "target-chip-hub": {
+   "spec": "recipe .chip min-height",
+   "status": "CURRENT",
+   "value": "60px"
+  },
+  "target-chip-mobile": {
+   "spec": "recipe .screen.dev-mobile .chip min-height",
+   "status": "CURRENT",
+   "value": "48px"
+  },
+  "target-desktop-max": {
+   "spec": "spec \u00a73.2 desktop 44\u201348px",
+   "status": "DECIDED",
+   "value": "48px"
+  },
+  "target-desktop-min": {
+   "spec": "spec \u00a73.2 desktop 44\u201348px",
+   "status": "DECIDED",
+   "value": "44px"
+  },
+  "target-dial-min-hub": {
+   "spec": "DESIGN-3 + TIMER-6 (measured current dial size)",
+   "status": "DECIDED",
+   "value": "137px"
+  },
+  "target-hub-max": {
+   "spec": "spec \u00a73.2 wall 64\u201380px",
+   "status": "DECIDED",
+   "value": "80px"
+  },
+  "target-hub-min": {
+   "spec": "spec \u00a73.2 wall 64\u201380px",
+   "status": "DECIDED",
+   "value": "64px"
+  },
+  "target-note-delete-min": {
+   "spec": "spec \u00a73.2 (note-delete x >=48px)",
+   "status": "DECIDED",
+   "value": "48px"
+  },
+  "target-phone-max": {
+   "spec": "spec \u00a73.2 phone 48\u201356px",
+   "status": "DECIDED",
+   "value": "56px"
+  },
+  "target-phone-min": {
+   "spec": "spec \u00a73.2 phone 48\u201356px",
+   "status": "DECIDED",
+   "value": "48px"
+  },
+  "target-tablet-max": {
+   "spec": "spec \u00a73.2 tablet 56\u201364px",
+   "status": "DECIDED",
+   "value": "64px"
+  },
+  "target-tablet-min": {
+   "spec": "spec \u00a73.2 tablet 56\u201364px",
+   "status": "DECIDED",
+   "value": "56px"
+  },
+  "target-time-chip-hub-min": {
+   "spec": "RECIPE-15 (hub 56\u201364px; current 43px FAILS)",
+   "status": "DECIDED",
+   "value": "56px"
+  },
+  "target-time-chip-phone-min": {
+   "spec": "RECIPE-15 (phone >=48px; current ~36px FAILS)",
+   "status": "DECIDED",
+   "value": "48px"
+  }
+ },
+ "type": {
+  "font-body-desktop": {
+   "spec": "home .screen.dev-desktop",
+   "status": "CURRENT",
+   "value": "20px"
+  },
+  "font-body-hub": {
+   "spec": "home + recipe .screen",
+   "status": "CURRENT",
+   "value": "24px"
+  },
+  "font-body-mobile": {
+   "spec": "home .screen.dev-mobile",
+   "status": "CURRENT",
+   "value": "18px"
+  },
+  "font-body-tablet": {
+   "spec": "OQ-4: tablet type = desktop type except clock",
+   "status": "DECISION",
+   "value": "20px"
+  },
+  "font-chip-desktop": {
+   "spec": "recipe .screen.dev-desktop .chip",
+   "status": "CURRENT",
+   "value": "17px"
+  },
+  "font-chip-hub": {
+   "spec": "recipe .chip",
+   "status": "CURRENT",
+   "value": "21px"
+  },
+  "font-chip-mobile": {
+   "spec": "recipe .screen.dev-mobile .chip",
+   "status": "CURRENT",
+   "value": "17px"
+  },
+  "font-clock-desktop": {
+   "spec": "spec \u00a75 desktop minimum 48px (current value, kept)",
+   "status": "DECIDED",
+   "value": "48px"
+  },
+  "font-clock-hub": {
+   "note": "Minimum is 117px; 176px is the comfortable value.",
+   "spec": "DESIGN-2 \u00a73.1 floor 117px at 2 m; HOME-14 comfortable range 154\u2013176px \u2014 top of range chosen; header has room",
+   "status": "DECISION",
+   "value": "176px"
+  },
+  "font-clock-mobile": {
+   "spec": "home .screen.dev-mobile .clock; clears the 0.5 m floor (29px)",
+   "status": "CURRENT",
+   "value": "40px"
+  },
+  "font-clock-tablet": {
+   "note": "Phase 0 decision; Phase 7 confirms.",
+   "spec": "DESIGN-2 \u00a73.1: 1 m floor is 59px; 64px reuses the current hub value",
+   "status": "DECISION",
+   "value": "64px"
+  },
+  "font-date-desktop": {
+   "spec": "home .screen.dev-desktop .date-line / .weather",
+   "status": "CURRENT",
+   "value": "22px"
+  },
+  "font-date-hub": {
+   "spec": "home .date-line / .weather",
+   "status": "CURRENT",
+   "value": "28px"
+  },
+  "font-date-mobile": {
+   "spec": "home .screen.dev-mobile .date-line / .weather",
+   "status": "CURRENT",
+   "value": "20px"
+  },
+  "font-date-tablet": {
+   "spec": "OQ-4",
+   "status": "DECISION",
+   "value": "22px"
+  },
+  "font-dial-hint-hub": {
+   "spec": "TIMER-6 minimum (state/hint >=18px on hub)",
+   "status": "DECIDED",
+   "value": "18px"
+  },
+  "font-dial-name-hub": {
+   "spec": "TIMER-6 minimum (name >=20px on hub)",
+   "status": "DECIDED",
+   "value": "20px"
+  },
+  "font-dial-state-hub": {
+   "spec": "TIMER-6 minimum (state/hint >=18px on hub)",
+   "status": "DECIDED",
+   "value": "18px"
+  },
+  "font-dial-time-hub": {
+   "note": "Tension with the 137px dial minimum \u2014 OQ-2, Phase 3 reconciles.",
+   "spec": "TIMER-6 minimum (time >=72px); HOME-14 timer remaining >=72\u201396px",
+   "status": "DECIDED",
+   "value": "72px"
+  },
+  "font-family": {
+   "spec": "home + recipe .screen (no webfont \u2014 identical offline)",
+   "status": "CURRENT",
+   "value": "-apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif"
+  },
+  "font-meta": {
+   "spec": "recipe .row-meta size; RECIPE-14 requires meta at >=4.5:1 (colour becomes muted #57534E)",
+   "status": "CURRENT",
+   "value": "17px"
+  },
+  "font-section-title-desktop": {
+   "spec": "home .screen.dev-desktop .section-title",
+   "status": "CURRENT",
+   "value": "24px"
+  },
+  "font-section-title-hub": {
+   "spec": "home .section-title",
+   "status": "CURRENT",
+   "value": "28px"
+  },
+  "font-section-title-mobile": {
+   "spec": "home .screen.dev-mobile .section-title",
+   "status": "CURRENT",
+   "value": "22px"
+  },
+  "font-section-title-tablet": {
+   "spec": "OQ-4",
+   "status": "DECISION",
+   "value": "24px"
+  },
+  "font-timer-detail-desktop": {
+   "spec": "home .screen.dev-desktop .timer-detail",
+   "status": "CURRENT",
+   "value": "18px"
+  },
+  "font-timer-detail-hub": {
+   "spec": "home .timer-detail",
+   "status": "CURRENT",
+   "value": "22px"
+  },
+  "font-timer-detail-mobile": {
+   "spec": "home .screen.dev-mobile .timer-detail",
+   "status": "CURRENT",
+   "value": "17px"
+  },
+  "font-timer-detail-tablet": {
+   "spec": "OQ-4",
+   "status": "DECISION",
+   "value": "18px"
+  },
+  "font-timer-name-desktop": {
+   "spec": "home .screen.dev-desktop .timer-name (grouped with todo-name, note-text, nav-button at 20px — the token's old 'no desktop override' note was wrong; the override exists)",
+   "status": "CURRENT",
+   "value": "20px"
+  },
+  "font-timer-name-hub": {
+   "spec": "home .timer-name; TIMER-1 full name wraps to 2 lines, min 20px on hub",
+   "status": "CURRENT",
+   "value": "24px"
+  },
+  "font-timer-name-mobile": {
+   "spec": "home .screen.dev-mobile .timer-name",
+   "status": "CURRENT",
+   "value": "18px"
+  },
+  "font-timer-name-tablet": {
+   "spec": "OQ-4, grouped with todo-name, note-text, nav-button at 20px like desktop (the token's old 24px was wrong; the card overrides it)",
+   "status": "DECISION",
+   "value": "20px"
+  },
+  "line-height-body": {
+   "spec": "home + recipe .screen",
+   "status": "CURRENT",
+   "value": 1.45
+  },
+  "line-height-clock": {
+   "spec": "home .clock",
+   "status": "CURRENT",
+   "value": 1
+  },
+  "line-height-timer-name": {
+   "spec": "home .timer-name",
+   "status": "CURRENT",
+   "value": 1.25
+  }
+ },
+ "decided_questions": [
+  {
+   "id": "OQ-1",
+   "decided": "Phase 7",
+   "decision": "Adopted #166534 as the success colour; text/icons only, never a large fill. First use: the recipe card's note/rating \"Saved.\" status lines.",
+   "question": "Success green: adopt proposed #166534 (7.13:1 on card, 6.68:1 on screen bg, white-on-green 7.13:1) or carry no success colour (success by text/checkmark only, as today)?"
+  }
+ ]
+}

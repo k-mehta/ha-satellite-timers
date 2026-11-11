@@ -5,6 +5,64 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
 
+## [0.2.0] - 2026-11-11
+
+### Added
+
+- Bridge-synthesised `ringing` sensor state: a finished timer's sensor
+  reports `ringing` for 60 s after it finishes, then flips to
+  `finished`, so the screensaver ringing guard can fire (previously no
+  sensor ever reported `ringing`).
+- `satellite_timers.restore_timer` and
+  `satellite_timers.restore_finished_timer` services (D6
+  Undo-restores-paused): Undo re-creates a cancelled timer already
+  paused, atomically, so the sensor never observes it as active; Undo
+  of a dismissed finished timer restores it finished with its original
+  `finished_at` and without re-ringing the satellite.
+- Timer card major refactor against the locked design (implementation
+  wave 1): the screen is a grid in both orientations with
+  device-driven columns (hub 3 landscape / 2 portrait, mobile 1
+  portrait / 2 landscape); the dial is a vertical stack (name above
+  the ring, countdown inside the ring, state/hint lines below it);
+  finished and ringing timers live as compact 74 px rows in a
+  collapsible "Finished (N)" section; the scroll indicator is a
+  floating pill above the strip instead of a badge on the Timers strip
+  button, and the count badge now always shows while timers exist;
+  the Undo toast is fixed above the strip; wall fallback chips
+  (5/10/15/30 min) appear when voice is unavailable; PIP pin
+  (`family-hub:timers:pin`) renders the pinned timer first with a
+  "Just started" marker, and "Back to recipe" is SPA navigation with
+  no DOM residue when there is no recipe context.
+- Wall fallback plain line, verbatim from the design: "Voice isn't
+  available right now — tap a time to start a timer".
+
+### Changed
+
+- Timer sort is running soonest-first, then paused soonest-first,
+  then finished/ringing most-recently-finished-first — a finished
+  timer no longer takes focus over a running one (F-T20).
+- The "Soon" word flips at 59 s or less from the sensor's `remaining`
+  attribute, not the displayed countdown.
+- The countdown steps down 72 → 64 → 56 → 48 → 44 → 40 px when the
+  rendered time is wider than the ring minus 16 px, never below
+  40 px.
+
+### Fixed
+
+- Finished timer sensors do not vanish: a 6-minute probe (73 polls)
+  showed all 14 sensors and all 14 stored records present throughout;
+  the earlier vanishing sighting was a rig rebuild wiping storage,
+  not bridge pruning.
+- The Undo toast no longer hides behind the nav strip (F-T17): it is
+  `position: fixed` with its bottom set from the measured strip height
+  + 8 px.
+- Long timer names no longer overflow their dials and dial sub-labels
+  are no longer clipped by the ring's bottom edge (NAV-O2): the name
+  wraps to at most two lines above the ring, and the state/hint lines
+  sit below it.
+- Dismissing a finished timer now offers the same 5 s Undo toast as
+  cancelling one (previously dismiss had no Undo).
+
 ## [0.1.14] - 2026-11-09
 
 ### Fixed

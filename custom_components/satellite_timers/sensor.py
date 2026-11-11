@@ -1,9 +1,13 @@
 """Sensor platform: one sensor per active voice timer on the chosen satellites.
 
 Each sensor is named after the timer ("Pasta") and carries what a dial card
-needs: state ``active`` / ``paused`` / ``finished``, plus ``duration`` (total
-seconds), ``remaining`` (seconds left) and ``finishes_at`` (ISO timestamp)
-attributes. The entity id always contains "timer" (``sensor.satellite_timer_<id>``) so
+needs: state ``active`` / ``paused`` / ``ringing`` / ``finished``, plus
+``duration`` (total seconds), ``remaining`` (seconds left) and
+``finishes_at`` (ISO timestamp) attributes. ``ringing`` is a finished
+timer inside its ringing window (RINGING-1, bridge.py): the satellite's
+alarm cannot be observed by Home Assistant, so the bridge reports
+"ringing" for 60 s after the timer goes off, then flips to "finished".
+The entity id always contains "timer" (``sensor.satellite_timer_<id>``) so
 cards that look for timer-like sensors recognise it.
 
 Sensors appear when a timer starts and disappear when it is cancelled or
@@ -132,7 +136,12 @@ class SatelliteTimerSensor(SensorEntity):
         without a live hub; production callers leave it unset.
         """
         if snapshot.is_finished:
-            state = "finished"
+            # RINGING-1: a finished timer inside its ringing window
+            # reports "ringing" (the satellite is sounding its alarm);
+            # after the window it is plain "finished". The card treats
+            # both as the finished group; the screensaver guard
+            # suppresses only while a timer is ringing.
+            state = "ringing" if snapshot.is_ringing else "finished"
         else:
             state = "active" if snapshot.is_active else "paused"
         attrs: dict = {

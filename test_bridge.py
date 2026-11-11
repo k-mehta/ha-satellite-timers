@@ -163,6 +163,19 @@ class FakeTimerManager:
             handler("started", timer)
         return timer_id
 
+    def pause_timer(self, timer_id):
+        timer = self.timers[timer_id]
+        timer.pause()
+        handler = self.handlers.get(timer.device_id)
+        if handler is not None:
+            handler("updated", timer)
+
+    def cancel_timer(self, timer_id):
+        timer = self.timers.pop(timer_id)
+        handler = self.handlers.get(timer.device_id)
+        if handler is not None:
+            handler("cancelled", timer)
+
 
 class FakeHass:
     def __init__(self, manager):
@@ -503,7 +516,181 @@ except _TimersNotSupportedError:
 b_s.stop()
 b_s2.stop()
 
-# --- persistence (BRIDGE-2) ----------------------------------------------
+# --- ringing (RINGING-1) --------------------------------------------------
+# A finished timer reports is_ringing for 60 s after finished_at, then
+# flips to plain finished. The window is a policy, not a satellite
+# measurement: HA cannot observe when the alarm stops.
+mgr_r2 = FakeTimerManager()
+hass_r2 = FakeHass(mgr_r2)
+mgr_r2.handlers["dev1"] = original_handler
+b_r2 = bridge.SatelliteTimerBridge(hass_r2, ["dev1"])
+check("ringing bridge starts", b_r2.start() is True)
+ring_id = b_r2.start_timer("dev1", "Pasta", 600)
+ring_timer = mgr_r2.timers[ring_id]
+mgr_r2.timers.pop(ring_id)
+mgr_r2.handlers["dev1"]("finished", ring_timer)
+snap = b_r2.snapshot(datetime.now(timezone.utc))
+check("fresh finished timer is ringing",
+      snap[ring_id].is_finished and snap[ring_id].is_ringing is True)
+# 59 s after finish: still ringing. 61 s after: finished, not ringing.
+b_r2._finished[ring_id] = dataclass_replace(
+    b_r2._finished[ring_id],
+    finished_at=datetime.now(timezone.utc) - timedelta(seconds=59),
+)
+snap = b_r2.snapshot(datetime.now(timezone.utc))
+check("59 s after finish still ringing", snap[ring_id].is_ringing is True)
+b_r2._finished[ring_id] = dataclass_replace(
+    b_r2._finished[ring_id],
+    finished_at=datetime.now(timezone.utc) - timedelta(seconds=61),
+)
+snap = b_r2.snapshot(datetime.now(timezone.utc))
+check("61 s after finish no longer ringing",
+      snap[ring_id].is_finished and snap[ring_id].is_ringing is False)
+# Re-asserting FINISHED (satellite reconnects and hears it again)
+# restarts the window from the announcement, even though finished_at
+# is long past — and the satellite hears FINISHED again.
+finished_before = calls.count("original:finished")
+b_r2._on_handler_registered("dev1")
+snap = b_r2.snapshot(datetime.now(timezone.utc))
+check("re-assert restarts the ringing window",
+      snap[ring_id].is_ringing is True)
+check("re-assert tells the satellite FINISHED again",
+      calls.count("original:finished") == finished_before + 1)
+# Dismiss clears ringing with the record.
+b_r2.dismiss_timer(ring_id)
+snap = b_r2.snapshot(datetime.now(timezone.utc))
+check("dismissed ringing timer leaves the snapshot", ring_id not in snap)
+# The ringing window survives a persistence round-trip: a record whose
+# window was extended by a re-assert keeps its ringing_until.
+ring2_id = b_r2.start_timer("dev1", "Rice", 300)
+ring2_timer = mgr_r2.timers[ring2_id]
+mgr_r2.timers.pop(ring2_id)
+mgr_r2.handlers["dev1"]("finished", ring2_timer)
+b_r2._finished[ring2_id] = dataclass_replace(
+    b_r2._finished[ring2_id],
+    finished_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+)
+b_r2._on_handler_registered("dev1")
+stored = b_r2._persisted_data(datetime.now(timezone.utc))
+rec = next(t for t in stored["timers"] if t["timer_id"] == ring2_id)
+check("persisted record carries ringing_until",
+      rec.get("ringing_until") is not None)
+rebuilt = b_r2._snapshot_from_record(rec, datetime.now(timezone.utc))
+check("rebuilt record keeps ringing_until",
+      rebuilt.ringing_until is not None
+      and rebuilt.ringing_until == datetime.fromisoformat(rec["ringing_until"]))
+check("rebuilt record still rings",
+      b_r2._with_ringing(rebuilt, datetime.now(timezone.utc)).is_ringing is True)
+# A record from before this change (no ringing_until) derives the
+# window from finished_at.
+old_rec = dict(rec)
+old_rec.pop("ringing_until")
+old_rec["finished_at"] = (
+    datetime.now(timezone.utc) - timedelta(seconds=30)
+).isoformat()
+rebuilt_old = b_r2._snapshot_from_record(old_rec, datetime.now(timezone.utc))
+check("old record without ringing_until derives from finished_at",
+      b_r2._with_ringing(rebuilt_old, datetime.now(timezone.utc)).is_ringing
+      is True)
+b_r2.stop()
+
+# --- restore (D6 Undo) -----------------------------------------------------
+# Undo on a cancelled timer puts it back with its REMAINING time, in
+# the state it was in — atomically: no await separates the start and
+# the pause, so HA's scheduled syncs (which run after the call
+# returns) only ever see the restored state.
+mgr_u = FakeTimerManager()
+hass_u = FakeHass(mgr_u)
+mgr_u.handlers["dev1"] = original_handler
+b_u = bridge.SatelliteTimerBridge(hass_u, ["dev1"])
+check("restore bridge starts", b_u.start() is True)
+restored_id = b_u.restore_timer("dev1", "Pasta", 420, paused=True)
+snap = b_u.snapshot(datetime.now(timezone.utc))
+check("restore returns a live timer", restored_id in snap)
+r = snap[restored_id]
+check("restored timer keeps the name", r.name == "Pasta")
+check("restored timer keeps the remaining time",
+      r.total_seconds == 420 and r.seconds_left == 420)
+check("restored paused timer comes back paused", r.is_active is False)
+check("restored timer is service-started",
+      r.started_via_service is True)
+running_id = b_u.restore_timer("dev1", "Soup", 300, paused=False)
+snap = b_u.snapshot(datetime.now(timezone.utc))
+check("restored running timer comes back running",
+      snap[running_id].is_active is True)
+check("restored running timer keeps the remaining time",
+      snap[running_id].seconds_left == 300)
+try:
+    b_u.restore_timer("dev1", "Pasta", 0, paused=False)
+    check("restore rejects zero remaining time", False)
+except ValueError:
+    check("restore rejects zero remaining time", True)
+try:
+    b_u.restore_timer("dev9", "Pasta", 60, paused=False)
+    check("restore rejects unconfigured device", False)
+except ValueError:
+    check("restore rejects unconfigured device", True)
+# A pause that fails must not leave a half-restored running timer.
+class _FailPauseManager(FakeTimerManager):
+    def pause_timer(self, timer_id):
+        raise RuntimeError("satellite unreachable")
+
+mgr_f = _FailPauseManager()
+hass_f = FakeHass(mgr_f)
+mgr_f.handlers["dev1"] = original_handler
+b_f = bridge.SatelliteTimerBridge(hass_f, ["dev1"])
+check("failing-pause bridge starts", b_f.start() is True)
+try:
+    b_f.restore_timer("dev1", "Pasta", 420, paused=True)
+    check("restore with failing pause raises ValueError", False)
+except ValueError:
+    check("restore with failing pause raises ValueError", True)
+check("failed restore leaves no timer behind",
+      b_f.snapshot(datetime.now(timezone.utc)) == {})
+b_f.stop()
+# Undo on a dismissed finished timer puts the finished record back
+# WITHOUT re-ringing the satellite, preserving finished_at.
+fin_id = b_u.start_timer("dev1", "Eggs", 120)
+fin_timer = mgr_u.timers[fin_id]
+mgr_u.timers.pop(fin_id)
+mgr_u.handlers["dev1"]("finished", fin_timer)
+orig_finished_at = b_u._finished[fin_id].finished_at
+b_u.dismiss_timer(fin_id)
+check("dismissed finished timer is gone",
+      fin_id not in b_u.snapshot(datetime.now(timezone.utc)))
+finished_before = calls.count("original:finished")
+new_fin_id = b_u.restore_finished(
+    "dev1", "Eggs", 120, orig_finished_at, started_via_service=True
+)
+check("restore_finished returns a new id", new_fin_id != fin_id)
+snap = b_u.snapshot(datetime.now(timezone.utc))
+check("restored finished timer is back", new_fin_id in snap)
+rf = snap[new_fin_id]
+check("restored finished timer keeps the name", rf.name == "Eggs")
+check("restored finished timer keeps finished_at",
+      rf.finished_at == orig_finished_at)
+check("restored finished timer is finished, not ringing",
+      rf.is_finished is True and rf.is_ringing is False)
+check("restored finished timer keeps service-started",
+      rf.started_via_service is True)
+check("restore_finished does not re-ring the satellite",
+      calls.count("original:finished") == finished_before)
+try:
+    b_u.restore_finished("dev1", "Eggs", 0, orig_finished_at, False)
+    check("restore_finished rejects zero duration", False)
+except ValueError:
+    check("restore_finished rejects zero duration", True)
+try:
+    b_u.restore_finished("dev1", "Eggs", 120, None, False)
+    check("restore_finished rejects missing finished_at", False)
+except (ValueError, TypeError):
+    check("restore_finished rejects missing finished_at", True)
+try:
+    b_u.restore_finished("dev9", "Eggs", 120, orig_finished_at, False)
+    check("restore_finished rejects unconfigured device", False)
+except ValueError:
+    check("restore_finished rejects unconfigured device", True)
+b_u.stop()
 import asyncio as _asyncio
 
 _LOOP = _asyncio.new_event_loop()

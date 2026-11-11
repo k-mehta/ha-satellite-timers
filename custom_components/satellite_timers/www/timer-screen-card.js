@@ -3,12 +3,12 @@
 // action (pause / resume / dismiss), Cancel arms before it cancels.
 //
 // Phase 3 (consolidated spec rev 2, TIMER-1..15) changes, by spec ID:
-//   TIMER-1  Full timer name, wrapped to two lines, never truncated,
-//            never shrunk below 20px on the hub. The name is HTML text
-//            (not SVG <text>, which cannot wrap), overlaid on the dial
-//            so it can use the full grid-cell width. The flex row also
-//            carries min-width: 0 — the 50-char unbroken name used to
-//            overflow 4 sizes in true kiosk for exactly that reason.
+//   TIMER-1  Full timer name, wrapped to at most two lines, never
+//            shrunk below 20px on the hub. The name is HTML text in
+//            its own block ABOVE the ring (Wave 1): the old overlay
+//            centred text on the ring and clipped sub-labels at the
+//            circle's bottom edge (NAV-O2). The name block is the
+//            full cell width; the ring holds only the countdown.
 //   TIMER-2  detectDevice follows the unified §3.7 rule as reordered
 //            by P8-16: the exact 1920x1200 panel signature FIRST, in
 //            EITHER orientation (1920x1200 landscape, or 1200x1920
@@ -25,19 +25,24 @@
 //            from finished_at on the tick (same as HOME-3).
 //   TIMER-4  Viewport-split creation: the hub is voice-only + a hint;
 //            phone/tablet get on-screen preset chips (5/10/15/30 min)
-//            that call satellite_timers.start_timer.
+//            that call satellite_timers.start_timer. Wave 1: the chips
+//            live in the "+ Add timer" row (shown directly with no
+//            timers, toggled while timers run); the wall shows the
+//            same chips only when voice is provably unavailable (D4
+//            fallback, T-IMPL-12).
 //   TIMER-5  Warm palette, all passing the §3.3 bars: running ring
 //            #C2410C (4.96:1), soon/finished ring #B45309 (4.81:1),
 //            track #757575 (4.41:1), error #B71C1C (6.29:1).
 //   TIMER-6  Dial text minima (hub): name >=20px, state/hint >=18px,
-//            time 72px. The time sizes to the grid cell, not the ring
-//            diameter (OQ-2 decision: the 72px minimum holds at normal
-//            hub dial sizes; below that the time scales with the cell,
-//            never below 40px, because the ring is decorative and the
-//            text is the content).
-//   TIMER-7  NO cap: past 12 timers the view becomes a scroll
-//            container with a VISIBLE scroll indicator, and finished
-//            timers collapse to compact full-width rows.
+//            time 72px. The time is centred INSIDE the ring (Wave 1)
+//            and steps down (72→64→56→48→44→40) when it is wider
+//            than the ring minus 16px (_fitTimes) — never below 40px,
+//            because the ring is decorative and the text is the
+//            content.
+//   TIMER-7  NO cap: the view scrolls, a floating "↓" pill shows
+//            while a dial sits below the fold, and finished timers
+//            live in a collapsible "Finished (N)" section as compact
+//            74px rows — never as dials (Wave 1).
 //   TIMER-9  Dial taps (and Restart) clear a pending Cancel arm.
 //   TIMER-10 "Back to recipe" bar when the jump came from a recipe:
 //            the timer-jump automation navigates to
@@ -55,9 +60,14 @@
 //            whenever it next looks). Missed-timer announcement is
 //            bridge-side (replay on satellite reconnect).
 //   TIMER-13 Cancelling shows an Undo toast for 5 s; Undo re-creates
-//            the timer via start_timer with the same name and the
-//            REMAINING time at cancel (min 1 s) — not the full
-//            duration (F-T1).
+//            the timer via the bridge restore_timer service with the
+//            same name and the REMAINING time at cancel (min 1 s) —
+//            not the full duration (F-T1) — and restores a paused
+//            timer paused (D6). Dismissing a finished timer offers
+//            the same Undo (restore_finished_timer, no re-ring).
+//            The toast is position: fixed with its bottom set from
+//            the measured strip height, so it never hides behind the
+//            strip (F-T17).
 //   TIMER-14 "A few more minutes" is voice-only (add_time): the empty
 //            state names that path. There is NO on-screen +1 min
 //            button (deliberate user choice).
@@ -84,24 +94,33 @@
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 88;
 
-// A timer is "finishing soon" in its last minute: the ring turns warm and
-// pulses gently so it catches the eye without shouting.
-const FINISHING_SOON_SECONDS = 60;
+// A timer is "finishing soon" in its last 59 seconds: the ring turns
+// warm and pulses gently so it catches the eye without shouting.
+// 59, not 60 (Wave 1, OQ-5): the design flips "soon" at 59 s and the
+// flip follows the SENSOR's remaining attribute (sensorRemaining),
+// not the displayed countdown — the two can differ by a second, and
+// the sensor is the source of truth. The strip badge amber stays at
+// <=60 s (coordinator decision #25-D, literal) — a different rule
+// for a different surface.
+const FINISHING_SOON_SECONDS = 59;
 // How long the Cancel button stays armed ("Tap again to cancel") after the
 // first tap, before it disarms itself.
 const CANCEL_ARM_MS = 4000;
-// How long the cancel Undo toast stays up (TIMER-13).
+// How long the cancel/dismiss Undo toast stays up (TIMER-13).
 const UNDO_TOAST_MS = 5000;
 // Entrance animation length for a newly added dial.
 const ENTER_ANIMATION_MS = 240;
-// Above this many timers the view degrades gracefully (TIMER-7): the
-// screen scrolls, a scroll indicator shows, finished timers collapse.
-const MANY_TIMERS = 12;
-// Space reserved below each dial for its always-visible buttons, so the
-// dial never overlaps them. The tallest button row is 80px plus a 12px
-// gap and a little slack. It is a CSS variable on .screen (100px on the
-// hub) so the desktop and mobile layouts can reserve less for their
-// shorter buttons.
+// Time-fit steps (T-IMPL-7): when the rendered countdown is wider
+// than the ring minus 16px, the font steps down this ladder to the
+// 40px floor (TIMER-6) — never below it.
+const TIME_FIT_STEPS = [72, 64, 56, 48, 44, 40];
+// Preset chip durations, minutes (TIMER-4 / D4 fallback).
+const PRESET_MINUTES = [5, 10, 15, 30];
+// The PIP pin (written by the recipe card, read once per mount) and
+// the Home arrival flag (written by the Home card, read once per
+// mount) — sessionStorage keys (D7.3 / T-IMPL-20/23).
+const TIMERS_PIN_KEY = "family-hub:timers:pin";
+const TIMERS_ARRIVAL_KEY = "family-hub:timers:arrival";
 
 function displayName(stateObj) {
   const attrs = (stateObj && stateObj.attributes) || {};
@@ -153,6 +172,14 @@ function remainingSeconds(timer, nowMs) {
   return Math.max(0, timer.remaining || 0);
 }
 
+// The sensor's own remaining attribute (T-IMPL-13 / OQ-5): the "soon"
+// flip and the strip badge read this, not the displayed countdown
+// derived from finishes_at — the two can differ by a second.
+function sensorRemaining(timer) {
+  if (!timer) return 0;
+  return Math.max(0, Number(timer.remaining) || 0);
+}
+
 function progressFraction(timer, nowMs) {
   if (!timer || !timer.duration || timer.duration <= 0) return 0;
   return Math.min(1, Math.max(0, remainingSeconds(timer, nowMs) / timer.duration));
@@ -189,7 +216,12 @@ function discoverTimers(states) {
   for (const s of states || []) {
     if (!s || typeof s.entity_id !== "string") continue;
     if (!s.entity_id.startsWith("sensor.satellite_timer_")) continue;
-    if (s.state !== "active" && s.state !== "paused" && s.state !== "finished") {
+    if (
+      s.state !== "active" &&
+      s.state !== "paused" &&
+      s.state !== "finished" &&
+      s.state !== "ringing"
+    ) {
       continue;
     }
     const attrs = s.attributes || {};
@@ -205,19 +237,26 @@ function discoverTimers(states) {
       finishedAt: attrs.finished_at || null,
       startedAt: attrs.started_at || null,
       deviceId: attrs.device_id || null,
+      // BRIDGE-1: how the timer was started — the dismiss Undo must
+      // restore it the same way (restore_finished_timer).
+      startedViaService: attrs.started_via === "service",
     });
   }
   const now = Date.now();
+  // Wave 1 sort (T-IMPL-2/3 — the finished-first defect F-T20 is
+  // gone): running timers first (active, soonest first), then paused
+  // (soonest first), then finished and ringing together,
+  // most-recently-finished first. A finished timer no longer takes
+  // focus over a running one.
+  const groupOf = (t) =>
+    t.state === "active" ? 0 : t.state === "paused" ? 1 : 2;
   out.sort((a, b) => {
-    // A finished timer takes focus: it sorts before every running timer,
-    // oldest finish first. Running timers sort soonest-first by time left.
-    const aFinished = a.state === "finished";
-    const bFinished = b.state === "finished";
-    if (aFinished && bFinished) {
-      return String(a.finishedAt || "").localeCompare(String(b.finishedAt || ""));
+    const ga = groupOf(a);
+    const gb = groupOf(b);
+    if (ga !== gb) return ga - gb;
+    if (ga === 2) {
+      return String(b.finishedAt || "").localeCompare(String(a.finishedAt || ""));
     }
-    if (aFinished) return -1;
-    if (bFinished) return 1;
     return remainingSeconds(a, now) - remainingSeconds(b, now);
   });
   return out;
@@ -231,85 +270,96 @@ function escapeHtml(value) {
     .replace(/"/g, "&quot;");
 }
 
-// How many columns the landscape grid uses, by device category. On the
-// hub one to three timers stay in a single row; four split into a 2x2
-// square so the dials stay big; five and up use three columns, rows as
-// needed. Desktop is denser: up to four in a row, four columns past
-// that. Mobile keeps the hub mapping in landscape; portrait ignores
-// this — the vertical stack is the only layout there.
-function gridColumns(count, category) {
-  if (category === "desktop") {
-    if (count <= 1) return 1;
-    if (count <= 4) return count;
-    return 4;
-  }
-  if (count <= 1) return 1;
-  if (count <= 3) return count;
-  if (count === 4) return 2;
-  return 3;
+// How many columns the grid uses, by viewport class ONLY (Wave 1,
+// T-IMPL-1/4 — the count-driven grid is deleted: it shrank dials to
+// 30px rings at 12 timers and overlapped names onto bars). Hub
+// portrait 2, hub landscape 3, mobile portrait 1, mobile landscape 2;
+// tablet and desktop by width (>=1600 -> 3, 900-1599 -> 2, <900 -> 1).
+// Pure — unit-testable in node.
+function gridColumnsFor(category, orientation, width) {
+  const w = Number(width) || 0;
+  if (category === "hub") return orientation === "portrait" ? 2 : 3;
+  if (orientation === "portrait" && category === "mobile") return 1;
+  if (category === "mobile") return 2;
+  if (w >= 1600) return 3;
+  if (w >= 900) return 2;
+  return 1;
 }
 
-// -- height-budget dial cap (P8-3 / P8-6) ----------------------------------
-//
-// The dial used to size by width only (the smaller of the column width
-// and 100vh − controls − padding), so it knew nothing about how many
-// rows exist: 1 timer scrolled 84px, 3 fit, 5 scrolled 368px, 12
-// scrolled 1820px — non-monotonic, and 4 timers (2x2, dial 936px)
-// were the worst unmeasured state. The fix caps the dial by the HEIGHT
-// budget: the viewport height minus the screen's vertical padding
-// (24px top + 24px bottom + the nav strip's height), minus the gaps
-// between rows, minus any full-width extra row (the "Back to recipe"
-// bar, 64px + one gap), divided by the row count, minus the controls
-// reserve below each dial. The result is --dial-max, a CSS var on
-// .screen that the landscape dial rule takes as a third min() term.
-// Dials then shrink as rows grow (1 timer -> 968px, 4-5 timers ->
-// 426px, 12 timers -> 155px at the hub) and docH stays <= viewport
-// for counts <= 12. If --dial-max would fall below the many-mode dial
-// size (140px), fitting is impossible and the view switches to
-// many-mode behaviour (scroll + compact finished rows) regardless of
-// count — at the hub that lands at 13 timers, the same threshold as
-// the old count rule. The fit requirement is scoped to landscape:
-// phone portrait is expected to scroll (TIMER-7), and the cap only
-// applies inside the landscape media query, so portrait is untouched.
-const DIAL_FIT_MIN_PX = 140; // many-mode dial size; the fit floor
-// Below this fitted diameter the 72px time (TIMER-6) no longer fits
-// inside the ring — "59:55" at 72px is ~200px wide — so the screen
-// takes the many-mode text scale instead (44px time, 18px name,
-// 16px state/hint; same values as .screen.many). 260px leaves room
-// for the time plus the chord margin; the 426px dials at 4–5 timers
-// keep the full 72px time.
-const SMALL_DIAL_MAX_PX = 260;
-const SCREEN_PAD_TOP_PX = 24;
-const SCREEN_PAD_BOTTOM_PX = 24;
-const GRID_GAP_PX = 16;
+// Whether voice is provably unavailable (D4 fallback trigger,
+// T-IMPL-12 — resolved against Navigation D-N4 and HA 2026.10.4):
+// at least one assist_satellite entity exists AND every one is
+// unavailable/unknown — or muted, for integrations that publish a
+// muted/is_muted attribute (HA core publishes NO mute state: mute is
+// device-internal, so the state leg is the only provable one). Zero
+// assist_satellite entities is NOT proof of anything (fail-open, like
+// the screensaver voice-as-activity condition): absence is not proof
+// the satellite is down. Pure — pass hass.states (object or array).
+function voiceUnavailable(states) {
+  if (!states) return false;
+  const sats = [];
+  for (const s of Object.values(states)) {
+    if (!s || typeof s.entity_id !== "string") continue;
+    if (s.entity_id.indexOf("assist_satellite.") === 0) sats.push(s);
+  }
+  if (sats.length === 0) return false;
+  return sats.every((s) => {
+    if (s.state === "unavailable" || s.state === "unknown") return true;
+    const attrs = s.attributes || {};
+    return attrs.muted === true || attrs.is_muted === true;
+  });
+}
 
-// Pure — unit-testable in node. Returns { dialMax } in px, or
-// { dialMax: null, many: true } when the fit is impossible, or
-// { dialMax: null, many: false } when there is nothing to fit (no
-// timers, or no viewport to fit into).
-function dialFit(count, cols, viewportHeight, controlsReserve, navStripHeight, extraPx) {
-  if (
-    !count ||
-    count <= 0 ||
-    !cols ||
-    cols <= 0 ||
-    !viewportHeight ||
-    viewportHeight <= 0
-  )
-    return { dialMax: null, many: false };
-  const rows = Math.ceil(count / cols);
-  const verticalPad =
-    SCREEN_PAD_TOP_PX + SCREEN_PAD_BOTTOM_PX + (navStripHeight || 0);
-  const rowBudget = Math.floor(
-    (viewportHeight -
-      verticalPad -
-      GRID_GAP_PX * (rows - 1) -
-      (extraPx || 0)) /
-      rows
-  );
-  const dialMax = rowBudget - controlsReserve;
-  if (dialMax < DIAL_FIT_MIN_PX) return { dialMax: null, many: true };
-  return { dialMax, many: false };
+// The PIP pin (D7.3 / T-IMPL-20): the recipe card writes
+// family-hub:timers:pin = {timerId} when the user taps a PIP. Read
+// once per mount and clear after reading, so a later mount does not
+// re-pin a stale timer. Returns the timer id, or null.
+function readTimersPin(storage) {
+  if (!storage || typeof storage.getItem !== "function") return null;
+  let raw = null;
+  try {
+    raw = storage.getItem(TIMERS_PIN_KEY);
+  } catch (_err) {
+    return null;
+  }
+  if (!raw) return null;
+  try {
+    storage.removeItem(TIMERS_PIN_KEY);
+  } catch (_err) {
+    // Clear failure: the pin is still consumed below (returned once
+    // — the caller keeps it in memory, never re-reads).
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && typeof parsed.timerId === "string" && parsed.timerId) {
+      return parsed.timerId;
+    }
+    if (typeof parsed === "string" && parsed) return parsed;
+  } catch (_err) {
+    if (typeof raw === "string" && raw) return raw;
+  }
+  return null;
+}
+
+// The Home arrival flag (T-IMPL-23): the Home card writes
+// family-hub:timers:arrival = "home" when the user arrives from Home.
+// Read once per mount and clear after reading. Returns true when the
+// arrival was Home.
+function readTimersArrival(storage) {
+  if (!storage || typeof storage.getItem !== "function") return false;
+  let raw = null;
+  try {
+    raw = storage.getItem(TIMERS_ARRIVAL_KEY);
+  } catch (_err) {
+    return false;
+  }
+  if (!raw) return false;
+  try {
+    storage.removeItem(TIMERS_ARRIVAL_KEY);
+  } catch (_err) {
+    // Clear failure: the flag is still consumed once by the caller.
+  }
+  return raw === "home" || raw === '"home"';
 }
 
 // -- scroll persistence (DESIGN-7, Phase 7) ------------------------------
@@ -519,6 +569,186 @@ function isKioskMode(search) {
   );
 }
 
+// -- Kiosk as a session property (D-N8.3 / N-IMPL-10) ---------------------
+// Same block as family-hub-nav-strip.js (the reference implementation):
+// kiosk is a session property, not a URL parameter. Once the hub loads
+// with ?kiosk the flag is stored in sessionStorage (per-tab, key
+// family-hub:kiosk) and EVERY in-app navigation carries ?kiosk in the
+// URL. A reload in the same tab re-applies kiosk from the stored flag:
+// the URL already carries ?kiosk for every in-app navigation, so the
+// reload URL has it; if the URL somehow lacks it, the card performs
+// ONE location.replace adding ?kiosk. Card JavaScript cannot hide HA
+// chrome before first paint, so a bare-URL paint may flash chrome
+// once before the re-apply reload. A fresh tab, browser restart, or
+// second device re-establishes kiosk only via the WIZ-8 start URL.
+const KIOSK_SESSION_KEY = "family-hub:kiosk";
+
+function readKioskFlag() {
+  if (typeof sessionStorage === "undefined") return false;
+  try {
+    return sessionStorage.getItem(KIOSK_SESSION_KEY) === "1";
+  } catch (_err) {
+    return false;
+  }
+}
+
+function storeKioskFlag() {
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    sessionStorage.setItem(KIOSK_SESSION_KEY, "1");
+  } catch (_err) {
+    // Storage blocked: kiosk still works for this load (the URL has
+    // ?kiosk); only the same-tab reload re-apply is lost.
+  }
+}
+
+function isKioskSession(search) {
+  return isKioskMode(search) || readKioskFlag();
+}
+
+function withKioskQuery(path) {
+  const target = String(path || "/family-hub");
+  if (!isKioskSession(typeof window !== "undefined" && window.location ? window.location.search || "" : "")) return target;
+  const [base, query] = target.split("?");
+  if (!query) return `${base}?kiosk`;
+  const params = query.split("&");
+  if (params.some((part) => part === "kiosk" || part.indexOf("kiosk=") === 0)) return target;
+  return `${base}?${query}&kiosk`;
+}
+
+function reapplyKioskIfNeeded() {
+  if (typeof window === "undefined" || !window.location) return false;
+  if (!readKioskFlag()) return false;
+  if (isKioskMode(window.location.search || "")) return false;
+  const url = withKioskQuery(
+    `${window.location.pathname || "/family-hub"}${window.location.search || ""}${window.location.hash || ""}`
+  );
+  try {
+    window.location.replace(url);
+  } catch (_err) {
+    return false;
+  }
+  return true;
+}
+
+// -- Timers count badge (D-N1 / N-IMPL-5) ---------------------------------
+// Same block as family-hub-nav-strip.js: counts ACTIVE + PAUSED
+// (coordinator decision #25-D); colour from running/finished only
+// (amber = a RUNNING timer in its last 60 s; red = any finished
+// timer). Finished-only: when active+paused is 0 but a finished timer
+// exists, the badge shows the finished count in red. Null = no badge.
+// This card calls timerBadgeState(this._timers) directly — the timer
+// objects from discoverTimers already carry {state, remaining}.
+function timerBadgeState(timers) {
+  let count = 0;
+  let finished = 0;
+  let soon = false;
+  for (const timer of timers || []) {
+    if (!timer || typeof timer.state !== "string") continue;
+    if (timer.state === "active" || timer.state === "paused") count += 1;
+    // Ringing is the finished group (RINGING-1): a ringing timer
+    // counts in the red finished bucket, not the running count.
+    if (timer.state === "finished" || timer.state === "ringing") finished += 1;
+    if (timer.state === "active" && Number(timer.remaining) <= 60) soon = true;
+  }
+  if (count === 0 && finished === 0) return null;
+  const shown = count === 0 ? finished : count;
+  return {
+    count: shown,
+    tone: finished > 0 ? "finished" : soon ? "soon" : "count",
+  };
+}
+
+function timerBadgeFromHassStates(states) {
+  if (!states) return null;
+  const timers = [];
+  for (const key of Object.keys(states)) {
+    if (key.indexOf("sensor.satellite_timer_") !== 0) continue;
+    const state = states[key];
+    if (!state) continue;
+    const attrs = state.attributes || {};
+    timers.push({ state: state.state, remaining: Number(attrs.remaining) || 0 });
+  }
+  return timerBadgeState(timers);
+}
+
+// -- Night mode (D-N10 / N-IMPL-24) ---------------------------------------
+// Same block as family-hub-nav-strip.js: a setting with a schedule;
+// the user sets the hours — there are NO default hours. Stored in
+// localStorage family-hub:night-mode = {"start":"HH:MM","end":"HH:MM"};
+// absent or invalid means night mode is off. The strip stays usable
+// at night (dimmed palette, same targets).
+const NIGHT_SETTING_KEY = "family-hub:night-mode";
+
+function parseNightSetting(raw) {
+  if (typeof raw !== "string" || !raw) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (_err) {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const toMinutes = (value) => {
+    if (typeof value !== "string") return null;
+    const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+    if (!m) return null;
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+    return h * 60 + min;
+  };
+  const start = toMinutes(parsed.start);
+  const end = toMinutes(parsed.end);
+  if (start === null || end === null || start === end) return null;
+  return { start, end };
+}
+
+function readNightSetting() {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    return parseNightSetting(localStorage.getItem(NIGHT_SETTING_KEY));
+  } catch (_err) {
+    return null;
+  }
+}
+
+function isNightNow(setting, date) {
+  if (!setting) return false;
+  const now = date instanceof Date ? date : new Date();
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  if (setting.start < setting.end) {
+    return minutes >= setting.start && minutes < setting.end;
+  }
+  return minutes >= setting.start || minutes < setting.end;
+}
+
+// The recipe to go back to (TIMER-10 + N-IMPL-21): the recipe card's
+// session state first (family-hub:recipe:state — openId + step, saved
+// on every step change), the URL ?from_recipe=<id>&step=<n> as the
+// fallback for a jump that arrived without a session. Returns null
+// when neither carries a recipe. Pure enough to test: pass a query
+// string in (the session is read from sessionStorage when present).
+function readBackRecipeContext(search) {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      const raw = sessionStorage.getItem("family-hub:recipe:state");
+      if (raw) {
+        const saved = JSON.parse(raw);
+        if (saved && saved.openId) {
+          return {
+            recipeId: saved.openId,
+            step: saved.step === undefined || saved.step === null ? null : saved.step,
+          };
+        }
+      }
+    }
+  } catch (_err) {
+    // Corrupt session state: fall through to the URL.
+  }
+  return readRecipeContext(search);
+}
+
 // The environment the card is actually running in, read from the
 // browser. Returns null outside a browser (node tests), where the card
 // keeps its base layout and detectDevice is never called.
@@ -588,55 +818,85 @@ const CARD_CSS = `
     min-height: 480px;
     box-sizing: border-box;
     padding: 24px;
-    display: flex;
-    flex-direction: column;
+    /* Wave 1 (T-IMPL-1/4/5): the screen is a grid in BOTH
+       orientations — the columns come from the viewport class
+       (gridColumnsFor), never from the timer count. Rows size to
+       content; the view scrolls when they overflow. The old
+       count-driven grid and the height-budget dial fit (dialFit /
+       --dial-max / many-mode) are deleted: they shrank dials to
+       30px rings and overlapped names onto bars (LB-7). */
+    display: grid;
+    grid-template-columns: repeat(1, 1fr);
+    grid-auto-rows: auto;
+    align-content: start;
     gap: 16px;
     background: transparent;
     overflow-y: auto;
-    --controls-reserve: 100px;
-    /* NAV-1: the nav strip's height on this device (84px hub, 76px
-       tablet, 60px mobile, 0px desktop-hidden, 84px desktop+kiosk).
-       The screen reserves it in bottom padding so the last row
-       scrolls clear of the fixed strip; the Undo toast reads the
-       same var. */
-    --nav-strip-height: 84px;
-    padding-bottom: calc(24px + var(--nav-strip-height, 84px));
+    /* NAV-1: the nav strip's height on this device (96px hub, 80px
+       tablet, 72px mobile, 0px desktop-hidden, 64px desktop+kiosk) —
+       strip height + 8px (N-IMPL-20). The screen reserves it in bottom
+       padding so the last row scrolls clear of the fixed strip; the
+       Undo toast and the scroll pill read the same var. */
+    --nav-strip-height: 96px;
+    padding-bottom: calc(8px + var(--nav-strip-height, 96px));
   }
-  /* The hub display is landscape (1920x1200): timers sit in a grid —
-     one row of up to three, then a balanced grid (at most three
-     columns) so dials and buttons stay big instead of shrinking down
-     one long row. Portrait is only a fallback (a phone or a rotated
-     browser): the same dials stack vertically instead. */
-  @media (orientation: landscape) {
-    .screen { display: grid; grid-auto-rows: 1fr; align-content: stretch; }
-    .screen.cols-1 { grid-template-columns: repeat(1, 1fr); }
-    .screen.cols-2 { grid-template-columns: repeat(2, 1fr); }
-    .screen.cols-3 { grid-template-columns: repeat(3, 1fr); }
-    .screen.cols-4 { grid-template-columns: repeat(4, 1fr); }
-    .dial { min-width: 0; }
-    .empty { grid-column: 1 / -1; }
-    .back-bar { grid-column: 1 / -1; }
-  }
+  .screen.cols-1 { grid-template-columns: repeat(1, 1fr); }
+  .screen.cols-2 { grid-template-columns: repeat(2, 1fr); }
+  .screen.cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .back-bar, .add-timer-row, .empty, .finished-section { grid-column: 1 / -1; }
+  /* Dial (Wave 1, D1): a vertical stack — name block (full cell
+     width, wraps to at most two lines) above the ring, the countdown
+     centred INSIDE the ring button, state/hint lines below the ring,
+     then the action button. The name and sub-text are HTML below and
+     above the ring, never overlaid on it: the old .dial-text overlay
+     centred text on the ring and clipped sub-labels at the circle's
+     bottom edge (NAV-O2). The whole dial cell is the tap target
+     (data-action="dial" on .dial). */
   .dial {
-    flex: 1 1 0;
-    min-height: 0;
     min-width: 0;
     width: 100%;
     position: relative;
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
+    gap: 8px;
+    cursor: pointer;
   }
   .dial.entering { animation: dial-in ${ENTER_ANIMATION_MS}ms ease-out; }
   @keyframes dial-in {
     from { opacity: 0; transform: scale(0.94); }
     to { opacity: 1; transform: scale(1); }
   }
+  /* A dial the user just started from a chip pulses once so the new
+     timer is easy to find after the scroll (T-IMPL-10). */
+  .dial.pulse .dial-button { animation: dial-pulse 0.6s ease-out 1; }
+  @keyframes dial-pulse {
+    0% { transform: scale(0.94); }
+    60% { transform: scale(1.03); }
+    100% { transform: scale(1); }
+  }
+  .dial-name {
+    width: 100%;
+    color: #212121;
+    font-size: 20px;
+    line-height: 1.25;
+    text-align: center;
+    overflow-wrap: break-word;
+    word-break: break-word;
+    /* D1: at most two lines — a longer name is cut with an ellipsis
+       rather than pushing the ring down into the next row (the D1.4
+       gate: name-vs-previous-bar = 0). */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
   .dial-button {
-    height: min(calc(100% - var(--controls-reserve)), calc(100vmin - 48px));
+    position: relative;
+    /* Ring diameter = column width minus 32px padding (D1.4: the
+       gate measures the .dial-button bounding-box width). */
+    width: calc(100% - 32px);
     aspect-ratio: 1;
-    max-width: 100%;
     padding: 0;
     border: none;
     background: none;
@@ -644,35 +904,10 @@ const CARD_CSS = `
     display: flex;
     align-items: center;
     justify-content: center;
-    /* No transition on height/width (DESIGN-6): animating layout
-       properties causes reflow jank on a low-power board. The button
-       resizes instantly on rotation, which is the correct behaviour
-       — a resize is not a moment that needs smoothing. */
+    /* No transition on width/height (DESIGN-6): animating layout
+       properties causes reflow jank on a low-power board. */
   }
   .dial-button:active { transform: scale(0.98); }
-  /* In a landscape grid the dial is a circle, so its diameter is the
-     smaller of the column width, the height left after the screen
-     padding and the button row below it, and --dial-max — the height
-     budget for the ROW count (P8-3/P8-6: _applyDialFit sets it from
-     the live viewport height, so the dials shrink as rows grow and
-     the view fits the viewport for counts <= 12 instead of sizing
-     by width alone). The var() fallback is effectively unbounded, so
-     a card with no fit computed (portrait, no window) behaves as
-     before. Sizing by width (with aspect-ratio) keeps the button
-     square: sizing by height and clamping the width left a tall
-     empty button with a small circle centred in it. The max-height
-     is only a safety net for when the card is not full-screen (Home
-     Assistant chrome visible): in kiosk mode the width cap already
-     accounts for the same budget. This sits after the base
-     .dial-button rule on purpose — same specificity, so the later
-     rule wins for the properties it sets. */
-  @media (orientation: landscape) {
-    .dial-button {
-      width: min(100%, calc(100vh - var(--controls-reserve) - 48px), var(--dial-max, 100000px));
-      height: auto;
-      max-height: calc(100% - var(--controls-reserve));
-    }
-  }
   .dial-button:focus-visible { outline: 2px solid #C2410C; outline-offset: 4px; border-radius: 50%; }
   svg { display: block; width: 100%; height: auto; max-height: 100%; }
   /* TIMER-5 palette (spec §3.3, tokens --hub-color-timer-*): running
@@ -697,53 +932,37 @@ const CARD_CSS = `
     0%, 100% { opacity: 1; }
     50% { opacity: 0.55; }
   }
-  /* Dial text is HTML, overlaid on the dial cell (TIMER-1 / TIMER-6):
-     SVG <text> cannot wrap, and the name must wrap to two lines at
-     >=20px without truncating. The overlay spans the full cell width
-     (the ring is decorative; the text sizes to the cell, not the ring
-     — OQ-2). It never intercepts taps (pointer-events: none): the
-     dial button underneath stays the tap target.
-     The bottom padding is the controls reserve (TIMER-7): the overlay
-     covers the whole cell, but the ring is only the top part — the
-     Cancel/Restart row sits below it. Without the padding the text
-     centres on the cell and sits half the reserve below the ring
-     centre, so in many-mode (140px ring) the name lands on the ring's
-     top stroke and the hint is clipped by the button below. Padding
-     the overlay by the reserve centres the text on the ring instead;
-     the reserve matches the controls height per context (100px hub,
-     76px desktop, 84px tablet/mobile), so the alignment holds everywhere. */
-  .dial-text {
+  /* The countdown sits INSIDE the ring button, absolutely centred
+     (TIMER-6: 72px, never below 40px — the time is the content, the
+     ring is decorative). pointer-events none: the button underneath
+     stays the tap target. _fitTimes steps the size down (72→64→56→
+     48→44→40) when the rendered time is wider than the ring minus
+     16px. */
+  .time {
     position: absolute;
     inset: 0;
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    text-align: center;
-    pointer-events: none;
-    padding: 0 8px var(--controls-reserve) 8px;
-    box-sizing: border-box;
-    min-width: 0;
-  }
-  .name {
-    color: #212121;
-    font-size: 20px;
-    line-height: 1.25;
-    overflow-wrap: break-word;
-    word-break: break-word;
-    min-width: 0;
-    max-width: 100%;
-  }
-  .time {
     color: #212121;
     font-size: clamp(40px, 11vw, 72px);
     font-weight: 700;
     line-height: 1.1;
+    pointer-events: none;
+    text-align: center;
+  }
+  .dial-sub {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    min-width: 0;
+    width: 100%;
   }
   .state { color: #57534E; font-size: 18px; line-height: 1.3; }
   .started { color: #57534E; font-size: 16px; line-height: 1.3; }
   .hint { color: #57534E; font-size: 18px; line-height: 1.3; }
-  .controls { display: flex; gap: 12px; margin-top: 12px; width: 100%; }
+  .controls { display: flex; gap: 12px; margin-top: 4px; width: 100%; }
   .controls button {
     flex: 1;
     min-height: 80px;
@@ -763,29 +982,73 @@ const CARD_CSS = `
     to { opacity: 1; transform: translateY(0); }
   }
   .controls button:disabled { opacity: 0.5; cursor: default; }
-  .controls button.cancel { background: #B71C1C; border-color: #B71C1C; color: #fff; }
-  .controls button.cancel.armed { background: #B71C1C; border-color: #B71C1C; animation: cancel-arm-pulse 0.8s ease-in-out infinite; }
-  @keyframes cancel-arm-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.75; }
+  .controls button.cancel { background: #B71C1C; border-color: #B71C1C; color: #fff; position: relative; overflow: hidden; }
+  .controls button.cancel.armed { background: #B71C1C; border-color: #B71C1C; }
+  /* Cancel arm bar (T-IMPL-24): a bar drains across the bottom of
+     the armed Cancel button over the 4 s arm window, so the cook can
+     see how long the arm lasts. */
+  .arm-bar {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 6px;
+    width: 100%;
+    background: rgba(255, 255, 255, 0.75);
+    animation: arm-drain ${CANCEL_ARM_MS}ms linear forwards;
+    pointer-events: none;
+  }
+  @keyframes arm-drain {
+    from { width: 100%; }
+    to { width: 0; }
   }
   .controls button.restart { background: var(--card-background-color, #fff); }
   .error { color: #B71C1C; font-size: 14px; text-align: center; margin-top: 8px; width: 100%; }
+  /* Empty state (D4): a centred card, at least 30% of the safe-area
+     height, vertically centred within it — not a fixed-size block.
+     "No timers running" at 32px, the two voice hints at 20px. */
   .empty {
-    flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     text-align: center;
     color: #57534E;
-    font-size: clamp(20px, 4vmin, 32px);
     gap: 12px;
+    min-height: 30vh;
   }
   .empty[hidden] { display: none; }
   .empty svg { width: 72px; height: 72px; opacity: 0.6; margin-bottom: 12px; }
+  .empty-title { font-size: 32px; line-height: 1.25; color: #212121; }
   .voice-hint { font-size: 20px; line-height: 1.4; max-width: 640px; }
-  .preset-chips { display: none; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 8px; }
+  /* When the wall fallback chips show, the voice hints hide — they
+     contradict the "Voice isn't available" line (T-IMPL-12). */
+  .empty.voice-down .voice-hint { display: none; }
+  .empty-error { color: #B71C1C; font-size: 18px; }
+  .empty-error[hidden] { display: none; }
+  /* "+ Add timer" row (T-IMPL-10) + fallback chips (T-IMPL-12): one
+     full-width row at the top, above the dials. Non-hub only: a
+     persistent "+ Add timer" button when timers run, toggling the
+     chip row; the chips show directly when there are no timers. On
+     the wall the row appears only when voice is down (fallback), with
+     the plain line instead of the button. */
+  .add-timer-row { display: flex; flex-direction: column; gap: 12px; }
+  .add-timer-row[hidden] { display: none; }
+  .add-timer-button {
+    align-self: flex-start;
+    min-height: 64px;
+    padding: 12px 24px;
+    border-radius: 16px;
+    border: 1px solid #EDE8E3;
+    background: var(--card-background-color, #fff);
+    color: #212121;
+    font-size: 22px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .add-timer-hint { color: #57534E; font-size: 18px; line-height: 1.4; }
+  .fallback-line { color: #212121; font-size: 20px; font-weight: 700; line-height: 1.4; }
+  .preset-chips { display: none; flex-wrap: wrap; gap: 12px; justify-content: center; }
+  .preset-chips.show { display: flex; }
   .preset-chips .chip-label { font-size: 20px; align-self: center; }
   .preset-chips button {
     min-height: 56px;
@@ -800,14 +1063,22 @@ const CARD_CSS = `
     cursor: pointer;
   }
   .preset-chips button:disabled { opacity: 0.5; cursor: default; }
-  .empty-error { color: #B71C1C; font-size: 18px; }
-  .empty-error[hidden] { display: none; }
+  /* Mobile landscape: the open chips anchor above the strip so they
+     stay reachable while the view scrolls (T-IMPL-11). */
+  .screen.dev-mobile.orient-landscape .preset-chips.show {
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    bottom: calc(var(--nav-strip-height, 72px) + 16px);
+    z-index: 30;
+  }
   /* Back to recipe (TIMER-10): shown only when the jump came from a
-     recipe (?from_recipe=<id>). */
+     recipe (?from_recipe=<id>). Fixed size — never viewport-computed:
+     at most 229x64 on the wall, 196x56 on the phone. */
   .back-bar { display: flex; justify-content: flex-start; }
-  .back-bar[hidden] { display: none; }
   .back-bar button {
-    min-height: 64px;
+    height: 64px;
+    max-width: 229px;
     padding: 12px 24px;
     border-radius: 16px;
     border: 1px solid #EDE8E3;
@@ -816,112 +1087,46 @@ const CARD_CSS = `
     font-size: 22px;
     font-weight: 700;
     cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  /* -- Navigation strip (NAV-1) ---------------------------------------
-     The persistent strip, FIRST in the DOM (tab order). Noun labels,
-     Home first, the current view (Timers) with the accent background,
-     heavier weight, and aria-current. Hidden on DESKTOP only when NOT
-     in kiosk mode, where HA tabs already exist and work; always shown
-     on hub AND phone, and on desktop IN kiosk mode (HA tabs do not
-     exist there — the kiosk-desktop hole). The button sizes and the
-     strip heights match the recipe card exactly (hub 64px / 24px,
-     tablet 56px / 20px, mobile 48px / 16px nowrap), so the strip is
-     the same height on every view. The background is the HA page
-     background (#FAFAFA by default) — the timer screen is
-     transparent, so the strip must be opaque against the page its
-     dials scroll over.
-     Positioning: FIXED to the viewport bottom, in both orientations.
-     The recipe card's strip is sticky — but its screen is not a
-     scroll container, so sticky pins against the document. The timer
-     screen IS a scroll container (overflow-y: auto, TIMER-7), and
-     when the Lovelace view sizes the card to content the screen
-     grows past the viewport: a sticky strip would sit at the content
-     end, below the fold at scroll top, instead of staying visible.
-     Fixed is viewport-relative in both scroll modes (the screen
-     scrolling internally, and the document scrolling), and the screen
-     reserves the strip's height in bottom padding so the last row
-     scrolls clear of it. */
-  .nav-strip {
-    position: fixed;
-    bottom: 0;
-    left: 24px;
-    right: 24px;
-    z-index: 40;
-    box-sizing: border-box;
-    padding: 16px 0 4px;
-    background: var(--primary-background-color, #fafafa);
-  }
-  .nav-strip-buttons { display: flex; gap: 16px; }
-  .nav-strip-button {
-    flex: 1;
-    min-width: 0;
+  /* Finished section (TIMER-7, Wave 1): finished and ringing timers
+     live here as compact rows, never as dials — a finished timer
+     must not take a dial's space. The header collapses the section;
+     it is collapsed by default when a timer is running or paused,
+     expanded on arrival when none is, and forced expanded while any
+     timer is ringing. Rows are 74px: name + sub-line on the left,
+     Restart on the right. */
+  .finished-section { display: flex; flex-direction: column; gap: 12px; }
+  .finished-section[hidden] { display: none; }
+  .finished-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    width: 100%;
     min-height: 64px;
     padding: 12px 20px;
+    box-sizing: border-box;
     border-radius: 16px;
     border: 1px solid #EDE8E3;
     background: var(--card-background-color, #fff);
-    box-shadow: 0 1px 2px rgba(28, 25, 23, 0.05), 0 8px 20px rgba(28, 25, 23, 0.06);
-    color: var(--primary-text-color, #212121);
-    font-size: 24px;
+    color: #212121;
+    font-size: 22px;
     font-weight: 700;
     cursor: pointer;
-    font-family: inherit;
-    overflow-wrap: break-word;
-    /* Anchor for the scroll badge (P8-5): the badge is absolutely
-       positioned at this button's top-right corner. */
-    position: relative;
+    text-align: left;
   }
-  .nav-strip-button:hover { box-shadow: 0 2px 4px rgba(28, 25, 23, 0.06), 0 14px 28px rgba(28, 25, 23, 0.10); }
-  .nav-strip-button:active { transform: scale(0.98); }
-  .nav-strip-button.active { background: #C2410C; border-color: #C2410C; color: #fff; font-weight: 800; }
-  .nav-strip-button:focus-visible { outline: 2px solid #C2410C; outline-offset: 2px; }
-  /* Visible scroll indicator (TIMER-7 / P8-5): a "↓" badge on the
-     Timers strip button, shown only while a dial sits below the
-     viewport fold (P8-4 gate — see _updateScrollBadge). The strip is
-     already fixed chrome, so the indicator overlaps nothing — the
-     old floating pill sat over the middle column's dial and its
-     controls by construction. Corner-positioned, so it never changes
-     the button's size or wraps its label (the strip buttons are
-     tight at 360px); pointer-events none, so taps still hit the
-     button underneath. */
-  .nav-scroll-badge {
-    position: absolute;
-    top: -10px;
-    right: 6px;
-    min-width: 28px;
-    height: 28px;
-    padding: 0 6px;
-    box-sizing: border-box;
-    border-radius: 999px;
-    background: #1C1917;
-    color: #fff;
-    font-size: 18px;
-    font-weight: 700;
-    line-height: 28px;
-    text-align: center;
-    pointer-events: none;
-    z-index: 1;
-  }
-  .nav-scroll-badge[hidden] { display: none; }
-  /* Compact finished rows (TIMER-7): past 12 timers a finished timer
-     collapses to one short full-width row instead of a dial. */
-  .compact-row { display: none; }
-  .screen.many .dial.finished.compact-mode .dial-button,
-  .screen.many .dial.finished.compact-mode .dial-text,
-  .screen.many .dial.finished.compact-mode .controls,
-  .screen.many .dial.finished.compact-mode .error { display: none; }
-  .screen.many .dial.finished.compact-mode {
-    grid-column: 1 / -1;
-    flex: none;
-    min-height: 0;
-    justify-content: center;
-  }
-  .screen.many .dial.finished.compact-mode .compact-row {
+  .finished-header .finished-chevron { font-size: 22px; color: #57534E; }
+  .finished-rows { display: flex; flex-direction: column; gap: 12px; }
+  .finished-rows[hidden] { display: none; }
+  .finished-row {
     display: flex;
     align-items: center;
     gap: 16px;
     width: 100%;
-    min-height: 64px;
+    min-height: 74px;
     padding: 8px 16px;
     box-sizing: border-box;
     border: 1px solid #EDE8E3;
@@ -929,18 +1134,18 @@ const CARD_CSS = `
     background: var(--card-background-color, #fff);
     cursor: pointer;
   }
-  .compact-row .compact-name {
+  .finished-text { flex: 1; min-width: 0; display: flex; flex-direction: column; text-align: left; }
+  .finished-name {
     color: #212121;
     font-size: 20px;
     font-weight: 700;
+    line-height: 1.25;
     overflow-wrap: break-word;
     word-break: break-word;
-    min-width: 0;
-    flex: 1;
-    text-align: left;
   }
-  .compact-row .compact-elapsed { color: #57534E; font-size: 18px; white-space: nowrap; }
-  .compact-row .compact-restart {
+  .finished-sub { color: #57534E; font-size: 18px; line-height: 1.3; overflow-wrap: break-word; }
+  .finished-restart {
+    flex: none;
     min-height: 56px;
     padding: 8px 20px;
     border-radius: 16px;
@@ -951,28 +1156,117 @@ const CARD_CSS = `
     font-weight: 700;
     cursor: pointer;
   }
-  @media (orientation: landscape) {
-    /* In many-mode the grid rows size to content and the screen
-       scrolls (TIMER-7): running dials keep a fixed 190px row, so the
-       %-sized dial button resolves against something definite. */
-    .screen.many { grid-auto-rows: auto; align-content: start; }
-    .screen.many .dial { min-height: 190px; }
-    .screen.many .dial-button { height: 140px; width: 140px; flex: none; }
-    .screen.many .time { font-size: 44px; }
-    .screen.many .name { font-size: 18px; }
-    .screen.many .state, .screen.many .hint { font-size: 16px; }
-    /* Small FITTED dials (not many-mode, but shrunk by --dial-max
-       below SMALL_DIAL_MAX_PX — 155px at 12 timers on the hub) take
-       the same text scale: the 72px time is ~200px wide and bursts
-       out of a 155px ring. The class is set by _applyDialFit. */
-    .screen.small-dials .time { font-size: 44px; }
-    .screen.small-dials .name { font-size: 18px; }
-    .screen.small-dials .state, .screen.small-dials .hint { font-size: 16px; }
+  /* -- Navigation strip (NAV-1 / D-N1, wave 1) ------------------------
+     The persistent strip, FIRST in the DOM (tab order). Noun labels,
+     Home first, the current view (Timers) with the accent background,
+     heavier weight, and aria-current. Hidden on DESKTOP only when NOT
+     in kiosk mode, where HA tabs already exist and work; always shown
+     on hub AND phone, and on desktop IN kiosk mode (HA tabs do not
+     exist there — the kiosk-desktop hole). Heights: 96px wall, 72px
+     tablet, 64px phone (+ safe area), 56px desktop. The strip is
+     solid dark #171717 (coordinator decision B — the design mandate
+     governs), white text, inactive labels white at 70%. The Timers
+     button carries the count badge (N-IMPL-5, ACTIVE + PAUSED, amber
+     last 60 s / red finished). The strip is fixed to the viewport
+     bottom, in both orientations. */
+  .nav-strip {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    z-index: 40;
+    box-sizing: border-box;
+    height: 96px;
+    padding: 0;
+    background: #171717;
   }
-  /* Cancel Undo toast (TIMER-13): overlaid on the card, never in the
-     grid flow, so it cannot shift the dials when it appears. */
-  .toast {
+  .nav-strip-buttons { display: flex; gap: 0; height: 100%; }
+  .nav-strip-button {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    min-height: 0;
+    padding: 0 4px;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: rgba(255, 255, 255, 0.7);
+    font-size: 24px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: inherit;
+    overflow-wrap: break-word;
+    transition: transform 100ms ease-out;
+  }
+  .nav-strip-button:hover { background: rgba(255, 255, 255, 0.08); }
+  .nav-strip-button:active { transform: scale(0.97); background: rgba(255, 255, 255, 0.14); }
+  .nav-strip-button.active { background: #C2410C; border-color: #C2410C; color: #fff; font-weight: 800; }
+  .nav-strip-button:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+  /* Timers count badge (D-N1 / N-IMPL-5): white circle, dark numerals,
+     24 px, top-right of the Timers button. Amber = a running timer in
+     its last 60 s; red = a finished timer. Never shows 0. Wave 1: it
+     always shows while timers exist — the scroll indicator moved out
+     of the strip into its own floating pill, so the two no longer
+     share a slot and no reconciliation is needed. */
+  .timer-badge {
     position: absolute;
+    top: 6px;
+    right: 6px;
+    min-width: 24px;
+    height: 24px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    border-radius: 999px;
+    background: #fff;
+    color: #171717;
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 24px;
+    text-align: center;
+    pointer-events: none;
+    z-index: 1;
+  }
+  .timer-badge.soon { background: #B45309; color: #fff; }
+  .timer-badge.finished { background: #B91C1C; color: #fff; }
+  .timer-badge[hidden] { display: none; }
+  /* Night mode (D-N10): the strip stays visible and usable — dimmed
+     palette, same targets, same labels, same active state. */
+  .screen.night .nav-strip { background: #0A0A0A; }
+  .screen.night .nav-strip-button { color: rgba(255, 255, 255, 0.55); }
+  .screen.night .nav-strip-button.active { background: #7C2D12; color: #fff; }
+  /* Visible scroll indicator (TIMER-7 / P8-5, Wave 1): a floating
+     "↓" pill in the content area — NOT on the strip button, so the
+     count badge and the indicator can both show. It sits above the
+     strip (bottom set from the strip height in JS) and scrolls the
+     view down when tapped. Shown only while a dial sits below the
+     viewport fold (P8-4 gate — see _updateScrollPill). */
+  .scroll-pill {
+    position: fixed;
+    right: 16px;
+    z-index: 50;
+    min-width: 48px;
+    height: 48px;
+    padding: 0 12px;
+    box-sizing: border-box;
+    border-radius: 999px;
+    border: none;
+    background: #1C1917;
+    color: #fff;
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 48px;
+    text-align: center;
+    cursor: pointer;
+  }
+  .scroll-pill[hidden] { display: none; }
+  /* Cancel Undo toast (TIMER-13 / F-T17): fixed to the viewport, so
+     it can never sit behind the fixed strip — the old absolute toast
+     hid behind it. The bottom is set from the measured strip height
+     + 8px in JS (see _showUndoToast); the 24px here is the no-strip
+     fallback (desktop, strip hidden). */
+  .toast {
+    position: fixed;
     left: 50%;
     bottom: 24px;
     transform: translateX(-50%);
@@ -984,7 +1278,7 @@ const CARD_CSS = `
     font-size: 20px;
     padding: 12px 16px 12px 24px;
     border-radius: 16px;
-    z-index: 10;
+    z-index: 50;
     max-width: calc(100% - 48px);
     box-sizing: border-box;
   }
@@ -1001,14 +1295,6 @@ const CARD_CSS = `
     cursor: pointer;
     white-space: nowrap;
   }
-  /* The Undo toast must clear the nav strip at the bottom of the
-     viewport (NAV-1): it is a shadow-root sibling of .screen, so the
-     category classes on .screen select it with ~. On desktop the
-     strip is hidden, so the toast stays at 24px. */
-  .screen.dev-hub ~ .toast { bottom: 108px; }
-  .screen.dev-tablet ~ .toast { bottom: 100px; }
-  .screen.dev-mobile ~ .toast { bottom: 84px; }
-  .screen.dev-desktop.kiosk ~ .toast { bottom: 108px; }
   /* -- Adaptive layout --------------------------------------------------
      The card detects its device (see detectDevice) and carries the
      category + orientation as classes on .screen: dev-hub, dev-desktop,
@@ -1017,86 +1303,72 @@ const CARD_CSS = `
      dials, big touch targets); the rules below only adjust for desktop,
      tablet and mobile. A card with no device classes (no browser
      environment) renders the hub layout. */
-  /* Desktop: a mouse is precise, so the buttons shrink and the grid
-     gets denser — up to four dials in a row (see gridColumns). The
-     reserve below each dial shrinks with the buttons. */
-  .screen.dev-desktop { --controls-reserve: 76px; --nav-strip-height: 0px; }
+  /* Desktop: a mouse is precise, so the buttons shrink. */
+  .screen.dev-desktop { --nav-strip-height: 0px; }
   .screen.dev-desktop .controls button { min-height: 56px; font-size: 18px; padding: 8px; }
-  .screen.dev-desktop .empty { font-size: clamp(18px, 3vmin, 26px); }
-  .screen.dev-desktop .name { font-size: 20px; }
+  .screen.dev-desktop .dial-name { font-size: 20px; }
   .screen.dev-desktop .state, .screen.dev-desktop .hint { font-size: 16px; }
-  .screen.dev-desktop .back-bar button { min-height: 56px; font-size: 18px; }
+  .screen.dev-desktop .back-bar button { height: 56px; font-size: 18px; }
+  .screen.dev-desktop .add-timer-button { min-height: 56px; font-size: 18px; }
   /* Desktop: the nav strip is hidden (HA tabs already exist and work
      there — NAV-1) ONLY when NOT in kiosk mode: in kiosk mode HA tabs
      do not exist, so a desktop-class viewport in kiosk mode would have
      ZERO navigation with the strip hidden (the kiosk-desktop hole).
      The strip therefore shows in kiosk mode ALWAYS (the ".kiosk"
-     override below); desktop+kiosk reserves the strip height (84px)
+     override below); desktop+kiosk reserves the strip height (64px)
      in --nav-strip-height so the last row scrolls clear of it, and
      the Undo toast clears it too. */
   .screen.dev-desktop .nav-strip { display: none; }
-  .screen.dev-desktop.kiosk { --nav-strip-height: 84px; }
+  .screen.dev-desktop.kiosk { --nav-strip-height: 64px; }
+  .screen.dev-desktop.kiosk .nav-strip { height: 56px; }
+  .screen.dev-desktop.kiosk .nav-strip-button { font-size: 20px; }
   .screen.dev-desktop.kiosk .nav-strip { display: block; }
   /* Mobile: touch targets stay large (a finger is not a mouse) and the
-     buttons stay reachable. In portrait the dials stack; each dial
-     keeps a minimum height so its time stays readable, and the screen
-     scrolls when five timers need more room than the phone has.
+     buttons stay reachable. In portrait the dials stack; the screen
+     scrolls when the timers need more room than the phone has.
      Preset chips (TIMER-4) show on mobile and tablet — the hub is
-     voice-only by deliberate choice. */
-  .screen.dev-mobile { --controls-reserve: 84px; --nav-strip-height: 60px; }
+     voice-only by deliberate choice. Wave 1: the dial sub-text is
+     BELOW the ring at full cell width now, so the old 14px chord
+     workaround (Phase 7 Fix 2) is deleted — state/hint are 18px on
+     mobile too, and there is no 300px portrait dial minimum. */
+  .screen.dev-mobile { --nav-strip-height: 72px; }
   .screen.dev-mobile .controls button { min-height: 64px; font-size: 18px; }
-  .screen.dev-mobile.orient-portrait { overflow-y: auto; }
-  /* Phase 7 follow-up (Fix 2): the finished dial's two sub-lines
-     ("Done — N min ago", "Tap to dismiss") were wider than the ring's
-     chord at their height on a 360px phone, so the ring crossed
-     characters. Two changes, both mobile-only: the dial is taller
-     (300px, so the ring is ~200px instead of 154px) and the sub-text
-     is smaller (14px instead of 16px). Measured live at 360x640:
-     the worst realistic line ("Done — 12 h 59 min ago", 148px at
-     14px) clears the chord by ~12px, and the duplicate-timer hint
-     line by ~29px. The cost is scroll for two timers at 360x640
-     (the view already scrolls at three); the hub and tablet rules
-     (TIMER-6: name >=20px, state/hint >=18px on the hub) are
-     untouched, and the name stays 18px here. */
-  .screen.dev-mobile.orient-portrait .dial { min-height: 300px; }
-  .screen.dev-mobile .name { font-size: 18px; }
-  .screen.dev-mobile .state, .screen.dev-mobile .hint { font-size: 14px; }
-  .screen.dev-mobile .preset-chips { display: flex; }
-  .screen.dev-mobile .back-bar button { min-height: 56px; font-size: 18px; }
+  .screen.dev-mobile .dial-name { font-size: 18px; }
+  .screen.dev-mobile .state, .screen.dev-mobile .hint { font-size: 18px; }
+  .screen.dev-mobile .back-bar button { height: 56px; max-width: 196px; font-size: 18px; }
   /* Phone nav strip (NAV-1): 48px buttons, 16px labels, 8px gap,
      nowrap — four labels would wrap mid-word at 360px, so the strip
      is 16px + nowrap (same rule as the recipe card). */
-  .screen.dev-mobile .nav-strip { padding: 12px 0 0; }
-  .screen.dev-mobile .nav-strip-buttons { gap: 8px; }
-  .screen.dev-mobile .nav-strip-button { min-height: 48px; padding: 8px 6px; font-size: 16px; white-space: nowrap; }
+  .screen.dev-mobile .nav-strip { height: calc(64px + env(safe-area-inset-bottom, 0px)); }
+  .screen.dev-mobile .nav-strip-buttons { height: 64px; }
+  .screen.dev-mobile .nav-strip-button { font-size: 16px; white-space: nowrap; }
   /* Tablet (DESIGN-9): 56-64px targets (spec §3.2); dial text at
      the TIMER-6 hub minima (name 20px, state/hint 18px) — readable
      at 1m. Preset chips show here too (TIMER-4: phone/tablet get
-     on-screen presets; hub is voice-only). The dial grid keeps the
-     non-desktop rule (at most three columns — see gridColumns). */
-  .screen.dev-tablet { --controls-reserve: 84px; --nav-strip-height: 76px; }
+     on-screen presets; hub is voice-only). */
+  .screen.dev-tablet { --nav-strip-height: 80px; }
   .screen.dev-tablet .controls button { min-height: 64px; font-size: 18px; }
-  .screen.dev-tablet .empty { font-size: clamp(18px, 3vmin, 26px); }
-  .screen.dev-tablet .name { font-size: 20px; }
+  .screen.dev-tablet .dial-name { font-size: 20px; }
   .screen.dev-tablet .state, .screen.dev-tablet .hint { font-size: 18px; }
-  .screen.dev-tablet .preset-chips { display: flex; }
-  .screen.dev-tablet .back-bar button { min-height: 56px; font-size: 18px; }
+  .screen.dev-tablet .back-bar button { height: 56px; font-size: 18px; }
+  .screen.dev-tablet .add-timer-button { min-height: 56px; font-size: 18px; }
   /* Tablet nav strip (NAV-1): 56px buttons, 20px labels — the 56-64px
      tablet band (spec §3.2). */
-  .screen.dev-tablet .nav-strip-button { min-height: 56px; padding: 10px 16px; font-size: 20px; }
-  .screen.dev-tablet .nav-strip-buttons { gap: 12px; }
+  .screen.dev-tablet .nav-strip { height: 72px; }
+  .screen.dev-tablet .nav-strip-button { font-size: 20px; }
   /* Reduced motion (DESIGN-6, WCAG 2.2): no non-essential animation.
      The soon-ring pulse stops — the amber ring + orange time (the
      "soon" STATE, DESIGN-8 guardrail) still show. The ring sweep is
      continuous progress, not decoration, and its stroke-dashoffset
      transition is paint-only (no layout), so it stays. Dial entry,
-     controls entry and the cancel-arm pulse become instant; the
-     press feedback is instant too. */
+     controls entry, the cancel-arm pulse and the new-dial pulse
+     become instant; the press feedback is instant too. */
   @media (prefers-reduced-motion: reduce) {
     .dial.entering { animation: none; }
     .controls button { animation: none; }
     .dial.soon .ring { animation: none; }
-    .controls button.cancel.armed { animation: none; }
+    .dial.pulse .dial-button { animation: none; }
+    .arm-bar { animation: none; }
     .dial-button:active { transform: none; }
     .nav-strip-button:active { transform: none; }
   }
@@ -1108,25 +1380,41 @@ class TimerScreenCard extends HTMLElement {
     this._hass = null;
     this._config = null;
     this._timers = [];
+    this._timerBadgeEl = null;
     this._lastKey = "";
     this._busy = new Set();
     this._error = {};
     this._arming = new Map();
     this._tick = null;
     this._dialEls = new Map();
+    this._rowEls = new Map(); // timer_id -> finished-section row element
     this._screenEl = null;
     this._emptyEl = null;
     this._emptyErrorEl = null;
-    this._backBarEl = null;
+    this._backBarEl = null; // built in _sync only when a recipe context exists
+    this._addTimerRowEl = null; // "+ Add timer" / fallback chips row (built in _ensureShell)
+    this._addTimerButtonEl = null;
+    this._addTimerHintEl = null;
+    this._fallbackLineEl = null;
+    this._chipsEl = null; // preset chips row (shared by + Add timer and fallback)
+    this._chipsOpen = false; // "+ Add timer" toggled open (timers running)
+    this._finishedSectionEl = null;
+    this._finishedHeaderEl = null;
+    this._finishedRowsEl = null;
+    this._finishedOpen = null; // null = not decided this mount (arrival rule applies)
     this._navStripEl = null; // NAV-1 strip (built in _ensureShell)
     this._lastNavigation = null; // Last path _navigate was asked for (test hook)
-    this._scrollBadgeEl = null; // "↓" badge on the Timers strip button (P8-5), built in _ensureShell
+    this._scrollPillEl = null; // "↓" floating pill (TIMER-7), built in _ensureShell
     this._toastEl = null;
     this._toastTimer = null;
     this._undoTimer = null;
     this._presetBusy = false;
+    this._presetBeforeIds = null; // timer ids before a chip tap (scroll+pulse the new dial)
     this._device = null; // { category, orientation } from detectDevice, or null outside a browser.
-    this._manyMode = false; // dialFit() says the height budget cannot fit (P8-3/P8-6), or count > MANY_TIMERS.
+    this._voiceDown = false; // voice provably unavailable (voiceUnavailable)
+    this._pinTimerId = null; // PIP pin, read once per mount
+    this._arrivalHome = false; // Home arrival flag, read once per mount
+    this._overridesRead = false; // pin/arrival already read this mount
     this._resizeBound = null;
     this._scrollBound = null;
     this._windowScrollBound = null;
@@ -1153,7 +1441,12 @@ class TimerScreenCard extends HTMLElement {
     const key = JSON.stringify(
       timers.map((t) => [t.entity_id, t.state, t.name, t.duration])
     );
-    if (key !== this._lastKey) {
+    // The wall fallback chips are state-driven (D4): a voice change
+    // re-syncs even when no timer changed.
+    const voiceDown = voiceUnavailable(hass ? hass.states : null);
+    const voiceChanged = voiceDown !== this._voiceDown;
+    this._voiceDown = voiceDown;
+    if (key !== this._lastKey || voiceChanged) {
       this._timers = timers;
       this._lastKey = key;
       const live = new Set(timers.map((t) => t.timer_id));
@@ -1176,6 +1469,9 @@ class TimerScreenCard extends HTMLElement {
   }
 
   connectedCallback() {
+    // N-IMPL-10d: a stored kiosk flag with a bare URL re-applies
+    // ?kiosk with one location.replace before anything renders.
+    reapplyKioskIfNeeded();
     this._stopTick();
     this._tick = setInterval(() => this._updateTimes(), 500);
     // The layout follows the viewport: a resize or an orientation
@@ -1201,7 +1497,7 @@ class TimerScreenCard extends HTMLElement {
       !this._windowScrollBound
     ) {
       this._windowScrollBound = () => {
-        this._updateScrollBadge();
+        this._updateScrollPill();
         this._scheduleScrollSave();
       };
       window.addEventListener("scroll", this._windowScrollBound, {
@@ -1241,27 +1537,26 @@ class TimerScreenCard extends HTMLElement {
   }
 
   _onResize() {
-    // Re-sync only when the device actually changed: a category change
-    // moves the grid columns, an orientation change moves the layout.
-    // A pure viewport resize (same category, same orientation) still
-    // re-fits the dials — --dial-max depends on the viewport height —
-    // and a many-mode flip from the new height re-syncs too, so the
-    // compact finished rows follow the fit.
+    // Re-sync only when the device actually changed: a category
+    // change moves the grid columns, an orientation change moves the
+    // layout. A pure viewport resize (same category, same
+    // orientation) needs no re-sync — the grid is viewport-class
+    // based and the ring sizes from the column width — but the time
+    // fit and the scroll pill re-evaluate against the new size.
     const before = this._device;
-    const manyBefore = this._manyMode;
     this._applyDevice();
     const after = this._device;
-    this._applyDialFit();
     if (
       before &&
       after &&
       (before.category !== after.category ||
-        before.orientation !== after.orientation ||
-        manyBefore !== this._manyMode)
+        before.orientation !== after.orientation)
     ) {
       this._sync();
+    } else {
+      this._fitTimes();
     }
-    this._updateScrollBadge();
+    this._updateScrollPill();
   }
 
   // Detect the device and carry it as classes on the screen element:
@@ -1283,7 +1578,8 @@ class TimerScreenCard extends HTMLElement {
       "dev-mobile",
       "orient-landscape",
       "orient-portrait",
-      "kiosk"
+      "kiosk",
+      "night"
     );
     this._screenEl.classList.add(
       `dev-${device.category}`,
@@ -1291,78 +1587,12 @@ class TimerScreenCard extends HTMLElement {
     );
     // Kiosk mode is a class of its own (not a device category): the
     // nav strip shows in kiosk mode ALWAYS, even on desktop (NAV-1).
-    if (env.kiosk) this._screenEl.classList.add("kiosk");
-  }
-
-  // Height-budget dial cap (P8-3/P8-6): set --dial-max on .screen from
-  // the live viewport, row count and per-category reserves, or clear
-  // it when there is nothing to fit (portrait — the cap only applies
-  // inside the landscape media query — no window, or no timers). The
-  // many-mode flag is computed here too, so _sync and _onResize share
-  // one decision: count > MANY_TIMERS, or the fit floor.
-  _applyDialFit() {
-    if (!this._screenEl) return;
-    const device = this._device;
-    if (
-      !device ||
-      device.orientation !== "landscape" ||
-      typeof window === "undefined" ||
-      !window.innerHeight
-    ) {
-      this._screenEl.style.removeProperty("--dial-max");
-      this._screenEl.classList.remove("small-dials");
-      this._manyMode = this._timers.length > MANY_TIMERS;
-      return;
-    }
-    // The controls reserve is the space BELOW the ring in one dial:
-    // 12px .controls margin-top + the button min-height (80px hub,
-    // 56px desktop, 64px tablet/mobile) + the 8px margin-top of the
-    // (usually empty) .error div. The empty error div still takes its
-    // margin, so a reserve without it is 8px short per row and the
-    // view scrolls that much on desktop/tablet/mobile (measured live
-    // at 1366x768: docH 776 vs vh 768; the hub's 100 already included
-    // it: 12 + 80 + 8). The CSS --controls-reserve vars below must
-    // match these numbers: they size the button AND centre the
-    // .dial-text overlay on the ring.
-    const reserves = {
-      hub: { controls: 100, nav: 84 },
-      desktop: { controls: 76, nav: 0 },
-      tablet: { controls: 84, nav: 76 },
-      mobile: { controls: 84, nav: 60 },
-    };
-    const reserve = reserves[device.category] || reserves.hub;
-    // Desktop in kiosk mode keeps the strip (NAV-1), so it reserves
-    // the strip height like the hub instead of 0.
-    const nav =
-      device.category === "desktop" &&
-      this._screenEl.classList.contains("kiosk")
-        ? 84
-        : reserve.nav;
-    const cols = gridColumns(this._timers.length, device.category);
-    // The "Back to recipe" bar (TIMER-10) is a full-width grid row:
-    // 64px button + one 16px gap, taken out of the height budget.
-    const extra = this._recipeContext ? 80 : 0;
-    const fit = dialFit(
-      this._timers.length,
-      cols,
-      window.innerHeight,
-      reserve.controls,
-      nav,
-      extra
-    );
-    if (fit.dialMax !== null) {
-      this._screenEl.style.setProperty("--dial-max", `${fit.dialMax}px`);
-    } else {
-      this._screenEl.style.removeProperty("--dial-max");
-    }
-    // Small fitted dials take the many-mode text scale (see
-    // SMALL_DIAL_MAX_PX): without it the 72px time bursts out of a
-    // 155px ring at 12 timers.
-    this._screenEl.classList.toggle(
-      "small-dials",
-      fit.dialMax !== null && fit.dialMax < SMALL_DIAL_MAX_PX
-    );
-    this._manyMode = fit.many || this._timers.length > MANY_TIMERS;
+    // N-IMPL-10: a URL with ?kiosk stores the session flag; a stored
+    // flag keeps the class on reload.
+    if (env.kiosk) storeKioskFlag();
+    if (env.kiosk || readKioskFlag()) this._screenEl.classList.add("kiosk");
+    // Night mode (D-N10): dimmed strip palette, same targets.
+    if (isNightNow(readNightSetting(), new Date())) this._screenEl.classList.add("night");
   }
 
   _stopTick() {
@@ -1393,79 +1623,110 @@ class TimerScreenCard extends HTMLElement {
     this._navStripEl = document.createElement("nav");
     this._navStripEl.className = "nav-strip";
     this._navStripEl.setAttribute("aria-label", "Views");
-    // P8-5: the scroll indicator lives ON the strip — a "↓" badge on
-    // the Timers button (the strip is already fixed chrome, so the
-    // indicator overlaps nothing). It is aria-hidden: the badge is a
-    // visual cue only; the dials themselves are in the DOM and
-    // reachable by scrolling.
     this._navStripEl.innerHTML =
       '<div class="nav-strip-buttons">' +
       NAV_STRIP_VIEWS.map((view) => {
         const active = view.key === "timers";
         const badge =
           view.key === "timers"
-            ? '<span class="nav-scroll-badge" aria-hidden="true" hidden>↓</span>'
+            ? '<span class="timer-badge" aria-label="0 timers" hidden></span>'
             : "";
         return `<button type="button" class="nav-strip-button${active ? " active" : ""}" data-action="nav" data-path="${view.path}"${active ? ' aria-current="page"' : ""}>${view.label}${badge}</button>`;
       }).join("") +
       "</div>";
     this._screenEl.appendChild(this._navStripEl);
-    this._scrollBadgeEl = this._navStripEl.querySelector(".nav-scroll-badge");
-    this._backBarEl = document.createElement("div");
-    this._backBarEl.className = "back-bar";
-    this._backBarEl.hidden = true;
-    this._backBarEl.innerHTML =
-      '<button data-action="back-recipe">← Back to recipe</button>';
-    this._screenEl.appendChild(this._backBarEl);
+    this._timerBadgeEl = this._navStripEl.querySelector(".timer-badge");
+    // The back bar is NOT built here: it exists only when a recipe
+    // context exists (TIMER-10 / T-IMPL-18) and is created/removed in
+    // _sync, so a plain load has zero DOM residue of it.
+    // "+ Add timer" row (T-IMPL-10) + wall fallback chips (T-IMPL-12):
+    // one full-width row at the top, above the dials. Its contents
+    // are shown/hidden in _sync: the button on non-hub while timers
+    // run, the chips directly when there are no timers, the fallback
+    // line + chips on the wall while voice is down.
+    this._addTimerRowEl = document.createElement("div");
+    this._addTimerRowEl.className = "add-timer-row";
+    this._addTimerRowEl.hidden = true;
+    this._addTimerRowEl.innerHTML =
+      '<button class="add-timer-button" data-action="add-timer" aria-expanded="false">+ Add timer</button>' +
+      '<div class="add-timer-hint" hidden></div>' +
+      '<div class="fallback-line" hidden>Voice isn\'t available right now — tap a time to start a timer</div>' +
+      '<div class="preset-chips"><span class="chip-label">Start a timer:</span>' +
+      PRESET_MINUTES.map(
+        (m) =>
+          `<button data-action="preset" data-minutes="${m}" aria-label="Start a ${m} minute timer">${m} min</button>`
+      ).join("") +
+      "</div>";
+    this._screenEl.appendChild(this._addTimerRowEl);
+    this._addTimerButtonEl = this._addTimerRowEl.querySelector(".add-timer-button");
+    this._addTimerHintEl = this._addTimerRowEl.querySelector(".add-timer-hint");
+    this._fallbackLineEl = this._addTimerRowEl.querySelector(".fallback-line");
+    this._chipsEl = this._addTimerRowEl.querySelector(".preset-chips");
     this._emptyEl = document.createElement("div");
     this._emptyEl.className = "empty";
     this._emptyEl.innerHTML =
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="13" r="8" /><path d="M12 9v4l2.5 2.5M9 2h6" /></svg><div>No timers running</div>' +
-      '<div class="voice-hint">Say &ldquo;Okay Nabu, set a 10 minute pasta timer&rdquo;</div>' +
-      '<div class="voice-hint">To add time, say &ldquo;Okay Nabu, add 5 more minutes to the pasta timer&rdquo;</div>' +
-      '<div class="preset-chips"><span class="chip-label">Start a timer:</span>' +
-      [5, 10, 15, 30]
-        .map(
-          (m) =>
-            `<button data-action="preset" data-minutes="${m}" aria-label="Start a ${m} minute timer">${m} min</button>`
-        )
-        .join("") +
-      "</div>" +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="13" r="8" /><path d="M12 9v4l2.5 2.5M9 2h6" /></svg><div class="empty-title">No timers running</div>' +
+      '<div class="voice-hint voice-hint-1"></div>' +
+      '<div class="voice-hint voice-hint-2"></div>' +
       '<div class="empty-error" hidden></div>';
     this._screenEl.appendChild(this._emptyEl);
     this._emptyErrorEl = this._emptyEl.querySelector(".empty-error");
+    // Finished section (TIMER-7, Wave 1): finished and ringing timers
+    // live here as compact rows, never as dials. Built once, hidden
+    // while there is nothing finished; the header toggles it.
+    this._finishedSectionEl = document.createElement("div");
+    this._finishedSectionEl.className = "finished-section";
+    this._finishedSectionEl.hidden = true;
+    this._finishedSectionEl.innerHTML =
+      '<button class="finished-header" data-action="finished-toggle" aria-expanded="false"><span class="finished-title">Finished (0)</span><span class="finished-chevron" aria-hidden="true">▾</span></button>' +
+      '<div class="finished-rows" hidden></div>';
+    this._screenEl.appendChild(this._finishedSectionEl);
+    this._finishedHeaderEl = this._finishedSectionEl.querySelector(".finished-header");
+    this._finishedRowsEl = this._finishedSectionEl.querySelector(".finished-rows");
     this._toastEl = document.createElement("div");
     this._toastEl.className = "toast";
     this._toastEl.hidden = true;
     this.shadowRoot.appendChild(this._toastEl);
+    // Scroll pill (TIMER-7 / P8-5, Wave 1): a floating "↓" pill in
+    // the content area, NOT on the strip — the count badge and the
+    // indicator no longer share a slot. It is a shadow-root sibling
+    // of .screen, fixed to the viewport; its bottom is set from the
+    // strip height in _updateScrollPill.
+    this._scrollPillEl = document.createElement("button");
+    this._scrollPillEl.className = "scroll-pill";
+    this._scrollPillEl.setAttribute("data-action", "scroll-more");
+    this._scrollPillEl.setAttribute("aria-label", "Scroll to more timers");
+    this._scrollPillEl.textContent = "↓";
+    this._scrollPillEl.hidden = true;
+    this.shadowRoot.appendChild(this._scrollPillEl);
     if (
       typeof window !== "undefined" &&
       window.location &&
       typeof window.location.search === "string"
     ) {
-      this._recipeContext = readRecipeContext(window.location.search);
+      this._recipeContext = readBackRecipeContext(window.location.search);
     }
     if (this._scrollBound === null && typeof this._screenEl.addEventListener === "function") {
       this._scrollBound = () => {
-        this._updateScrollBadge();
+        this._updateScrollPill();
         this._scheduleScrollSave();
       };
       this._screenEl.addEventListener("scroll", this._scrollBound);
     }
-    // The badge also re-evaluates when the screen itself changes size
+    // The pill also re-evaluates when the screen itself changes size
     // (TIMER-7): _sync runs while the Lovelace view is still sizing
-    // the card, so the first _updateScrollBadge can measure a screen
+    // the card, so the first _updateScrollPill can measure a screen
     // that is still at its minimum height — and nothing else fires
     // when the view later grows the card to its full height. The
     // observer fires on that growth (and on dial adds/removes), and
-    // it fires once on observe, so the badge is correct from the first
+    // it fires once on observe, so the pill is correct from the first
     // settled layout. (No ResizeObserver in node tests: skipped.)
     if (
       this._screenResizeObserver === null &&
       typeof ResizeObserver !== "undefined"
     ) {
       this._screenResizeObserver = new ResizeObserver(() =>
-        this._updateScrollBadge()
+        this._updateScrollPill()
       );
       this._screenResizeObserver.observe(this._screenEl);
     }
@@ -1481,11 +1742,24 @@ class TimerScreenCard extends HTMLElement {
   _sync() {
     if (!this._screenEl) return;
     this._applyDevice();
-    // Fit the dials to the height budget before building them: the
-    // many-mode flag decides the compact finished rows below.
-    this._applyDialFit();
     const now = Date.now();
+    // Pin + arrival overrides (D7.3 / T-IMPL-20/23): read once per
+    // mount, cleared after reading — a later mount never re-pins.
+    if (!this._overridesRead) {
+      this._overridesRead = true;
+      if (typeof sessionStorage !== "undefined") {
+        this._pinTimerId = readTimersPin(sessionStorage);
+        this._arrivalHome = readTimersArrival(sessionStorage);
+      }
+    }
     const live = new Set(this._timers.map((t) => t.timer_id));
+    const running = this._timers.filter(
+      (t) => t.state === "active" || t.state === "paused"
+    );
+    const finished = this._timers.filter(
+      (t) => t.state === "finished" || t.state === "ringing"
+    );
+    const ringing = this._timers.filter((t) => t.state === "ringing");
 
     // Which names are duplicated (TIMER-11): only those timers get a
     // "started ..." line, so a lone timer stays uncluttered.
@@ -1512,7 +1786,17 @@ class TimerScreenCard extends HTMLElement {
       before.set(id, el.getBoundingClientRect());
     }
 
-    for (const timer of this._timers) {
+    // The pinned timer (PIP tap) renders first, with a "Just started"
+    // marker — and appears once, not also in the sorted list.
+    const dialOrder = [...running];
+    if (this._pinTimerId) {
+      const pinnedIdx = dialOrder.findIndex((t) => t.timer_id === this._pinTimerId);
+      if (pinnedIdx > 0) {
+        const [pinned] = dialOrder.splice(pinnedIdx, 1);
+        dialOrder.unshift(pinned);
+      }
+    }
+    for (const timer of dialOrder) {
       let el = this._dialEls.get(timer.timer_id);
       if (!el) {
         el = this._buildDial(timer);
@@ -1523,24 +1807,215 @@ class TimerScreenCard extends HTMLElement {
       this._updateDial(el, timer, now);
       this._screenEl.appendChild(el);
     }
-
     for (const [id, el] of [...this._dialEls]) {
-      if (!live.has(id)) {
+      if (!live.has(id) || finished.some((t) => t.timer_id === id)) {
+        // A timer that finished moves out of the dial grid and into
+        // the finished section (its dial is removed here; the row is
+        // built below).
         this._dialEls.delete(id);
         el.remove();
       }
     }
+    // Grid order is DOM order: the finished section sits after the
+    // dials, so move it to the end (it was built before any dial
+    // existed, and appendChild would otherwise leave it above them).
+    this._screenEl.appendChild(this._finishedSectionEl);
+
+    // Finished section: one compact row per finished/ringing timer,
+    // in the same sort order (most-recently-finished first).
+    for (const timer of finished) {
+      let row = this._rowEls.get(timer.timer_id);
+      if (!row) {
+        row = this._buildFinishedRow(timer);
+        this._rowEls.set(timer.timer_id, row);
+      }
+      this._updateFinishedRow(row, timer, now);
+      this._finishedRowsEl.appendChild(row);
+    }
+    for (const [id, row] of [...this._rowEls]) {
+      if (!live.has(id) || running.some((t) => t.timer_id === id)) {
+        this._rowEls.delete(id);
+        row.remove();
+      }
+    }
+    const finishedCount = finished.length;
+    this._finishedSectionEl.hidden = finishedCount === 0;
+    if (finishedCount > 0) {
+      // Collapse rule (D1.2): forced expanded while any timer is
+      // ringing (a ringing timer must be visible); on arrival expanded
+      // only when nothing is running or paused; otherwise keep the
+      // user's toggle state. The ringing force is DERIVED, not stored:
+      // writing it into _finishedOpen made the section stick open after
+      // the ringing window ended (rig: Finished (1) still expanded 90 s
+      // after the ring, Pasta running — D1.2 says collapsed by default
+      // whenever anything runs). Once the window ends the section falls
+      // back to the default (collapsed while anything runs) unless the
+      // user opened it.
+      let open;
+      if (ringing.length > 0) open = true;
+      else if (this._finishedOpen === null) open = running.length === 0;
+      else open = this._finishedOpen === true;
+      this._finishedRowsEl.hidden = !open;
+      const title = this._finishedHeaderEl.querySelector(".finished-title");
+      if (title) title.textContent = `Finished (${finishedCount})`;
+      const chevron = this._finishedHeaderEl.querySelector(".finished-chevron");
+      if (chevron) chevron.textContent = open ? "▴" : "▾";
+      this._finishedHeaderEl.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    // Back bar (TIMER-10 / T-IMPL-18): built ONLY when a recipe
+    // context exists, removed when it does not — a plain load has
+    // zero DOM residue of it.
+    if (this._recipeContext && !this._backBarEl) {
+      const bar = document.createElement("div");
+      bar.className = "back-bar";
+      bar.innerHTML =
+        '<button data-action="back-recipe">← Back to recipe</button>';
+      this._backBarEl = bar;
+      // First after the strip: the bar is the first grid row.
+      this._screenEl.insertBefore(bar, this._screenEl.children[1] || null);
+    } else if (!this._recipeContext && this._backBarEl) {
+      this._backBarEl.remove();
+      this._backBarEl = null;
+    }
+
+    // Add-timer row + fallback chips (T-IMPL-10/12) + empty hints.
+    this._updateAddTimerRow();
+    this._updateEmptyHints();
 
     this._emptyEl.hidden = this._timers.length > 0;
-    this._backBarEl.hidden = !this._recipeContext;
-    this._screenEl.classList.toggle("many", this._manyMode);
-    this._screenEl.classList.remove("cols-1", "cols-2", "cols-3", "cols-4");
+    this._screenEl.classList.remove("cols-1", "cols-2", "cols-3");
+    const device = this._device;
     this._screenEl.classList.add(
-      `cols-${gridColumns(this._timers.length, this._device ? this._device.category : undefined)}`
+      `cols-${gridColumnsFor(
+        device ? device.category : undefined,
+        device ? device.orientation : "landscape",
+        typeof window !== "undefined" ? window.innerWidth : 0
+      )}`
     );
     this._flip(before);
-    this._updateScrollBadge();
-    this._restoreScroll();
+    this._fitTimes();
+    this._updateTimerBadge();
+    this._updateScrollPill();
+    // Arrival overrides suppress the saved-scroll restore: the pin
+    // scrolls into view (= top) and Home forces scrollY 0.
+    if (this._pinTimerId || this._arrivalHome) {
+      if (this._screenEl) this._screenEl.scrollTop = 0;
+      if (typeof window !== "undefined" && typeof window.scrollTo === "function") {
+        window.scrollTo(0, 0);
+      }
+      this._scrollRestored = true;
+    } else {
+      this._restoreScroll();
+    }
+    // A chip tap scrolls the new dial into view and pulses it once.
+    if (this._presetBeforeIds) {
+      const beforeIds = this._presetBeforeIds;
+      this._presetBeforeIds = null;
+      for (const timer of dialOrder) {
+        if (!beforeIds.has(timer.timer_id)) {
+          const el = this._dialEls.get(timer.timer_id);
+          if (el) {
+            el.classList.add("pulse");
+            setTimeout(() => el.classList.remove("pulse"), 700);
+            // Scroll AFTER the dial-in entry animation settles, not
+            // immediately: while .entering scales the dial (0.94) its
+            // measured top sits ~16px below the settled top, so an
+            // immediate scrollIntoView lands 16px too far and clips the
+            // name (rig: name top -16px at 844x390, drifting -10 to -16
+            // as the 240ms animation runs). ENTER_ANIMATION_MS + 60 is
+            // when the entering class is removed (same delay as the
+            // _buildDial cleanup), so the layout is settled by then.
+            // block: "start" (not "nearest"): a dial taller than the
+            // viewport is clipped by "nearest", which scrolls the minimum
+            // to expose the bottom. "start" aligns the dial top with the
+            // view top so the name is fully visible; instant so the
+            // position is settled, not mid-animation, when read.
+            setTimeout(() => {
+              if (typeof el.scrollIntoView === "function") {
+                el.scrollIntoView({ block: "start", behavior: "auto" });
+              }
+            }, ENTER_ANIMATION_MS + 60);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // "+ Add timer" row + fallback chips (T-IMPL-10/12).
+  //
+  // Non-hub: a persistent "+ Add timer" button at the top while timers
+  // run (it toggles the chip row below it, above the dials); when
+  // there are no timers the chips show directly — creation stays
+  // one tap from the empty state. The row also carries the add-time
+  // voice hint while timers run (TIMER-14).
+  // Wall fallback (D4, LOCKED): when voice is provably unavailable
+  // the wall shows the same 5/10/15/30 chips plus the plain line
+  // "Voice isn't available right now — tap a time to start a timer",
+  // whether or not timers run (§6 item 6 — the ruling's purpose is
+  // that the wall is never dead when voice is down). When voice
+  // recovers the chips disappear and the voice-only state returns.
+  // The wall voice hints hide while the fallback shows (they would
+  // contradict the "Voice isn't available" line).
+  _updateAddTimerRow() {
+    if (!this._addTimerRowEl) return;
+    const isHub = !this._device || this._device.category === "hub";
+    const hasTimers = this._timers.length > 0;
+    const fallback = isHub && this._voiceDown;
+    const showRow = fallback || !isHub;
+    this._addTimerRowEl.hidden = !showRow;
+    if (!showRow) return;
+    if (fallback) {
+      this._addTimerButtonEl.hidden = true;
+      this._addTimerHintEl.hidden = true;
+      this._fallbackLineEl.hidden = false;
+      this._chipsEl.classList.add("show");
+    } else {
+      this._fallbackLineEl.hidden = true;
+      if (hasTimers) {
+        this._addTimerButtonEl.hidden = false;
+        this._addTimerButtonEl.textContent = this._chipsOpen
+          ? "Close"
+          : "+ Add timer";
+        this._addTimerButtonEl.setAttribute(
+          "aria-expanded",
+          this._chipsOpen ? "true" : "false"
+        );
+        this._addTimerHintEl.hidden = false;
+        this._addTimerHintEl.textContent =
+          "To add time, tell the kitchen speaker: “Okay Nabu, add 5 more minutes to the pasta timer”";
+        if (this._chipsOpen) this._chipsEl.classList.add("show");
+        else this._chipsEl.classList.remove("show");
+      } else {
+        this._addTimerButtonEl.hidden = true;
+        this._addTimerHintEl.hidden = true;
+        this._chipsEl.classList.add("show");
+      }
+    }
+    this._emptyEl.classList.toggle("voice-down", fallback);
+  }
+
+  // Empty-state voice hints (D4 / contract-hints): the wall gets the
+  // verbatim TIMER-4 lines; phone/tablet/desktop name the kitchen
+  // speaker (the phone has no wake word listening).
+  _updateEmptyHints() {
+    if (!this._emptyEl) return;
+    const hint1 = this._emptyEl.querySelector(".voice-hint-1");
+    const hint2 = this._emptyEl.querySelector(".voice-hint-2");
+    if (!hint1 || !hint2) return;
+    const isHub = !this._device || this._device.category === "hub";
+    if (isHub) {
+      hint1.textContent =
+        "Say “Okay Nabu, set a 10 minute pasta timer”";
+      hint2.textContent =
+        "To add time, say “Okay Nabu, add 5 more minutes to the pasta timer”";
+    } else {
+      hint1.textContent =
+        "Or tell the kitchen speaker: “Okay Nabu, set a 10 minute pasta timer”";
+      hint2.textContent =
+        "To add time, tell the kitchen speaker: “Okay Nabu, add 5 more minutes to the pasta timer”";
+    }
   }
 
   // -- scroll persistence (DESIGN-7) --------------------------------------
@@ -1622,22 +2097,43 @@ class TimerScreenCard extends HTMLElement {
     this._scrollRestored = done;
   }
 
-  // Scroll indicator (TIMER-7 / P8-4 / P8-5): the "↓" badge on the
-  // Timers strip button shows only while at least one DIAL sits below
-  // the fold — not whenever the screen's rect extends below it. The
-  // old gate fired whenever the controls row overflowed (e.g. with 1
-  // timer), so the pill claimed "More timers below" when there were
-  // none. The fold is the lower of the viewport bottom and the
-  // screen's own bottom: in document-scroll mode the screen runs past
-  // the viewport, in internal-scroll mode the screen is shorter than
-  // the viewport and its own bottom is the fold. Either way the
+  // Scroll indicator (TIMER-7 / P8-4 / P8-5, Wave 1): the floating
+  // "↓" pill shows only while at least one DIAL sits below the fold
+  // — not whenever the screen's rect extends below it. The old gate
+  // fired whenever the controls row overflowed (e.g. with 1 timer),
+  // so the pill claimed "More timers below" when there were none.
+  // The fold is the lower of the viewport bottom and the screen's own
+  // bottom: in document-scroll mode the screen runs past the
+  // viewport, in internal-scroll mode the screen is shorter than the
+  // viewport and its own bottom is the fold. Either way the
   // getBoundingClientRect() of a dial already accounts for scrolling,
   // so one check covers both scroll modes — and once the user has
   // scrolled to the bottom the last dial is fully visible and the
-  // badge hides itself. (No window in node tests: the badge stays
+  // pill hides itself. (No window in node tests: the pill stays
   // hidden and the logic is skipped.)
-  _updateScrollBadge() {
-    if (!this._screenEl || !this._scrollBadgeEl) return;
+  // Timers count badge (D-N1 / N-IMPL-5): rendered from this._timers
+  // (ACTIVE + PAUSED count, amber last-60 s / red finished). Wave 1:
+  // it always shows while timers exist — the pill moved out of the
+  // strip, so the two no longer share a slot and no reconciliation
+  // is needed. _updateTimerBadge is called from _sync directly.
+  _updateTimerBadge() {
+    if (!this._timerBadgeEl) return;
+    const badge = timerBadgeState(this._timers);
+    if (!badge) {
+      this._timerBadgeEl.hidden = true;
+      this._timerBadgeEl.textContent = "";
+      this._timerBadgeEl.className = "timer-badge";
+      return;
+    }
+    this._timerBadgeEl.hidden = false;
+    this._timerBadgeEl.textContent = String(badge.count);
+    this._timerBadgeEl.className =
+      "timer-badge" + (badge.tone === "count" ? "" : ` ${badge.tone}`);
+    this._timerBadgeEl.setAttribute("aria-label", `${badge.count} timers`);
+  }
+
+  _updateScrollPill() {
+    if (!this._screenEl || !this._scrollPillEl) return;
     const el = this._screenEl;
     let show = false;
     if (typeof window !== "undefined" && window.innerHeight) {
@@ -1658,7 +2154,35 @@ class TimerScreenCard extends HTMLElement {
         }
       }
     }
-    this._scrollBadgeEl.hidden = !show;
+    this._scrollPillEl.hidden = !show;
+    if (show) {
+      // Above the strip: measured strip height + 16px (the strip is
+      // fixed chrome; the pill must clear it).
+      let stripHeight = 0;
+      if (this._navStripEl && typeof this._navStripEl.getBoundingClientRect === "function") {
+        const r = this._navStripEl.getBoundingClientRect();
+        if (r && typeof r.height === "number") stripHeight = r.height;
+      }
+      this._scrollPillEl.style.bottom = `${stripHeight + 16}px`;
+    }
+  }
+
+  _onScrollPillTap() {
+    // Scroll down by most of a viewport, in whichever element scrolls.
+    const amount =
+      typeof window !== "undefined" && window.innerHeight
+        ? Math.floor(window.innerHeight * 0.8)
+        : 400;
+    if (
+      this._screenEl &&
+      this._screenEl.scrollHeight > this._screenEl.clientHeight
+    ) {
+      this._screenEl.scrollTop += amount;
+      return;
+    }
+    if (typeof window !== "undefined" && typeof window.scrollBy === "function") {
+      window.scrollBy(0, amount);
+    }
   }
 
   _flip(before) {
@@ -1681,27 +2205,31 @@ class TimerScreenCard extends HTMLElement {
   }
 
   _buildDial(timer) {
+    // Wave 1 (D1): a vertical stack — name block above the ring, the
+    // countdown centred INSIDE the ring button, state/hint lines
+    // below the ring, then the action button. Finished timers never
+    // get a dial (they live in the finished section as rows), so
+    // there is no compact-row markup here any more. The whole .dial
+    // cell carries data-action="dial" so the name and sub-lines are
+    // tappable too (the old overlay missed name taps).
     const el = document.createElement("div");
     el.className = "dial";
     el.dataset.timerId = timer.timer_id;
+    el.setAttribute("data-action", "dial");
+    el.setAttribute("data-timer", timer.timer_id);
     el.innerHTML = `
+      <div class="dial-name" data-name="${escapeHtml(timer.timer_id)}"></div>
       <button class="dial-button" data-action="dial" data-timer="${escapeHtml(timer.timer_id)}" aria-label="${escapeHtml(timer.name)} timer">
         <svg viewBox="0 0 200 200" role="img" aria-label="${escapeHtml(timer.name)}">
           <circle class="track" cx="100" cy="100" r="88" />
           <circle class="ring" data-ring="${escapeHtml(timer.timer_id)}" cx="100" cy="100" r="88" transform="rotate(-90 100 100)" />
         </svg>
-      </button>
-      <div class="dial-text" aria-hidden="true">
-        <div class="name" data-name="${escapeHtml(timer.timer_id)}"></div>
         <div class="time" data-remaining="${escapeHtml(timer.timer_id)}"></div>
+      </button>
+      <div class="dial-sub">
         <div class="state" data-state="${escapeHtml(timer.timer_id)}"></div>
         <div class="started" data-started="${escapeHtml(timer.timer_id)}"></div>
         <div class="hint" data-hint="${escapeHtml(timer.timer_id)}"></div>
-      </div>
-      <div class="compact-row" data-compact="${escapeHtml(timer.timer_id)}" data-action="dial" data-timer="${escapeHtml(timer.timer_id)}" role="button" aria-label="${escapeHtml(timer.name)} timer, finished, tap to dismiss">
-        <span class="compact-name" data-compact-name="${escapeHtml(timer.timer_id)}"></span>
-        <span class="compact-elapsed" data-compact-elapsed="${escapeHtml(timer.timer_id)}"></span>
-        <button class="compact-restart" data-action="restart" data-timer="${escapeHtml(timer.timer_id)}" aria-label="Restart ${escapeHtml(timer.name)} timer">Restart</button>
       </div>
       <div class="controls" data-controls="${escapeHtml(timer.timer_id)}"></div>
       <div class="error" data-error="${escapeHtml(timer.timer_id)}"></div>`;
@@ -1713,59 +2241,112 @@ class TimerScreenCard extends HTMLElement {
       state: el.querySelector(`[data-state="${timer.timer_id}"]`),
       started: el.querySelector(`[data-started="${timer.timer_id}"]`),
       hint: el.querySelector(`[data-hint="${timer.timer_id}"]`),
-      compactRow: el.querySelector(`[data-compact="${timer.timer_id}"]`),
-      compactName: el.querySelector(`[data-compact-name="${timer.timer_id}"]`),
-      compactElapsed: el.querySelector(
-        `[data-compact-elapsed="${timer.timer_id}"]`
-      ),
       controls: el.querySelector(`[data-controls="${timer.timer_id}"]`),
       error: el.querySelector(`[data-error="${timer.timer_id}"]`),
     };
     el._controlsKind = "";
+    el._armState = false;
     return el;
+  }
+
+  _buildFinishedRow(timer) {
+    // A finished or ringing timer as a compact row (TIMER-7, Wave 1):
+    // name + sub-line on the left, Restart on the right. The row
+    // itself dismisses on tap (same as a dial tap on a finished
+    // timer); Restart is its own button inside it.
+    const el = document.createElement("div");
+    el.className = "finished-row";
+    el.dataset.timerId = timer.timer_id;
+    el.setAttribute("data-action", "dial");
+    el.setAttribute("data-timer", timer.timer_id);
+    el.setAttribute("role", "button");
+    el.innerHTML = `
+      <div class="finished-text">
+        <span class="finished-name" data-finished-name="${escapeHtml(timer.timer_id)}"></span>
+        <span class="finished-sub" data-finished-sub="${escapeHtml(timer.timer_id)}"></span>
+      </div>
+      <button class="finished-restart" data-action="restart" data-timer="${escapeHtml(timer.timer_id)}" aria-label="Restart ${escapeHtml(timer.name)} timer">Restart</button>`;
+    el._refs = {
+      name: el.querySelector(`[data-finished-name="${timer.timer_id}"]`),
+      sub: el.querySelector(`[data-finished-sub="${timer.timer_id}"]`),
+    };
+    return el;
+  }
+
+  _updateFinishedRow(row, timer, now) {
+    const refs = row._refs;
+    const isRinging = timer.state === "ringing";
+    refs.name.textContent = timer.name;
+    const finishedMs = timer.finishedAt ? Date.parse(timer.finishedAt) : null;
+    refs.sub.textContent = isRinging
+      ? "Ringing · Tap to dismiss"
+      : `${formatElapsedSince(finishedMs, now)} · Tap to dismiss`;
+    row.setAttribute(
+      "aria-label",
+      isRinging
+        ? `${timer.name} timer, ringing, tap to dismiss`
+        : `${timer.name} timer, finished, tap to dismiss`
+    );
+    row.classList.toggle("ringing", isRinging);
   }
 
   _updateDial(el, timer, now) {
     const refs = el._refs;
-    const isFinished = timer.state === "finished";
     const isPaused = timer.state === "paused";
     const left = remainingSeconds(timer, now);
+    // The "soon" flip follows the SENSOR's remaining attribute
+    // (T-IMPL-13 / OQ-5), not the displayed countdown.
+    const sensorLeft = sensorRemaining(timer);
+    const isSoon =
+      !isPaused &&
+      timer.state === "active" &&
+      sensorLeft > 0 &&
+      sensorLeft <= FINISHING_SOON_SECONDS;
 
-    el.classList.toggle("finished", isFinished);
     el.classList.toggle("paused", isPaused);
-    el.classList.toggle(
-      "soon",
-      !isFinished && timer.state === "active" && left > 0 && left <= FINISHING_SOON_SECONDS
-    );
-    // Past 12 timers — or whenever the height budget cannot fit the
-    // dials (P8-3/P8-6) — a finished timer collapses to a compact row
-    // (TIMER-7).
-    el.classList.toggle("compact-mode", isFinished && this._manyMode);
+    el.classList.toggle("soon", isSoon);
+    // A dial is only ever running or paused now (finished timers are
+    // rows); the "finished" class stays off so the ring keeps the
+    // running colour.
+    el.classList.toggle("finished", false);
 
     // The dial itself is the primary tap target — the biggest, most
-    // forgiving thing on the screen. It pauses a running timer, resumes
-    // a paused one, and dismisses a finished one, so the most common
-    // action for each state is one big tap, never a small button.
+    // forgiving thing on the screen. It pauses a running timer and
+    // resumes a paused one, so the most common action for each state
+    // is one big tap, never a small button.
     refs.button.setAttribute(
       "aria-label",
-      isFinished
-        ? `${timer.name} timer, finished, tap to dismiss`
-        : `${timer.name} timer, tap to ${isPaused ? "resume" : "pause"}`
+      `${timer.name} timer, tap to ${isPaused ? "resume" : "pause"}`
+    );
+    el.setAttribute(
+      "aria-label",
+      `${timer.name} timer, tap to ${isPaused ? "resume" : "pause"}`
     );
 
-    // TIMER-1: the full name, wrapping to two lines at >=20px on the
-    // hub. No truncation, no shrinking.
+    // TIMER-1: the full name, wrapping to at most two lines at >=20px
+    // on the hub (CSS line-clamp).
     refs.name.textContent = timer.name;
-    refs.time.textContent = isFinished ? "Done" : formatRemaining(left);
-    if (isFinished) {
-      const finishedMs = timer.finishedAt ? Date.parse(timer.finishedAt) : null;
-      refs.state.textContent = formatElapsedSince(finishedMs, now);
+    refs.time.textContent = formatRemaining(left);
+    // Soon word (D1): the state line reads exactly
+    // "Soon · Tap to pause" and the hint is empty; running shows no
+    // state line and "Tap to pause"; paused shows "Paused" +
+    // "Tap to resume".
+    if (isSoon) {
+      refs.state.textContent = "Soon · Tap to pause";
+      refs.hint.textContent = "";
+    } else if (isPaused) {
+      refs.state.textContent = "Paused";
+      refs.hint.textContent = "Tap to resume";
     } else {
-      refs.state.textContent = isPaused ? "Paused" : "";
+      refs.state.textContent = "";
+      refs.hint.textContent = "Tap to pause";
     }
     // TIMER-11: duplicates get their start time, so two timers with
-    // the same name are distinguishable.
-    if (this._duplicateNames.has(timer.name)) {
+    // the same name are distinguishable. The PIP-pinned timer shows
+    // "Just started" instead (D7.3).
+    if (timer.timer_id === this._pinTimerId) {
+      refs.started.textContent = "Just started";
+    } else if (this._duplicateNames.has(timer.name)) {
       const started = startedAtMs(
         timer,
         now,
@@ -1777,29 +2358,17 @@ class TimerScreenCard extends HTMLElement {
     } else {
       refs.started.textContent = "";
     }
-    refs.hint.textContent = isFinished
-      ? "Tap to dismiss"
-      : isPaused
-        ? "Tap to resume"
-        : "Tap to pause";
-
-    if (isFinished) {
-      const finishedMs = timer.finishedAt ? Date.parse(timer.finishedAt) : null;
-      refs.compactName.textContent = timer.name;
-      refs.compactElapsed.textContent = formatElapsedSince(finishedMs, now);
-    }
 
     refs.ring.style.strokeDashoffset = String(
-      isFinished ? 0 : RING_CIRCUMFERENCE * (1 - progressFraction(timer, now))
+      RING_CIRCUMFERENCE * (1 - progressFraction(timer, now))
     );
     refs.ring.classList.toggle("paused", isPaused);
 
-    const kind = isFinished ? "finished" : "running";
+    const kind = "running";
     if (el._controlsKind !== kind) {
       el._controlsKind = kind;
-      refs.controls.innerHTML = isFinished
-        ? `<button class="restart" data-action="restart" data-timer="${escapeHtml(timer.timer_id)}" aria-label="Restart ${escapeHtml(timer.name)} timer">Restart</button>`
-        : `<button class="cancel" data-action="cancel" data-timer="${escapeHtml(timer.timer_id)}" aria-label="Cancel ${escapeHtml(timer.name)} timer">Cancel</button>`;
+      refs.controls.innerHTML =
+        `<button class="cancel" data-action="cancel" data-timer="${escapeHtml(timer.timer_id)}" aria-label="Cancel ${escapeHtml(timer.name)} timer">Cancel</button>`;
     }
     this._refreshCancelButton(el, timer);
     if (this._error[timer.timer_id]) {
@@ -1815,8 +2384,19 @@ class TimerScreenCard extends HTMLElement {
     const button = el.querySelector(".cancel");
     if (!button) return;
     const armed = this._arming.has(timer.timer_id);
+    // Only rewrite the button when the armed state changed: rewriting
+    // restarts the arm-bar drain animation, and _updateDial runs on
+    // every sync — a rewrite here would restart the drain whenever
+    // any timer changed.
+    if (el._armState === armed) {
+      button.classList.toggle("armed", armed);
+      return;
+    }
+    el._armState = armed;
     button.classList.toggle("armed", armed);
-    button.textContent = armed ? "Tap again to cancel" : "Cancel";
+    button.innerHTML = armed
+      ? 'Tap again to cancel<span class="arm-bar"></span>'
+      : "Cancel";
   }
 
   _setBusy(el, busy) {
@@ -1832,24 +2412,72 @@ class TimerScreenCard extends HTMLElement {
     const now = Date.now();
     for (const timer of this._timers) {
       const el = this._dialEls.get(timer.timer_id);
-      if (!el) continue;
-      if (timer.state === "finished") {
-        // TIMER-3: the elapsed-since-finish counts up on the tick.
-        const finishedMs = timer.finishedAt ? Date.parse(timer.finishedAt) : null;
-        const text = formatElapsedSince(finishedMs, now);
-        el._refs.state.textContent = text;
-        el._refs.compactElapsed.textContent = text;
+      if (el) {
+        const left = remainingSeconds(timer, now);
+        el._refs.time.textContent = formatRemaining(left);
+        el._refs.ring.style.strokeDashoffset = String(
+          RING_CIRCUMFERENCE * (1 - progressFraction(timer, now))
+        );
+        // The "soon" flip follows the sensor's remaining attribute
+        // (T-IMPL-13 / OQ-5), not the displayed countdown.
+        const sensorLeft = sensorRemaining(timer);
+        const isSoon =
+          timer.state === "active" &&
+          sensorLeft > 0 &&
+          sensorLeft <= FINISHING_SOON_SECONDS;
+        el.classList.toggle("soon", isSoon);
+        if (isSoon) {
+          el._refs.state.textContent = "Soon · Tap to pause";
+          el._refs.hint.textContent = "";
+        } else if (timer.state === "paused") {
+          el._refs.state.textContent = "Paused";
+          el._refs.hint.textContent = "Tap to resume";
+        } else {
+          el._refs.state.textContent = "";
+          el._refs.hint.textContent = "Tap to pause";
+        }
         continue;
       }
-      const left = remainingSeconds(timer, now);
-      el._refs.time.textContent = formatRemaining(left);
-      el._refs.ring.style.strokeDashoffset = String(
-        RING_CIRCUMFERENCE * (1 - progressFraction(timer, now))
-      );
-      el.classList.toggle(
-        "soon",
-        timer.state === "active" && left > 0 && left <= FINISHING_SOON_SECONDS
-      );
+      const row = this._rowEls.get(timer.timer_id);
+      if (row) {
+        // TIMER-3: the elapsed-since-finish counts up on the tick.
+        this._updateFinishedRow(row, timer, now);
+      }
+    }
+    // One batched fit pass per tick: reads happen after all the
+    // writes above, so the tick costs one forced layout, not one per
+    // dial (T-IMPL-7).
+    this._fitTimes();
+  }
+
+  // Time fit (T-IMPL-7 / D1.4): the rendered countdown must fit
+  // inside its ring (time width <= ring width - 16px). Measure at the
+  // CSS size first — a shorter time or a wider ring may fit again at
+  // full size — then step the font down the TIME_FIT_STEPS ladder
+  // (72→64→56→48→44→40) until it fits, never below the 40px floor
+  // (TIMER-6). No layout engine (node tests: no scrollWidth) means
+  // no measurement — skip silently.
+  _fitTimes() {
+    for (const el of this._dialEls.values()) {
+      const refs = el._refs;
+      if (!refs.time || !refs.button) continue;
+      if (typeof refs.time.scrollWidth !== "number") continue;
+      if (typeof refs.button.getBoundingClientRect !== "function") continue;
+      const ringW = refs.button.getBoundingClientRect().width || 0;
+      if (ringW <= 0) continue;
+      const maxW = ringW - 16;
+      if (refs.time.style.fontSize) refs.time.style.fontSize = "";
+      if (refs.time.scrollWidth <= maxW) continue;
+      const current =
+        typeof getComputedStyle === "function"
+          ? parseFloat(getComputedStyle(refs.time).fontSize) || 72
+          : 72;
+      for (const size of TIME_FIT_STEPS) {
+        if (size >= current) continue;
+        refs.time.style.fontSize = `${size}px`;
+        if (refs.time.scrollWidth <= maxW) break;
+      }
+      if (refs.time.scrollWidth > maxW) refs.time.style.fontSize = "40px";
     }
   }
 
@@ -1898,28 +2526,67 @@ class TimerScreenCard extends HTMLElement {
     this._refreshCancelButton(this._dialEls.get(timerId), { timer_id: timerId });
   }
 
-  _showUndoToast(timer) {
-    // TIMER-13: cancelling offers a 5 s Undo; Undo re-creates the
-    // timer with the same name and the REMAINING time at cancel
-    // (F-T1) — a 10-min timer cancelled with 3 min left comes back
-    // as a 3-min timer, not a fresh 10-min one. Min 1 s: a timer
-    // cancelled at 0 s remaining still comes back.
+  _showUndoToast(timer, kind) {
+    // TIMER-13 / D6: cancelling or dismissing offers a 5 s Undo.
+    // Undo re-creates the timer with the same name and the REMAINING
+    // time at cancel (F-T1) — a 10-min timer cancelled with 3 min
+    // left comes back as a 3-min timer, not a fresh 10-min one. Min
+    // 1 s: a timer cancelled at 0 s remaining still comes back. A
+    // paused timer comes back paused (D6) — the bridge restores it
+    // atomically (restore_timer), so the sensor never observes it as
+    // active. A dismissed finished timer comes back finished, with
+    // its original finished_at and WITHOUT re-ringing the satellite
+    // (restore_finished_timer).
+    // F-T17: the toast is position: fixed and its bottom is set from
+    // the measured strip height + 8px, so it can never sit behind
+    // the fixed strip.
     if (!this._toastEl) return;
     if (this._toastTimer) {
       clearTimeout(this._toastTimer);
       this._toastTimer = null;
     }
-    const remaining = Math.max(1, remainingSeconds(timer, Date.now()));
-    this._undoTimer = { name: timer.name, duration: remaining };
+    if (kind === "dismissed") {
+      this._undoTimer = {
+        kind: "dismissed",
+        name: timer.name,
+        totalSeconds: timer.duration,
+        finishedAt: timer.finishedAt,
+        startedViaService: timer.startedViaService,
+        startedAt: timer.startedAt,
+      };
+    } else {
+      const remaining = Math.max(1, remainingSeconds(timer, Date.now()));
+      this._undoTimer = {
+        kind: "cancelled",
+        name: timer.name,
+        duration: remaining,
+        paused: timer.state === "paused",
+      };
+    }
     this._toastEl.innerHTML = "";
     const message = document.createElement("span");
-    message.textContent = `${timer.name} timer cancelled`;
+    message.textContent =
+      kind === "dismissed"
+        ? `${timer.name} timer dismissed`
+        : `${timer.name} timer cancelled`;
     const undo = document.createElement("button");
     undo.setAttribute("data-action", "undo-cancel");
     undo.textContent = "Undo";
     this._toastEl.appendChild(message);
     this._toastEl.appendChild(undo);
     this._toastEl.hidden = false;
+    let stripHeight = 0;
+    if (
+      this._navStripEl &&
+      typeof this._navStripEl.getBoundingClientRect === "function"
+    ) {
+      const r = this._navStripEl.getBoundingClientRect();
+      if (r && typeof r.height === "number") stripHeight = r.height;
+    }
+    // No strip (desktop, strip hidden): the CSS 24px bottom stands.
+    if (stripHeight > 0) {
+      this._toastEl.style.bottom = `${stripHeight + 8}px`;
+    }
     this._toastTimer = setTimeout(() => this._hideToast(), UNDO_TOAST_MS);
   }
 
@@ -1937,10 +2604,25 @@ class TimerScreenCard extends HTMLElement {
     this._hideToast();
     if (!undo || !this._hass) return;
     try {
-      await this._hass.callService("satellite_timers", "start_timer", {
-        name: undo.name,
-        duration: undo.duration,
-      });
+      if (undo.kind === "dismissed") {
+        await this._hass.callService(
+          "satellite_timers",
+          "restore_finished_timer",
+          {
+            name: undo.name,
+            total_seconds: undo.totalSeconds,
+            finished_at: undo.finishedAt,
+            started_via_service: Boolean(undo.startedViaService),
+            ...(undo.startedAt ? { started_at: undo.startedAt } : {}),
+          }
+        );
+      } else {
+        await this._hass.callService("satellite_timers", "restore_timer", {
+          name: undo.name,
+          duration: undo.duration,
+          paused: Boolean(undo.paused),
+        });
+      }
     } catch (err) {
       if (this._emptyErrorEl) {
         this._emptyErrorEl.textContent =
@@ -1951,19 +2633,23 @@ class TimerScreenCard extends HTMLElement {
   }
 
   async _onPresetTap(minutes) {
-    // TIMER-4: phone/tablet preset chips start a timer by duration.
-    // The name is the duration ("10 minute timer"); the recipe name
-    // comes from recipe chips instead (RECIPE-5 / BRIDGE-1).
+    // TIMER-4: preset chips start a timer by duration. The name is
+    // the duration ("10 minute timer"); the recipe name comes from
+    // recipe chips instead (RECIPE-5 / BRIDGE-1). After the start,
+    // _sync scrolls the new dial into view and pulses it once — the
+    // ids seen before the tap tell it which dial is new.
     if (this._presetBusy || !this._hass) return;
     this._presetBusy = true;
     this._setPresetBusy(true);
     try {
+      this._presetBeforeIds = new Set(this._timers.map((t) => t.timer_id));
       await this._hass.callService("satellite_timers", "start_timer", {
         name: `${minutes} minute timer`,
         duration: minutes * 60,
       });
       if (this._emptyErrorEl) this._emptyErrorEl.hidden = true;
     } catch (err) {
+      this._presetBeforeIds = null;
       if (this._emptyErrorEl) {
         const message = String((err && err.message) || err || "");
         this._emptyErrorEl.textContent = /service.*not found/i.test(message)
@@ -1978,8 +2664,8 @@ class TimerScreenCard extends HTMLElement {
   }
 
   _setPresetBusy(busy) {
-    if (!this._emptyEl) return;
-    for (const button of this._emptyEl.querySelectorAll(
+    if (!this._chipsEl) return;
+    for (const button of this._chipsEl.querySelectorAll(
       '[data-action="preset"]'
     )) {
       button.disabled = busy;
@@ -1991,12 +2677,19 @@ class TimerScreenCard extends HTMLElement {
   // history.pushState + a location-changed dispatch — no reload. The
   // same mechanism the standalone nav strip and the recipe card use.
   // _lastNavigation is the test hook (also used by the standalone strip).
+  // N-IMPL-6: tapping the already-active strip button (Timers, on
+  // this card) is a no-op — no pushState, no location-changed.
+  // N-IMPL-10: every navigation carries ?kiosk when this tab session
+  // is kiosk (stored flag + URL).
   _navigate(path) {
-    this._lastNavigation = path;
+    const target = String(path || "/family-hub/timers");
+    if (target.split("?")[0].replace(/\/+$/, "") === "/family-hub/timers") return;
+    const url = withKioskQuery(target);
+    this._lastNavigation = url;
     if (typeof window === "undefined") return;
     try {
       if (window.history && typeof window.history.pushState === "function") {
-        window.history.pushState(null, "", path);
+        window.history.pushState(null, "", url);
       }
     } catch (_err) {
       // A pushState failure (a test stub, a file URL) never breaks
@@ -2008,14 +2701,14 @@ class TimerScreenCard extends HTMLElement {
   }
 
   _onBackToRecipe() {
-    // TIMER-10: return to the recipe at the same step. The recipe id
-    // and step came in as ?from_recipe=<id>&step=<n>; the recipe card
-    // (Phase 4) honours ?recipe=<id>&step=<n> as a deep link.
-    if (
-      typeof window === "undefined" ||
-      !window.location ||
-      !this._recipeContext
-    ) {
+    // TIMER-10 + N-IMPL-21: return to the recipe at the same step, by
+    // SPA navigation (history.pushState + location-changed — no
+    // full-page reload, so the recipe card's session restores in
+    // place). The recipe id and step come from the recipe card's
+    // session state first (family-hub:recipe:state openId/step), the
+    // URL ?from_recipe=<id>&step=<n> as the fallback; the recipe card
+    // honours ?recipe=<id>&step=<n> as a deep link.
+    if (typeof window === "undefined" || !window.location || !this._recipeContext) {
       return;
     }
     const path = window.location.pathname || "";
@@ -2026,7 +2719,7 @@ class TimerScreenCard extends HTMLElement {
       (step !== null && step !== undefined
         ? `&step=${encodeURIComponent(step)}`
         : "");
-    window.location.assign(url);
+    this._navigate(url);
   }
 
   _onClick(event) {
@@ -2052,6 +2745,29 @@ class TimerScreenCard extends HTMLElement {
       this._navigate(target.dataset.path || "/family-hub");
       return;
     }
+    if (action === "add-timer") {
+      // T-IMPL-10: toggle the chip row below the button.
+      this._chipsOpen = !this._chipsOpen;
+      this._updateAddTimerRow();
+      return;
+    }
+    if (action === "finished-toggle") {
+      // Flip from the RENDERED state, not from _finishedOpen: while a
+      // timer rings the section is forced open but _finishedOpen is
+      // still null (the force is derived, not stored), so flipping
+      // _finishedOpen alone would no-op on the first tap. During
+      // ringing the force still wins on the next sync (D1.2: the
+      // collapse never hides a ringing timer), so the tap takes effect
+      // once the window ends.
+      const currentlyOpen = this._finishedRowsEl ? !this._finishedRowsEl.hidden : false;
+      this._finishedOpen = !currentlyOpen;
+      this._sync();
+      return;
+    }
+    if (action === "scroll-more") {
+      this._onScrollPillTap();
+      return;
+    }
 
     const timerId = target.dataset.timer;
     const timer = this._timers.find((t) => t.timer_id === timerId);
@@ -2062,8 +2778,14 @@ class TimerScreenCard extends HTMLElement {
       this._clearArm(timerId);
       // One tap on the dial does the primary thing for the timer's
       // state: pause a running timer, resume a paused one, dismiss a
-      // finished one. Adding time stays voice-only.
-      if (timer.state === "finished") this._control(timerId, "dismiss_timer");
+      // finished or ringing one. Adding time stays voice-only.
+      // Dismissing offers the same 5 s Undo as cancelling (the old
+      // dismiss path had no toast — F-T13 asymmetry).
+      if (timer.state === "finished" || timer.state === "ringing") {
+        this._control(timerId, "dismiss_timer").then((ok) => {
+          if (ok) this._showUndoToast(timer, "dismissed");
+        });
+      }
       else if (timer.state === "paused") this._control(timerId, "resume_timer");
       else if (timer.state === "active") this._control(timerId, "pause_timer");
       return;
@@ -2111,13 +2833,27 @@ if (typeof module !== "undefined" && module.exports) {
     formatElapsedSince,
     formatStartTime,
     remainingSeconds,
+    sensorRemaining,
     progressFraction,
     startedAtMs,
     discoverTimers,
-    gridColumns,
-    dialFit,
+    gridColumnsFor,
+    voiceUnavailable,
+    readTimersPin,
+    readTimersArrival,
     detectDevice,
     isKioskMode,
+    readKioskFlag,
+    storeKioskFlag,
+    isKioskSession,
+    withKioskQuery,
+    reapplyKioskIfNeeded,
+    timerBadgeState,
+    timerBadgeFromHassStates,
+    parseNightSetting,
+    readNightSetting,
+    isNightNow,
+    readBackRecipeContext,
     readDeviceEnv,
     readRecipeContext,
     NAV_STRIP_VIEWS,

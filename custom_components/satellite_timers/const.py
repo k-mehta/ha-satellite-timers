@@ -27,6 +27,12 @@ SERVICE_ADD_TIME = "add_time"
 SERVICE_DISMISS_TIMER = "dismiss_timer"
 SERVICE_RESTART_TIMER = "restart_timer"
 SERVICE_START_TIMER = "start_timer"
+# D6 Undo: put a cancelled / dismissed timer back with its remaining
+# time (restore_timer) or its finished record (restore_finished_timer).
+# The card calls these from the Undo toast; they are the only way to
+# restore a timer the TimerManager no longer holds.
+SERVICE_RESTORE_TIMER = "restore_timer"
+SERVICE_RESTORE_FINISHED_TIMER = "restore_finished_timer"
 
 # Voice dismissal of a finished timer. Home Assistant's built-in timer
 # sentences cannot do this: "cancel/stop the pasta timer" looks the timer

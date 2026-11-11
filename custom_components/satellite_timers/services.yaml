@@ -95,3 +95,63 @@ restart_timer:
       required: false
       default: 0
       example: 0
+restore_timer:
+  name: Restore timer
+  description: Put a cancelled timer back with the time it had left when it was cancelled (Undo). A paused timer comes back paused. The restored timer gets a new timer id.
+  fields:
+    name:
+      name: Timer name
+      description: The name of the timer to restore.
+      required: true
+      example: "Pasta"
+    duration:
+      name: Seconds left
+      description: The seconds left on the timer when it was cancelled.
+      required: true
+      example: 420
+    paused:
+      name: Paused
+      description: Restore the timer paused (true) or running (false).
+      required: false
+      default: false
+      example: true
+    satellite:
+      name: Satellite
+      description: The satellite entity id (e.g. the kitchen satellite). Omit to use the default satellite.
+      required: false
+      example: "assist_satellite.kitchen"
+restore_finished_timer:
+  name: Restore finished timer
+  description: Put a dismissed finished timer back, WITHOUT ringing the satellite again (Undo). The original finished time is preserved, so "Done — N min ago" is unchanged. The restored timer gets a new timer id.
+  fields:
+    name:
+      name: Timer name
+      description: The name of the timer to restore.
+      required: true
+      example: "Pasta"
+    total_seconds:
+      name: Total duration
+      description: The timer's full duration in seconds.
+      required: true
+      example: 600
+    finished_at:
+      name: Finished at
+      description: ISO-8601 time the timer originally finished.
+      required: true
+      example: "2026-11-11T18:12:00+00:00"
+    satellite:
+      name: Satellite
+      description: The satellite entity id (e.g. the kitchen satellite). Omit to use the default satellite.
+      required: false
+      example: "assist_satellite.kitchen"
+    started_via_service:
+      name: Started via service
+      description: True when the original timer was started from the dashboard (a chip or preset), not by voice.
+      required: false
+      default: false
+      example: true
+    started_at:
+      name: Started at
+      description: ISO-8601 time the original timer started. Omit to derive it from finished_at minus total_seconds.
+      required: false
+      example: "2026-11-11T18:02:00+00:00"

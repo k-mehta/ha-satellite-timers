@@ -166,6 +166,15 @@ class FakeElement {
     return child;
   }
 
+  insertBefore(child, before) {
+    if (child.parentNode) child.parentNode.removeChild(child);
+    child.parentNode = this;
+    const index = before ? this.children.indexOf(before) : -1;
+    if (index >= 0) this.children.splice(index, 0, child);
+    else this.children.push(child);
+    return child;
+  }
+
   removeChild(child) {
     const index = this.children.indexOf(child);
     if (index >= 0) this.children.splice(index, 1);
@@ -216,6 +225,12 @@ class FakeElement {
     if (this._rect) return { ...this._rect };
     return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
   }
+
+  scrollIntoView(options) {
+    // Recorded so tests can assert the chip-tap scroll alignment.
+    if (!this._scrollIntoViewCalls) this._scrollIntoViewCalls = [];
+    this._scrollIntoViewCalls.push(options);
+  }
 }
 
 function matches(el, selector) {
@@ -264,13 +279,26 @@ const {
   formatElapsedSince,
   formatStartTime,
   remainingSeconds,
+  sensorRemaining,
   progressFraction,
   startedAtMs,
   discoverTimers,
-  gridColumns,
-  dialFit,
+  gridColumnsFor,
+  voiceUnavailable,
+  readTimersPin,
+  readTimersArrival,
   detectDevice,
   isKioskMode,
+  readKioskFlag,
+  storeKioskFlag,
+  isKioskSession,
+  withKioskQuery,
+  timerBadgeState,
+  timerBadgeFromHassStates,
+  parseNightSetting,
+  readNightSetting,
+  isNightNow,
+  readBackRecipeContext,
   readDeviceEnv,
   readRecipeContext,
   NAV_STRIP_VIEWS,
@@ -334,20 +362,52 @@ test("formatRemaining renders mm:ss and h:mm:ss", () => {
   assert.equal(formatRemaining(-5), "0:00");
 });
 
-test("discoverTimers keeps only satellite timer sensors in a live state, soonest first", () => {
+test("discoverTimers keeps only satellite timer sensors in a live state, running first (Wave 1 sort)", () => {
   const states = [
     timerState("t-late", "Pasta", "active", { remaining: 700 }),
     { entity_id: "sensor.other", state: "active", attributes: {} },
     timerState("t-soon", "Rice", "active", { remaining: 120 }),
     timerState("t-idle", "Idle", "idle", {}),
     timerState("t-done", "Done", "finished", {}),
+    timerState("t-paused", "Tea", "paused", { remaining: 300 }),
+  ];
+  const timers = discoverTimers(states);
+  // Wave 1 (T-IMPL-2/3): active soonest-first, then paused, then
+  // finished — the finished-first defect (F-T20) is gone.
+  assert.deepEqual(
+    timers.map((t) => t.timer_id),
+    ["t-soon", "t-late", "t-paused", "t-done"]
+  );
+  assert.equal(timers[0].name, "Rice");
+});
+
+test("discoverTimers keeps ringing timers in the finished group, most-recently-finished first", () => {
+  const states = [
+    timerState("t-old", "Old", "finished", {
+      finishedAt: new Date(Date.now() - 600000).toISOString(),
+    }),
+    timerState("t-ring", "Ring", "ringing", {
+      finishedAt: new Date(Date.now() - 10000).toISOString(),
+    }),
+    timerState("t-new", "New", "finished", {
+      finishedAt: new Date(Date.now() - 30000).toISOString(),
+    }),
+    timerState("t-run", "Run", "active", { remaining: 60 }),
   ];
   const timers = discoverTimers(states);
   assert.deepEqual(
     timers.map((t) => t.timer_id),
-    ["t-done", "t-soon", "t-late"]
+    ["t-run", "t-ring", "t-new", "t-old"]
   );
-  assert.equal(timers[1].name, "Rice");
+});
+
+test("sensorRemaining reads the sensor's remaining attribute (OQ-5)", () => {
+  const timer = discoverTimers([
+    timerState("t1", "Pasta", "active", { remaining: 59 }),
+  ])[0];
+  assert.equal(sensorRemaining(timer), 59);
+  assert.equal(sensorRemaining(null), 0);
+  assert.equal(sensorRemaining({}), 0);
 });
 
 test("remainingSeconds counts down from finishes_at and freezes while paused", () => {
@@ -370,42 +430,27 @@ test("progressFraction is the share of time left", () => {
   assert.equal(progressFraction(null, Date.now()), 0);
 });
 
-// -- gridColumns per category -----------------------------------------------
+// -- gridColumnsFor: columns by viewport class only (Wave 1) ----------
+// The count-driven grid is deleted: columns never depend on how many
+// timers exist.
 
-test("gridColumns on the hub: one row to three, 2x2 for four, three columns past that", () => {
-  assert.equal(gridColumns(0), 1);
-  assert.equal(gridColumns(1), 1);
-  assert.equal(gridColumns(2), 2);
-  assert.equal(gridColumns(3), 3);
-  assert.equal(gridColumns(4), 2);
-  assert.equal(gridColumns(5), 3);
-  assert.equal(gridColumns(9), 3);
-  // No category given is the hub mapping (the old call shape).
-  assert.equal(gridColumns(4, "hub"), 2);
-  assert.equal(gridColumns(5, "hub"), 3);
+test("gridColumnsFor on the hub: 3 landscape, 2 portrait", () => {
+  assert.equal(gridColumnsFor("hub", "landscape", 1920), 3);
+  assert.equal(gridColumnsFor("hub", "portrait", 1200), 2);
 });
 
-test("gridColumns on desktop: up to four in a row, four columns past that", () => {
-  assert.equal(gridColumns(1, "desktop"), 1);
-  assert.equal(gridColumns(3, "desktop"), 3);
-  assert.equal(gridColumns(4, "desktop"), 4);
-  assert.equal(gridColumns(5, "desktop"), 4);
-  assert.equal(gridColumns(9, "desktop"), 4);
+test("gridColumnsFor on mobile: 1 portrait, 2 landscape", () => {
+  assert.equal(gridColumnsFor("mobile", "portrait", 390), 1);
+  assert.equal(gridColumnsFor("mobile", "landscape", 844), 2);
 });
 
-test("gridColumns on mobile keeps the hub mapping (portrait stacks; landscape grids)", () => {
-  assert.equal(gridColumns(1, "mobile"), 1);
-  assert.equal(gridColumns(3, "mobile"), 3);
-  assert.equal(gridColumns(4, "mobile"), 2);
-  assert.equal(gridColumns(5, "mobile"), 3);
-});
-
-test("gridColumns on tablet keeps the hub mapping (DESIGN-9: at most three dials in a row)", () => {
-  assert.equal(gridColumns(1, "tablet"), 1);
-  assert.equal(gridColumns(3, "tablet"), 3);
-  assert.equal(gridColumns(4, "tablet"), 2);
-  assert.equal(gridColumns(5, "tablet"), 3);
-  assert.equal(gridColumns(9, "tablet"), 3);
+test("gridColumnsFor on tablet/desktop: by width (>=1600 -> 3, 900-1599 -> 2, <900 -> 1)", () => {
+  assert.equal(gridColumnsFor("tablet", "landscape", 1024), 2);
+  assert.equal(gridColumnsFor("tablet", "portrait", 768), 1);
+  assert.equal(gridColumnsFor("desktop", "landscape", 1920), 3);
+  assert.equal(gridColumnsFor("desktop", "landscape", 1366), 2);
+  assert.equal(gridColumnsFor("desktop", "landscape", 1024), 2);
+  assert.equal(gridColumnsFor("desktop", "portrait", 800), 1);
 });
 
 // -- Device detection (shared mechanism; the recipe card carries the
@@ -557,19 +602,22 @@ test("the screen carries dev-hub + orient-landscape on the kiosk, with the hub g
     assert.ok(screen.classList.contains("dev-hub"));
     assert.ok(screen.classList.contains("orient-landscape"));
     assert.ok(screen.classList.contains("cols-3"));
-    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 5);
+    // Wave 1: 4 running/paused dials; the finished timer is a row
+    // in the finished section, not a fifth dial.
+    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 4);
+    assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 1);
   } finally {
     clearWindow();
   }
 });
 
-test("the screen carries dev-desktop and four columns for five timers", () => {
+test("the screen carries dev-desktop and two columns at 1440px for five timers", () => {
   stubWindow(DESKTOP_WINDOW);
   try {
     const card = timerCard(fiveTimers());
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-desktop"));
-    assert.ok(screen.classList.contains("cols-4"));
+    assert.ok(screen.classList.contains("cols-2"));
   } finally {
     clearWindow();
   }
@@ -582,7 +630,9 @@ test("the screen carries dev-mobile + orient-portrait on a phone", () => {
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-mobile"));
     assert.ok(screen.classList.contains("orient-portrait"));
-    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 5);
+    assert.ok(screen.classList.contains("cols-1"));
+    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 4);
+    assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 1);
   } finally {
     clearWindow();
   }
@@ -594,12 +644,12 @@ test("a resize re-detects the device and re-grids", () => {
     const card = timerCard(fiveTimers());
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-mobile"));
-    assert.ok(screen.classList.contains("cols-3"));
+    assert.ok(screen.classList.contains("cols-1"));
     stubWindow(DESKTOP_WINDOW);
     card._onResize();
     assert.ok(screen.classList.contains("dev-desktop"));
     assert.ok(!screen.classList.contains("dev-mobile"));
-    assert.ok(screen.classList.contains("cols-4"));
+    assert.ok(screen.classList.contains("cols-2"));
   } finally {
     clearWindow();
   }
@@ -612,8 +662,8 @@ test("with no browser environment the screen carries no device classes (base lay
   assert.ok(!screen.classList.contains("dev-hub"));
   assert.ok(!screen.classList.contains("dev-desktop"));
   assert.ok(!screen.classList.contains("dev-mobile"));
-  // No category given is the hub grid.
-  assert.ok(screen.classList.contains("cols-3"));
+  // No device detected: the single-column base layout.
+  assert.ok(screen.classList.contains("cols-1"));
 });
 
 test("an empty screen shows the empty state and one column", () => {
@@ -649,6 +699,27 @@ test("tapping a dial pauses a running timer, resumes a paused one, dismisses a f
     ["satellite_timers", "resume_timer", { timer_id: "t2" }],
     ["satellite_timers", "dismiss_timer", { timer_id: "t3" }],
   ]);
+});
+
+test("a chip tap scrolls the new dial to the top of the view (block start), so its name is fully visible", async () => {
+  const card = new TimerScreenCard();
+  card.setConfig({});
+  // Simulate a chip tap: no timers existed before it.
+  card._presetBeforeIds = new Set();
+  card.hass = fakeHass([timerState("t1", "Pasta", "active", { remaining: 600 })]);
+  const dial = card._dialEls.get("t1");
+  assert.ok(dial, "dial element exists");
+  // The scroll is deferred until the 240ms dial-in entry animation
+  // settles: while .entering scales the dial (0.94) its measured top sits
+  // ~16px below the settled top, so an immediate scrollIntoView lands
+  // 16px too far and clips the name (rig: name top -16px at 844x390).
+  assert.deepEqual(dial._scrollIntoViewCalls || [], []);
+  await sleep(400);
+  // block: "nearest" clipped the name on a taller-than-viewport dial;
+  // "start" aligns the dial top so the name is fully visible, and the
+  // scroll is instant, not animated.
+  assert.deepEqual(dial._scrollIntoViewCalls, [{ block: "start", behavior: "auto" }]);
+  assert.ok(dial.classList.contains("pulse"));
 });
 
 test("Cancel arms on the first tap and only cancels on the second", async () => {
@@ -859,19 +930,25 @@ test("the full timer name renders — never truncated (TIMER-1)", () => {
   assert.doesNotMatch(html, /Chicken in oven -…/);
 });
 
-test("a finished timer shows Done — N min ago, counting up (TIMER-3)", () => {
+test("a finished timer shows as a compact row: Done — N min ago, counting up (TIMER-3)", () => {
   const card = timerCard([
     timerState("t1", "Tea", "finished", {
       finishedAt: new Date(Date.now() - 3 * 60000).toISOString(),
     }),
   ]);
+  // Wave 1: finished timers are rows in the "Finished (N)" section,
+  // never dials — there is no dial time or dial state line for t1.
+  assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 0);
+  const row = card.shadowRoot.querySelector(".finished-row");
+  assert.ok(row, "the finished row renders");
+  assert.equal(row.dataset.timerId, "t1");
   assert.equal(
-    card.shadowRoot.querySelector('[data-state="t1"]').textContent,
-    "Done — 3 min ago"
+    card.shadowRoot.querySelector('[data-finished-sub="t1"]').textContent,
+    "Done — 3 min ago · Tap to dismiss"
   );
-  assert.equal(
-    card.shadowRoot.querySelector('[data-remaining="t1"]').textContent,
-    "Done"
+  assert.match(
+    card.shadowRoot.querySelector(".finished-title").textContent,
+    /Finished \(1\)/
   );
 });
 
@@ -932,7 +1009,7 @@ test("the palette is the warm §3.3 set — no HA blue, amber, or #db4437 (TIMER
   }
 });
 
-test("past 12 timers the view degrades: many class + finished collapse (TIMER-7)", () => {
+test("finished timers live in a collapsible Finished section; running timers keep their dials (TIMER-7)", () => {
   const states = [];
   for (let i = 0; i < 12; i++) {
     states.push(timerState(`a${i}`, `Timer ${i}`, "active", { remaining: 600 + i }));
@@ -940,18 +1017,27 @@ test("past 12 timers the view degrades: many class + finished collapse (TIMER-7)
   states.push(timerState("done1", "Tea", "finished", {}));
   const card = timerCard(states);
   const screen = card.shadowRoot.querySelector(".screen");
-  assert.ok(screen.classList.contains("many"));
-  const finishedDial = [...card.shadowRoot.querySelectorAll(".dial")].find(
-    (d) => d.dataset.timerId === "done1"
-  );
-  assert.ok(finishedDial.classList.contains("compact-mode"));
+  // Wave 1: no count-driven degradation — no "many" class, no
+  // compact dial mode; all 12 running timers keep full dials.
+  assert.ok(!screen.classList.contains("many"));
+  assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 12);
+  // The finished timer is a row in the section, not a dial.
+  assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 1);
   assert.equal(
-    card.shadowRoot.querySelector('[data-compact-name="done1"]').textContent,
+    card.shadowRoot.querySelector('[data-finished-name="done1"]').textContent,
     "Tea"
   );
-  // At 12 timers exactly there is no degradation.
-  const twelve = timerCard(states.slice(0, 12));
-  assert.ok(!twelve.shadowRoot.querySelector(".screen").classList.contains("many"));
+  // With running timers present the section starts collapsed.
+  const header = card.shadowRoot.querySelector(".finished-header");
+  assert.equal(header.getAttribute("aria-expanded"), "false");
+  // 13 running timers: still no cap, still no degradation.
+  const thirteen = timerCard(
+    Array.from({ length: 13 }, (_, i) =>
+      timerState(`b${i}`, `Timer ${i}`, "active", { remaining: 600 + i })
+    )
+  );
+  assert.equal(thirteen.shadowRoot.querySelectorAll(".dial").length, 13);
+  assert.ok(!thirteen.shadowRoot.querySelector(".screen").classList.contains("many"));
 });
 
 test("a dial tap clears a pending Cancel arm (TIMER-9)", async () => {
@@ -982,10 +1068,12 @@ test("a dial tap clears a pending Cancel arm (TIMER-9)", async () => {
   );
 });
 
-test("cancelling shows a 5 s Undo toast; Undo re-creates the timer with the REMAINING time (TIMER-13, F-T1)", async () => {
+test("cancelling shows a 5 s Undo toast; Undo restores the timer with the REMAINING time, paused as it was (TIMER-13, F-T1, D6)", async () => {
   // Paused with 180 s left of a 900 s timer: Undo must bring back
   // 180 s, not a fresh 900 s. (The old test asserted the full
-  // duration here; that was the F-T1 defect.)
+  // duration here; that was the F-T1 defect.) Wave 1 (D6): the
+  // restore goes through the bridge restore_timer service, which
+  // re-creates the timer already paused — no active flash.
   const hass = fakeHass([
     timerState("t1", "Pasta", "paused", { remaining: 180, duration: 900 }),
   ]);
@@ -1011,7 +1099,63 @@ test("cancelling shows a 5 s Undo toast; Undo re-creates the timer with the REMA
   await sleep(20);
   assert.deepEqual(hass.calls, [
     ["satellite_timers", "cancel_timer", { timer_id: "t1" }],
-    ["satellite_timers", "start_timer", { name: "Pasta", duration: 180 }],
+    ["satellite_timers", "restore_timer", { name: "Pasta", duration: 180, paused: true }],
+  ]);
+  assert.equal(toast.hidden, true);
+});
+
+test("Undo of a running timer restores it running (D6)", async () => {
+  const hass = fakeHass([
+    timerState("t1", "Soup", "active", { remaining: 420, duration: 900 }),
+  ]);
+  const card = new TimerScreenCard();
+  card.setConfig({});
+  card.hass = hass;
+  const click = (action, timer) =>
+    card._onClick({
+      target: { closest: () => ({ dataset: { action, timer } }) },
+    });
+  click("cancel", "t1");
+  await sleep(20);
+  click("cancel", "t1");
+  await sleep(20);
+  click("undo-cancel", undefined);
+  await sleep(20);
+  assert.deepEqual(hass.calls, [
+    ["satellite_timers", "cancel_timer", { timer_id: "t1" }],
+    ["satellite_timers", "restore_timer", { name: "Soup", duration: 420, paused: false }],
+  ]);
+});
+
+test("dismissing a finished timer shows an Undo toast; Undo restores it finished without re-ringing (TIMER-13, D6)", async () => {
+  const finishedAt = new Date(Date.now() - 3 * 60000).toISOString();
+  const hass = fakeHass([
+    timerState("t1", "Tea", "finished", { finishedAt, duration: 600 }),
+  ]);
+  const card = new TimerScreenCard();
+  card.setConfig({});
+  card.hass = hass;
+  card._onClick({
+    target: { closest: () => ({ dataset: { action: "dial", timer: "t1" } }) },
+  });
+  await sleep(20);
+  assert.deepEqual(hass.calls, [
+    ["satellite_timers", "dismiss_timer", { timer_id: "t1" }],
+  ]);
+  const toast = card.shadowRoot.querySelector(".toast");
+  assert.equal(toast.hidden, false);
+  assert.match(toast.textContent, /Tea timer dismissed/);
+  card._onClick({
+    target: { closest: () => ({ dataset: { action: "undo-cancel" } }) },
+  });
+  await sleep(20);
+  assert.deepEqual(hass.calls, [
+    ["satellite_timers", "dismiss_timer", { timer_id: "t1" }],
+    [
+      "satellite_timers",
+      "restore_finished_timer",
+      { name: "Tea", total_seconds: 600, finished_at: finishedAt, started_via_service: false },
+    ],
   ]);
   assert.equal(toast.hidden, true);
 });
@@ -1019,48 +1163,93 @@ test("cancelling shows a 5 s Undo toast; Undo re-creates the timer with the REMA
 test("Undo never restores less than 1 s (F-T1 floor)", () => {
   const card = timerCard([]);
   // A timer cancelled at 0 s remaining still comes back (as 1 s).
-  card._showUndoToast({
+  card._showUndoToast(
+    {
+      name: "Tea",
+      duration: 600,
+      state: "active",
+      finishesAt: new Date(Date.now() - 5000).toISOString(),
+      remaining: 0,
+    },
+    "cancelled"
+  );
+  assert.deepEqual(card._undoTimer, {
+    kind: "cancelled",
     name: "Tea",
-    duration: 600,
-    state: "active",
-    finishesAt: new Date(Date.now() - 5000).toISOString(),
-    remaining: 0,
+    duration: 1,
+    paused: false,
   });
-  assert.deepEqual(card._undoTimer, { name: "Tea", duration: 1 });
   card._hideToast();
-  // And a timer with time left stores exactly that remainder.
-  card._showUndoToast({
+  // And a timer with time left stores exactly that remainder, paused
+  // as it was.
+  card._showUndoToast(
+    {
+      name: "Pasta",
+      duration: 900,
+      state: "paused",
+      remaining: 240,
+    },
+    "cancelled"
+  );
+  assert.deepEqual(card._undoTimer, {
+    kind: "cancelled",
     name: "Pasta",
-    duration: 900,
-    state: "paused",
-    remaining: 240,
+    duration: 240,
+    paused: true,
   });
-  assert.deepEqual(card._undoTimer, { name: "Pasta", duration: 240 });
+  card._hideToast();
+  // A dismissed finished timer stores the restore_finished shape:
+  // original finished_at, total seconds, no re-ring.
+  const finishedAt = new Date(Date.now() - 3 * 60000).toISOString();
+  const startedAt = new Date(Date.now() - 9 * 60000).toISOString();
+  card._showUndoToast(
+    {
+      name: "Tea",
+      duration: 600,
+      state: "finished",
+      finishedAt,
+      startedViaService: true,
+      startedAt,
+    },
+    "dismissed"
+  );
+  assert.deepEqual(card._undoTimer, {
+    kind: "dismissed",
+    name: "Tea",
+    totalSeconds: 600,
+    finishedAt,
+    startedViaService: true,
+    startedAt,
+  });
   card._hideToast();
 });
 
 test("Back to recipe shows with ?from_recipe= and navigates back at the same step (TIMER-10)", () => {
-  const assigned = [];
+  // Wave 1 (N-IMPL-21): the return is SPA navigation now
+  // (pushState + location-changed, recorded in _lastNavigation) — no
+  // full-page location.assign, so the recipe card's session restores
+  // in place.
   stubWindow(HUB_WINDOW);
   globalThis.window.location = {
     search: "?from_recipe=rec-1&step=3",
     pathname: "/family-hub/timers",
-    assign: (url) => assigned.push(url),
   };
   try {
     const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    // Wave 1: the back bar is created only when a recipe context
+    // exists — it is present here, not merely un-hidden.
     const bar = card.shadowRoot.querySelector(".back-bar");
-    assert.equal(bar.hidden, false);
+    assert.ok(bar, "the back bar renders with a recipe context");
     card._onClick({
       target: { closest: () => ({ dataset: { action: "back-recipe" } }) },
     });
-    assert.deepEqual(assigned, ["/family-hub/recipes?recipe=rec-1&step=3"]);
+    assert.equal(card._lastNavigation, "/family-hub/recipes?recipe=rec-1&step=3");
   } finally {
     clearWindow();
   }
-  // Without the param there is no back bar.
+  // Without the param there is no back bar at all (zero DOM residue).
   const plain = timerCard([timerState("t1", "Pasta", "active", {})]);
-  assert.equal(plain.shadowRoot.querySelector(".back-bar").hidden, true);
+  assert.equal(plain.shadowRoot.querySelector(".back-bar"), null);
 });
 
 // -- tablet category (DESIGN-9, Phase 7) -----------------------------------
@@ -1157,10 +1346,11 @@ test("detectDevice: tablet category — band, iPad, Android tablet (DESIGN-9)", 
 // -- Phase 7 CSS: tablet rules, reduced motion, no layout animation ------
 
 test("Phase 7 CSS: tablet rules, reduced motion, no layout-property animation", () => {
-  // Tablet (DESIGN-9): 64px controls, preset chips shown (TIMER-4).
+  // Tablet (DESIGN-9): 64px controls, preset chips shown when their
+  // row is open (TIMER-4).
   assert.match(CARD_CSS, /\.screen\.dev-tablet \.controls button \{ min-height: 64px;/);
-  assert.match(CARD_CSS, /\.screen\.dev-tablet \.preset-chips \{ display: flex; \}/);
-  assert.match(CARD_CSS, /\.screen\.dev-tablet \.name \{ font-size: 20px; \}/);
+  assert.match(CARD_CSS, /\.preset-chips\.show \{ display: flex; \}/);
+  assert.match(CARD_CSS, /\.screen\.dev-tablet \.dial-name \{ font-size: 20px; \}/);
   assert.match(CARD_CSS, /\.screen\.dev-tablet \.state, \.screen\.dev-tablet \.hint \{ font-size: 18px; \}/);
   // DESIGN-6: no layout-property animation anywhere — the dial
   // button's height/width transition is gone.
@@ -1192,27 +1382,36 @@ test("parseTimerScroll/serializeTimerScroll: round-trip, garbage -> null, negati
 });
 
 // -- Phase 7 follow-up: Fix 2 (finished-dial sub-text) ----------------------
-// At 360x640 the finished dial's two sub-lines ("Done — N min ago",
-// "Tap to dismiss") were wider than the ring's chord at their height,
-// so the ring crossed characters. Mobile-only fix: smaller sub-text
-// (14px) and a taller portrait dial (300px, so the ring is ~200px
-// instead of 154px). The hub and tablet type minima (TIMER-6) are
-// untouched.
+// DELETED in Wave 1: the old fix shrank finished-dial sub-text to
+// 14px and stretched the portrait dial to 300px because the sub-lines
+// sat INSIDE the ring and the ring crossed characters. The Wave 1
+// stack layout puts the name above the ring and the state/hint lines
+// BELOW it, so there is nothing for the ring to cross — the
+// workaround is gone and the sub-text stays at the TIMER-6 18px on
+// every category. The replacement test below pins the new structure.
 
-test("Phase 7 follow-up (Fix 2): mobile sub-text is 14px and the portrait dial is taller", () => {
+test("Wave 1 (Fix 2 superseded): sub-text sits below the ring at 18px on mobile — no 14px rule, no 300px portrait dial", () => {
+  // The dial is a vertical stack: name block above the ring button,
+  // countdown inside it, state/hint lines below it.
   assert.match(
     CARD_CSS,
-    /\.screen\.dev-mobile \.state, \.screen\.dev-mobile \.hint \{ font-size: 14px; \}/
+    /\.dial \{\n    min-width: 0;\n    width: 100%;\n    position: relative;\n    display: flex;\n    flex-direction: column;/
   );
   assert.match(
     CARD_CSS,
-    /\.screen\.dev-mobile\.orient-portrait \.dial \{ min-height: 300px; \}/
+    /\.dial-sub \{\n    display: flex;\n    flex-direction: column;/
   );
+  assert.match(CARD_CSS, /\.screen\.dev-mobile \.state, \.screen\.dev-mobile \.hint \{ font-size: 18px; \}/);
+  assert.doesNotMatch(CARD_CSS, /\.screen\.dev-mobile \.state, \.screen\.dev-mobile \.hint \{ font-size: 14px;/);
+  assert.doesNotMatch(CARD_CSS, /min-height: 300px;/);
+  // The finished timer's sub-lines live in the compact row, not in
+  // a dial at all.
+  assert.match(CARD_CSS, /\.finished-sub \{/);
 });
 
 test("Phase 7 follow-up (Fix 2): hub and tablet type sizes are unchanged (TIMER-6)", () => {
   // Base (hub) rules: name 20px, state/hint 18px.
-  assert.match(CARD_CSS, /\.name \{\n    color: #212121;\n    font-size: 20px;/);
+  assert.match(CARD_CSS, /\.dial-name \{\n    width: 100%;\n    color: #212121;\n    font-size: 20px;/);
   assert.match(CARD_CSS, /\.state \{ color: #57534E; font-size: 18px; line-height: 1\.3; \}/);
   assert.match(CARD_CSS, /\.hint \{ color: #57534E; font-size: 18px; line-height: 1\.3; \}/);
   // Tablet keeps the hub minima.
@@ -1220,8 +1419,8 @@ test("Phase 7 follow-up (Fix 2): hub and tablet type sizes are unchanged (TIMER-
     CARD_CSS,
     /\.screen\.dev-tablet \.state, \.screen\.dev-tablet \.hint \{ font-size: 18px; \}/
   );
-  // Mobile name is unchanged at 18px — only the sub-lines shrank.
-  assert.match(CARD_CSS, /\.screen\.dev-mobile \.name \{ font-size: 18px; \}/);
+  // Mobile name is 18px (the sub-lines never shrank in Wave 1).
+  assert.match(CARD_CSS, /\.screen\.dev-mobile \.dial-name \{ font-size: 18px; \}/);
 });
 
 // -- Phase 7 follow-up: Fix 3 (nav strip, NAV-1) ---------------------------
@@ -1250,22 +1449,28 @@ test("Phase 7 follow-up (Fix 3): the strip renders first in the screen, Timers a
   assert.equal(screen.children[0], strip, "the strip is first in the DOM (tab order)");
   const buttons = card.shadowRoot.querySelectorAll(".nav-strip-button");
   assert.equal(buttons.length, 4);
-  // The Timers button carries the scroll badge (P8-5) — a "↓" span
-  // after the label — so its textContent reads "Timers↓".
+  // Wave 1: the scroll indicator moved OUT of the strip into a
+  // floating pill, so the Timers button carries only the count badge
+  // (N-IMPL-5, "1" for the one active timer in this fixture) — its
+  // textContent reads "Timers1". Labels are read with the count
+  // digits stripped.
   assert.deepEqual(
-    buttons.map((button) => button.textContent),
-    ["Home", "Timers↓", "Photos", "Recipes"]
+    buttons.map((button) => button.textContent.replace(/[0-9]+$/, "")),
+    ["Home", "Timers", "Photos", "Recipes"]
   );
-  // The badge is on the Timers button only, and hidden until a dial
-  // sits below the fold (P8-4 gate — no window here, so hidden).
-  const badges = card.shadowRoot.querySelectorAll(".nav-scroll-badge");
-  assert.equal(badges.length, 1);
-  assert.equal(badges[0].hidden, true);
-  assert.equal(badges[0].textContent, "↓");
-  assert.ok(buttons[1].innerHTML.includes("nav-scroll-badge"));
-  assert.ok(!buttons[0].innerHTML.includes("nav-scroll-badge"));
-  assert.ok(!buttons[2].innerHTML.includes("nav-scroll-badge"));
-  assert.ok(!buttons[3].innerHTML.includes("nav-scroll-badge"));
+  // No scroll badge on any strip button any more.
+  assert.equal(card.shadowRoot.querySelectorAll(".nav-scroll-badge").length, 0);
+  assert.doesNotMatch(buttons[1].innerHTML, /nav-scroll-badge/);
+  // The count badge shows (Wave 1: it always shows while timers
+  // exist — no reconciliation with the pill): 1 active timer.
+  const countBadges = card.shadowRoot.querySelectorAll(".timer-badge");
+  assert.equal(countBadges.length, 1);
+  assert.equal(countBadges[0].hidden, false);
+  assert.equal(countBadges[0].textContent, "1");
+  assert.ok(buttons[1].innerHTML.includes("timer-badge"));
+  assert.ok(!buttons[0].innerHTML.includes("timer-badge"));
+  assert.ok(!buttons[2].innerHTML.includes("timer-badge"));
+  assert.ok(!buttons[3].innerHTML.includes("timer-badge"));
   assert.deepEqual(
     buttons.map((button) => button.dataset.path),
     ["/family-hub", "/family-hub/timers", "/family-hub/family-photos", "/family-hub/recipes"]
@@ -1324,10 +1529,12 @@ test("Phase 7 follow-up (Fix 3): strip CSS — fixed to the viewport bottom, hid
   // screen reserves the strip's height in bottom padding.
   assert.match(
     CARD_CSS,
-    /\.nav-strip \{\n    position: fixed;\n    bottom: 0;\n    left: 24px;\n    right: 24px;/
+    /\.nav-strip \{\n    position: fixed;\n    bottom: 0;\n    left: 0;\n    width: 100%;/
   );
+  assert.match(CARD_CSS, /\.nav-strip \{[^}]*height: 96px;/s);
+  assert.match(CARD_CSS, /\.nav-strip \{[^}]*background: #171717;/s);
   assert.ok(
-    CARD_CSS.includes("padding-bottom: calc(24px + var(--nav-strip-height, 84px));")
+    CARD_CSS.includes("padding-bottom: calc(8px + var(--nav-strip-height, 96px));")
   );
   // Desktop only when NOT in kiosk mode: hidden (HA tabs already exist
   // and work there). In kiosk mode the strip shows ALWAYS — HA tabs
@@ -1339,230 +1546,63 @@ test("Phase 7 follow-up (Fix 3): strip CSS — fixed to the viewport bottom, hid
   );
   assert.match(
     CARD_CSS,
-    /\.screen\.dev-desktop\.kiosk \{ --nav-strip-height: 84px; \}/
+    /\.screen\.dev-desktop\.kiosk \{ --nav-strip-height: 64px; \}/
   );
+  // Focus is 3px white, press is scale(0.97) within 100 ms (D-N1/D-N11).
+  assert.match(CARD_CSS, /\.nav-strip-button:focus-visible \{ outline: 3px solid #fff; outline-offset: 2px; \}/);
+  assert.match(CARD_CSS, /\.nav-strip-button:active \{ transform: scale\(0.97\);/);
+  // Count badge tones + night palette match the reference strip.
+  assert.ok(CARD_CSS.includes(".timer-badge.soon { background: #B45309; color: #fff; }"));
+  assert.ok(CARD_CSS.includes(".timer-badge.finished { background: #B91C1C; color: #fff; }"));
+  assert.ok(CARD_CSS.includes(".screen.night .nav-strip { background: #0A0A0A; }"));
   // Active state: the accent background, heavier weight.
   assert.ok(
     CARD_CSS.includes(
       ".nav-strip-button.active { background: #C2410C; border-color: #C2410C; color: #fff; font-weight: 800; }"
     )
   );
-  // Per-category sizes match the recipe card (hub 64px/24px, tablet
-  // 56px/20px, mobile 48px/16px nowrap).
+  // Per-category strip heights (D-N1, wave 1): 96px wall, 72px
+  // tablet, 64px phone (+ safe area), 56px desktop+kiosk.
+  assert.ok(CARD_CSS.includes(".screen.dev-tablet .nav-strip { height: 72px; }"));
+  assert.match(CARD_CSS, /\.screen\.dev-mobile \.nav-strip \{ height: calc\(64px \+ env\(safe-area-inset-bottom, 0px\)\); \}/);
+  assert.ok(CARD_CSS.includes(".screen.dev-desktop.kiosk .nav-strip { height: 56px; }"));
   assert.match(
     CARD_CSS,
-    /\.screen\.dev-tablet \.nav-strip-button \{ min-height: 56px; padding: 10px 16px; font-size: 20px; \}/
+    /\.screen\.dev-tablet \.nav-strip-button \{ font-size: 20px; \}/
   );
   assert.match(
     CARD_CSS,
-    /\.screen\.dev-mobile \.nav-strip-button \{ min-height: 48px; padding: 8px 6px; font-size: 16px; white-space: nowrap; \}/
+    /\.screen\.dev-mobile \.nav-strip-button \{ font-size: 16px; white-space: nowrap; \}/
   );
-  // P8-5: the scroll indicator is a badge on the Timers strip button
-  // now, not a floating pill — no .scroll-hint rule may remain, and
-  // the badge is corner-positioned with pointer-events none so it
-  // never eats a tap or changes the button's size.
+  // P8-5 (Wave 1): the scroll indicator is a floating pill, not a
+  // badge on the Timers strip button — no .nav-scroll-badge rule may
+  // remain, and no .scroll-hint rule either. The pill is fixed to
+  // the viewport (bottom set from the strip height in JS) with its
+  // own [hidden] rule.
   assert.doesNotMatch(CARD_CSS, /\.scroll-hint/);
-  assert.doesNotMatch(CARD_CSS, /More timers below/);
-  assert.match(CARD_CSS, /\.nav-scroll-badge \{/);
-  assert.ok(CARD_CSS.includes("position: absolute;"));
-  assert.ok(CARD_CSS.includes("pointer-events: none;"));
-  assert.ok(CARD_CSS.includes(".nav-scroll-badge[hidden] { display: none; }"));
-  // The Undo toast clears the strip on every category that shows it
-  // (desktop+kiosk included).
-  assert.ok(CARD_CSS.includes(".screen.dev-hub ~ .toast { bottom: 108px; }"));
-  assert.ok(CARD_CSS.includes(".screen.dev-tablet ~ .toast { bottom: 100px; }"));
-  assert.ok(CARD_CSS.includes(".screen.dev-mobile ~ .toast { bottom: 84px; }"));
-  assert.ok(CARD_CSS.includes(".screen.dev-desktop.kiosk ~ .toast { bottom: 108px; }"));
+  assert.doesNotMatch(CARD_CSS, /\.nav-scroll-badge/);
+  assert.match(CARD_CSS, /\.scroll-pill \{\n    position: fixed;/);
+  assert.ok(CARD_CSS.includes(".scroll-pill[hidden] { display: none; }"));
+  // F-T17 (Wave 1): the Undo toast is fixed to the viewport with its
+  // bottom set from the measured strip height + 8px in JS — no
+  // per-category sibling bottom rules remain. The CSS 24px bottom
+  // is the no-strip fallback (desktop, strip hidden).
+  assert.match(CARD_CSS, /\.toast \{\n    position: fixed;/);
+  assert.ok(CARD_CSS.includes("bottom: 24px;"));
+  assert.doesNotMatch(CARD_CSS, /~ \.toast/);
   // Reduced motion: the press feedback is instant.
   assert.match(CARD_CSS, /\.nav-strip-button:active \{ transform: none; \}/);
 });
 
-// -- Fix round: P8-3/P8-6 dial fit, P8-4/P8-5 scroll badge, P8-16,
-// kiosk-desktop strip, F-T1 (tests above), P8-7 ----------------------
-// The height-budget dial cap: --dial-max = floor((viewport − padding
-// − gaps − extra) / rows) − controls reserve. Hub padding is 132px
-// (24 top + 24 bottom + 84 strip), gaps 16px, hub reserve 100px.
+// -- Scroll pill gating (P8-4/P8-5, Wave 1) --------------------------------
+// Wave 1: the indicator moved out of the strip into a floating "↓"
+// pill (button.scroll-pill, a shadow-root sibling of .screen). The
+// gate is unchanged: the pill shows only while a DIAL sits below the
+// fold. Rects are pinned on the fake elements (see
+// getBoundingClientRect): the screen rect sets the fold, the dial
+// rects decide.
 
-test("dialFit: hub numbers — 1 timer 968px, 4–5 timers 426px, 12 timers 155px (P8-3/P8-6)", () => {
-  assert.deepEqual(dialFit(1, 1, 1200, 100, 84), { dialMax: 968, many: false });
-  assert.deepEqual(dialFit(2, 2, 1200, 100, 84), { dialMax: 968, many: false });
-  assert.deepEqual(dialFit(3, 3, 1200, 100, 84), { dialMax: 968, many: false });
-  assert.deepEqual(dialFit(4, 2, 1200, 100, 84), { dialMax: 426, many: false });
-  assert.deepEqual(dialFit(5, 3, 1200, 100, 84), { dialMax: 426, many: false });
-  assert.deepEqual(dialFit(12, 3, 1200, 100, 84), { dialMax: 155, many: false });
-  // Monotone: the cap never grows as rows grow.
-  let prev = Infinity;
-  for (const [count, cols] of [[1, 1], [2, 2], [3, 3], [4, 2], [5, 3], [9, 3], [12, 3]]) {
-    const { dialMax } = dialFit(count, cols, 1200, 100, 84);
-    assert.ok(dialMax <= prev, `${count} timers: ${dialMax} > ${prev}`);
-    prev = dialMax;
-  }
-});
-
-test("dialFit: below the 140px floor the view goes many-mode regardless of count (P8-6)", () => {
-  // 13 timers at the hub: 5 rows, 100px cap — under the floor.
-  assert.deepEqual(dialFit(13, 3, 1200, 100, 84), { dialMax: null, many: true });
-  assert.deepEqual(dialFit(20, 3, 1200, 100, 84), { dialMax: null, many: true });
-  // Desktop-landscape 1920x1080 (reserve 76, no strip): 12 fit, 20 do not.
-  assert.deepEqual(dialFit(12, 4, 1080, 76, 0), { dialMax: 257, many: false });
-  assert.deepEqual(dialFit(20, 4, 1080, 76, 0), { dialMax: null, many: true });
-});
-
-test("dialFit: the Back-to-recipe bar takes its row out of the budget (TIMER-10)", () => {
-  // 1 timer + back bar: 80px (64px button + one gap) less room.
-  assert.deepEqual(dialFit(1, 1, 1200, 100, 84, 80), { dialMax: 888, many: false });
-  assert.deepEqual(dialFit(1, 1, 1200, 100, 84, 0), { dialMax: 968, many: false });
-});
-
-test("dialFit: nothing to fit — no timers, or no viewport", () => {
-  assert.deepEqual(dialFit(0, 1, 1200, 100, 84), { dialMax: null, many: false });
-  assert.deepEqual(dialFit(5, 3, 0, 100, 84), { dialMax: null, many: false });
-  assert.deepEqual(dialFit(5, 3, null, 100, 84), { dialMax: null, many: false });
-});
-
-function hubDialMax(count) {
-  stubWindow(HUB_WINDOW);
-  try {
-    const states = [];
-    for (let i = 0; i < count; i++) {
-      states.push(timerState(`t${i}`, `Timer ${i}`, "active", { remaining: 3600 }));
-    }
-    const card = timerCard(states);
-    const screen = card.shadowRoot.querySelector(".screen");
-    return {
-      dialMax: screen.style.getPropertyValue("--dial-max"),
-      many: screen.classList.contains("many"),
-      cols: screen.className,
-    };
-  } finally {
-    clearWindow();
-  }
-}
-
-test("_applyDialFit sets --dial-max on the hub screen and flips many-mode at 13 (P8-3/P8-6)", () => {
-  assert.deepEqual(hubDialMax(1).dialMax, "968px");
-  assert.equal(hubDialMax(1).many, false);
-  assert.deepEqual(hubDialMax(4).dialMax, "426px");
-  assert.deepEqual(hubDialMax(5).dialMax, "426px");
-  assert.deepEqual(hubDialMax(12).dialMax, "155px");
-  assert.equal(hubDialMax(12).many, false);
-  const thirteen = hubDialMax(13);
-  assert.equal(thirteen.dialMax, "");
-  assert.equal(thirteen.many, true);
-  // 12 timers shrink to 155px dials: under the 260px threshold, so
-  // the screen takes the many-mode text scale (44px time) — otherwise
-  // the 72px time bursts out of the ring (seen live in the n-12
-  // screenshot). 5 timers at 426px keep the full 72px time.
-  assert.ok(hubDialMax(12).cols.includes("small-dials"));
-  assert.ok(!hubDialMax(5).cols.includes("small-dials"));
-  assert.match(CARD_CSS, /\.screen\.small-dials \.time \{ font-size: 44px; \}/);
-  assert.match(CARD_CSS, /\.screen\.small-dials \.name \{ font-size: 18px; \}/);
-  // The landscape dial rule consumes the var as a third min() term.
-  assert.match(
-    CARD_CSS,
-    /width: min\(100%, calc\(100vh - var\(--controls-reserve\) - 48px\), var\(--dial-max, 100000px\)\);/
-  );
-});
-
-test("_applyDialFit clears small-dials on rotation to portrait", () => {
-  stubWindow(HUB_WINDOW);
-  try {
-    const states = [];
-    for (let i = 0; i < 12; i++) {
-      states.push(timerState(`t${i}`, `Timer ${i}`, "active", { remaining: 3600 }));
-    }
-    const card = timerCard(states);
-    const screen = card.shadowRoot.querySelector(".screen");
-    assert.ok(screen.classList.contains("small-dials"));
-    stubWindow(PHONE_WINDOW);
-    card._onResize();
-    assert.ok(!screen.classList.contains("small-dials"));
-    assert.equal(screen.style.getPropertyValue("--dial-max"), "");
-  } finally {
-    clearWindow();
-  }
-});
-
-test("_applyDialFit does not set --dial-max in portrait (fit is landscape-only)", () => {
-  stubWindow(PHONE_WINDOW);
-  try {
-    const card = timerCard(fiveTimers());
-    const screen = card.shadowRoot.querySelector(".screen");
-    assert.equal(screen.style.getPropertyValue("--dial-max"), "");
-  } finally {
-    clearWindow();
-  }
-});
-
-// The controls reserve is the space below the ring: 12px .controls
-// margin-top + button min-height + the 8px margin-top of the (usually
-// empty) .error div. The hub's 100 already included the 8px; desktop/
-// tablet/mobile were 8px short per row, so those views scrolled 8px
-// (measured live at 1366x768: docH 776 vs vh 768) with nothing hidden.
-// These expectations pin the corrected reserves per category, and the
-// CSS --controls-reserve vars must match them (they size the button
-// and centre the .dial-text overlay on the ring).
-function categoryDialMax(count, win) {
-  stubWindow(win);
-  try {
-    const states = [];
-    for (let i = 0; i < count; i++) {
-      states.push(timerState(`t${i}`, `Timer ${i}`, "active", { remaining: 3600 }));
-    }
-    const card = timerCard(states);
-    const screen = card.shadowRoot.querySelector(".screen");
-    return screen.style.getPropertyValue("--dial-max");
-  } finally {
-    clearWindow();
-  }
-}
-
-const DESKTOP_1080_WINDOW = {
-  ...DESKTOP_WINDOW,
-  width: 1920,
-  height: 1080,
-};
-const MOBILE_LANDSCAPE_WINDOW = {
-  width: 1366,
-  height: 768,
-  coarse: true,
-  fine: false,
-  touch: true,
-  userAgent: HUB_WINDOW.userAgent,
-};
-const TABLET_WINDOW = {
-  width: 1024,
-  height: 768,
-  coarse: true,
-  fine: false,
-  touch: true,
-  userAgent: HUB_WINDOW.userAgent,
-};
-
-test("_applyDialFit reserves include the empty .error margin on desktop/tablet/mobile (P8-3/P8-6)", () => {
-  // Mobile 1366x768, 2 timers, 1 row: (768 - 108) - 84 = 576.
-  assert.equal(categoryDialMax(2, MOBILE_LANDSCAPE_WINDOW), "576px");
-  // Mobile, 5 timers, 2 rows: floor((768 - 108 - 16) / 2) - 84 = 238.
-  assert.equal(categoryDialMax(5, MOBILE_LANDSCAPE_WINDOW), "238px");
-  // Desktop 1920x1080 no-kiosk, 2 timers, 1 row: (1080 - 48) - 76 = 956.
-  assert.equal(categoryDialMax(2, DESKTOP_1080_WINDOW), "956px");
-  // Desktop, 5 timers, 2 rows: floor((1080 - 48 - 16) / 2) - 76 = 432.
-  assert.equal(categoryDialMax(5, DESKTOP_1080_WINDOW), "432px");
-  // Tablet 1024x768, 2 timers, 1 row: (768 - 124) - 84 = 560.
-  assert.equal(categoryDialMax(2, TABLET_WINDOW), "560px");
-  // The CSS vars carry the same reserves (button sizing + overlay
-  // centring read them, not the JS table).
-  assert.match(CARD_CSS, /\.screen\.dev-desktop \{ --controls-reserve: 76px;/);
-  assert.match(CARD_CSS, /\.screen\.dev-tablet \{ --controls-reserve: 84px;/);
-  assert.match(CARD_CSS, /\.screen\.dev-mobile \{ --controls-reserve: 84px;/);
-});
-
-// -- Scroll badge gating (P8-4/P8-5) --------------------------------------
-// The badge shows only while a DIAL sits below the fold. Rects are
-// pinned on the fake elements (see getBoundingClientRect): the screen
-// rect sets the fold, the dial rects decide.
-
-function badgeCard() {
+function pillCard() {
   stubWindow(HUB_WINDOW);
   const card = timerCard([
     timerState("t1", "Pasta", "active", { remaining: 600 }),
@@ -1574,54 +1614,59 @@ function badgeCard() {
   return { card, screen, dials };
 }
 
-test("the scroll badge stays hidden when every dial is in view (P8-4)", () => {
-  const { card, dials } = badgeCard();
+test("the scroll pill stays hidden when every dial is in view (P8-4)", () => {
+  const { card, dials } = pillCard();
   try {
     for (const d of dials) {
       d._rect = { top: 100, bottom: 1100, left: 0, right: 600, width: 600, height: 1000 };
     }
-    card._updateScrollBadge();
-    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, true);
+    card._updateScrollPill();
+    assert.equal(card.shadowRoot.querySelector(".scroll-pill").hidden, true);
   } finally {
     clearWindow();
   }
 });
 
-test("the scroll badge shows when a dial extends below the viewport fold (P8-4)", () => {
-  const { card, dials } = badgeCard();
+test("the scroll pill shows when a dial extends below the viewport fold (P8-4)", () => {
+  const { card, dials } = pillCard();
   try {
     dials[0]._rect = { top: 100, bottom: 1100, left: 0, right: 600, width: 600, height: 1000 };
     dials[1]._rect = { top: 1100, bottom: 1350, left: 0, right: 600, width: 600, height: 250 };
-    card._updateScrollBadge();
-    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, false);
+    card._updateScrollPill();
+    const pill = card.shadowRoot.querySelector(".scroll-pill");
+    assert.equal(pill.hidden, false);
+    assert.equal(pill.textContent, "↓");
+    // The pill clears the strip: bottom = strip height + 16px.
+    // (The fake strip rect is 0 high here, so the bottom is 16px.)
+    assert.equal(pill.style.bottom, "16px");
     // Scrolled to the bottom, the last dial is fully visible again.
     dials[1]._rect = { top: 900, bottom: 1150, left: 0, right: 600, width: 600, height: 250 };
-    card._updateScrollBadge();
-    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, true);
+    card._updateScrollPill();
+    assert.equal(card.shadowRoot.querySelector(".scroll-pill").hidden, true);
   } finally {
     clearWindow();
   }
 });
 
-test("the scroll badge stays hidden when only the screen (not a dial) extends below the fold (P8-4)", () => {
+test("the scroll pill stays hidden when only the screen (not a dial) extends below the fold (P8-4)", () => {
   // The 1-timer regression: the controls row overflowed, the screen
   // rect ran past the viewport, and the old gate showed "More timers
   // below" with no timers below at all.
-  const { card, screen, dials } = badgeCard();
+  const { card, screen, dials } = pillCard();
   try {
     screen._rect = { top: 0, bottom: 1284, left: 0, right: 1920, width: 1920, height: 1284 };
     for (const d of dials) {
       d._rect = { top: 100, bottom: 1050, left: 0, right: 600, width: 600, height: 950 };
     }
-    card._updateScrollBadge();
-    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, true);
+    card._updateScrollPill();
+    assert.equal(card.shadowRoot.querySelector(".scroll-pill").hidden, true);
   } finally {
     clearWindow();
   }
 });
 
-test("the scroll badge uses the screen's own bottom as the fold in internal-scroll mode (P8-4)", () => {
-  const { card, screen, dials } = badgeCard();
+test("the scroll pill uses the screen's own bottom as the fold in internal-scroll mode (P8-4)", () => {
+  const { card, screen, dials } = pillCard();
   try {
     // Screen shorter than the viewport, scrolling internally: a dial
     // below the screen's visible bottom (800) is below the fold even
@@ -1629,8 +1674,22 @@ test("the scroll badge uses the screen's own bottom as the fold in internal-scro
     screen._rect = { top: 0, bottom: 800, left: 0, right: 1920, width: 1920, height: 800 };
     dials[0]._rect = { top: 100, bottom: 700, left: 0, right: 600, width: 600, height: 600 };
     dials[1]._rect = { top: 700, bottom: 950, left: 0, right: 600, width: 600, height: 250 };
-    card._updateScrollBadge();
-    assert.equal(card.shadowRoot.querySelector(".nav-scroll-badge").hidden, false);
+    card._updateScrollPill();
+    assert.equal(card.shadowRoot.querySelector(".scroll-pill").hidden, false);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("tapping the scroll pill scrolls the screen down (P8-5)", () => {
+  const { card, screen } = pillCard();
+  try {
+    // Internal scroll: the screen scrolls by 80% of the viewport.
+    screen.scrollHeight = 2400;
+    screen.clientHeight = 1200;
+    screen.scrollTop = 0;
+    card._onScrollPillTap();
+    assert.equal(screen.scrollTop, 960);
   } finally {
     clearWindow();
   }
@@ -1683,4 +1742,373 @@ test("removing a timer removes its dial from the DOM synchronously (P8-7 unit bo
   assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 1);
   card.hass = fakeHass([]);
   assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 0);
+});
+
+// -- Wave 1 (Navigation N-IMPL-1/2/3/5/6/10/21/24): fixed dark strip, --
+// kiosk as a session property, timers badge, night mode, SPA back-to-recipe
+
+test("Wave 1: kiosk session flag + withKioskQuery (shared with the reference strip)", () => {
+  const store = new Map();
+  globalThis.sessionStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, v),
+  };
+  assert.equal(readKioskFlag(), false);
+  storeKioskFlag();
+  assert.equal(readKioskFlag(), true);
+  assert.equal(isKioskSession(""), true);
+  globalThis.window = { location: { search: "" } };
+  assert.equal(withKioskQuery("/family-hub/recipes"), "/family-hub/recipes?kiosk");
+  assert.equal(withKioskQuery("/family-hub/recipes?recipe=x&step=2"), "/family-hub/recipes?recipe=x&step=2&kiosk");
+  delete globalThis.window;
+  store.clear();
+  assert.equal(isKioskSession("?kiosk"), true);
+});
+
+test("Wave 1: timerBadgeState counts ACTIVE + PAUSED, colour from running/finished only", () => {
+  assert.equal(timerBadgeState([]), null);
+  assert.deepEqual(timerBadgeState([{ state: "active", remaining: 300 }]), { count: 1, tone: "count" });
+  assert.deepEqual(timerBadgeState([{ state: "paused", remaining: 30 }]), { count: 1, tone: "count" });
+  assert.deepEqual(timerBadgeState([{ state: "active", remaining: 45 }]), { count: 1, tone: "soon" });
+  assert.deepEqual(timerBadgeState([{ state: "finished", remaining: 0 }]), { count: 1, tone: "finished" });
+  assert.deepEqual(
+    timerBadgeState([
+      { state: "active", remaining: 500 },
+      { state: "paused", remaining: 20 },
+      { state: "finished", remaining: 0 },
+    ]),
+    { count: 2, tone: "finished" }
+  );
+  assert.deepEqual(
+    timerBadgeFromHassStates({
+      "sensor.satellite_timer_a": { state: "active", attributes: { remaining: 500 } },
+      "sensor.satellite_timer_b": { state: "active", attributes: { remaining: 30 } },
+    }),
+    { count: 2, tone: "soon" }
+  );
+});
+
+test("Wave 1: night mode has no default hours; overnight spans work", () => {
+  assert.equal(parseNightSetting(null), null);
+  assert.equal(readNightSetting(), null);
+  assert.equal(isNightNow(null, new Date(2026, 10, 10, 23, 0)), false);
+  const overnight = parseNightSetting('{"start":"22:00","end":"06:00"}');
+  assert.equal(isNightNow(overnight, new Date(2026, 10, 10, 23, 30)), true);
+  assert.equal(isNightNow(overnight, new Date(2026, 10, 10, 12, 0)), false);
+});
+
+test("Wave 1: readBackRecipeContext — session first, URL fallback, corrupt session falls through", () => {
+  globalThis.sessionStorage = {
+    getItem: (k) =>
+      k === "family-hub:recipe:state"
+        ? JSON.stringify({ openId: "rec-9", step: 4 })
+        : null,
+  };
+  assert.deepEqual(readBackRecipeContext("?from_recipe=rec-1&step=3"), {
+    recipeId: "rec-9",
+    step: 4,
+  });
+  globalThis.sessionStorage = { getItem: () => null };
+  assert.deepEqual(readBackRecipeContext("?from_recipe=rec-1&step=3"), {
+    recipeId: "rec-1",
+    step: "3",
+  });
+  assert.equal(readBackRecipeContext(""), null);
+  globalThis.sessionStorage = { getItem: () => "not json{" };
+  assert.deepEqual(readBackRecipeContext("?from_recipe=rec-1&step=3"), {
+    recipeId: "rec-1",
+    step: "3",
+  });
+  delete globalThis.sessionStorage;
+});
+
+test("Wave 1: _navigate is a no-op on the active Timers tab", () => {
+  const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+  // _lastNavigation starts null; a no-op navigate leaves it there.
+  assert.equal(card._lastNavigation, null);
+  card._navigate("/family-hub/timers");
+  assert.equal(card._lastNavigation, null);
+  card._navigate("/family-hub/timers?from_recipe=rec-1");
+  assert.equal(card._lastNavigation, null);
+});
+
+test("Wave 1: count badge always shows while timers exist — the scroll pill is independent, no reconciliation", () => {
+  const { card, dials } = pillCard();
+  try {
+    // A dial below the fold: the pill shows AND the count badge
+    // shows (2 active timers). Wave 1 moved the pill out of the
+    // strip, so the two no longer share a slot.
+    dials[0]._rect = { top: 100, bottom: 1100, left: 0, right: 600, width: 600, height: 1000 };
+    dials[1]._rect = { top: 1100, bottom: 1350, left: 0, right: 600, width: 600, height: 250 };
+    card._updateScrollPill();
+    assert.equal(card.shadowRoot.querySelector(".scroll-pill").hidden, false);
+    const countBadge = card.shadowRoot.querySelector(".timer-badge");
+    assert.equal(countBadge.hidden, false);
+    assert.equal(countBadge.textContent, "2");
+    // Scrolled to the bottom: the pill hides, the count stays.
+    dials[1]._rect = { top: 900, bottom: 1150, left: 0, right: 600, width: 600, height: 250 };
+    card._updateScrollPill();
+    assert.equal(card.shadowRoot.querySelector(".scroll-pill").hidden, true);
+    assert.equal(card.shadowRoot.querySelector(".timer-badge").hidden, false);
+    assert.equal(card.shadowRoot.querySelector(".timer-badge").textContent, "2");
+  } finally {
+    clearWindow();
+  }
+});
+
+// -- Wave 1: voice fallback trigger (D4 / T-IMPL-12) -----------------------
+// Voice is provably unavailable iff at least one assist_satellite
+// entity exists AND all of them are unavailable/unknown (or muted —
+// the defensive attr leg; HA 2026.10.4 exposes no mute state, so a
+// muted attr only counts when a custom integration provides one).
+// Zero satellites is NOT provably unavailable: fail open, no chips.
+
+test("voiceUnavailable: all satellites down, mixed, none, muted attr", () => {
+  const sat = (id, state, attrs = {}) => ({
+    entity_id: `assist_satellite.${id}`,
+    state,
+    attributes: attrs,
+  });
+  assert.equal(voiceUnavailable(null), false);
+  assert.equal(voiceUnavailable({}), false);
+  assert.equal(
+    voiceUnavailable({
+      "sensor.temperature": { entity_id: "sensor.temperature", state: "21" },
+    }),
+    false
+  );
+  assert.equal(voiceUnavailable({ "assist_satellite.kitchen": sat("kitchen", "unavailable") }), true);
+  assert.equal(voiceUnavailable({ "assist_satellite.kitchen": sat("kitchen", "unknown") }), true);
+  assert.equal(voiceUnavailable({ "assist_satellite.kitchen": sat("kitchen", "idle") }), false);
+  assert.equal(
+    voiceUnavailable({
+      "assist_satellite.kitchen": sat("kitchen", "unavailable"),
+      "assist_satellite.phone": sat("phone", "idle"),
+    }),
+    false
+  );
+  assert.equal(
+    voiceUnavailable({
+      "assist_satellite.kitchen": sat("kitchen", "idle", { muted: true }),
+    }),
+    true
+  );
+  assert.equal(
+    voiceUnavailable({
+      "assist_satellite.kitchen": sat("kitchen", "idle", { is_muted: true }),
+    }),
+    true
+  );
+});
+
+// -- Wave 1: PIP pin + Home arrival (D7.3 / T-IMPL-20/23) ------------------
+
+function memoryStorage(initial = {}) {
+  const store = new Map(Object.entries(initial));
+  return {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, v),
+    removeItem: (k) => store.delete(k),
+    _store: store,
+  };
+}
+
+test("readTimersPin: JSON object, plain string, missing, cleared after one read", () => {
+  assert.equal(readTimersPin(null), null);
+  assert.equal(readTimersPin(memoryStorage()), null);
+  const store = memoryStorage({
+    "family-hub:timers:pin": JSON.stringify({ timerId: "t2" }),
+  });
+  assert.equal(readTimersPin(store), "t2");
+  assert.equal(readTimersPin(store), null);
+  const plain = memoryStorage({ "family-hub:timers:pin": "t1" });
+  assert.equal(readTimersPin(plain), "t1");
+  assert.equal(readTimersPin(plain), null);
+});
+
+test("readTimersArrival: 'home' only, cleared after one read", () => {
+  assert.equal(readTimersArrival(null), false);
+  assert.equal(readTimersArrival(memoryStorage()), false);
+  const store = memoryStorage({ "family-hub:timers:arrival": "home" });
+  assert.equal(readTimersArrival(store), true);
+  assert.equal(readTimersArrival(store), false);
+  assert.equal(
+    readTimersArrival(memoryStorage({ "family-hub:timers:arrival": '"home"' })),
+    true
+  );
+  assert.equal(
+    readTimersArrival(memoryStorage({ "family-hub:timers:arrival": "recipes" })),
+    false
+  );
+});
+
+test("a PIP pin puts that timer first with a 'Just started' marker, read once per mount (D7.3)", () => {
+  const storage = memoryStorage({
+    "family-hub:timers:pin": JSON.stringify({ timerId: "t2" }),
+  });
+  globalThis.sessionStorage = storage;
+  try {
+    const card = timerCard([
+      timerState("t1", "Pasta", "active", { remaining: 300 }),
+      timerState("t2", "Rice", "active", { remaining: 600 }),
+    ]);
+    const dials = [...card.shadowRoot.querySelectorAll(".dial")];
+    assert.equal(dials[0].dataset.timerId, "t2");
+    assert.equal(
+      card.shadowRoot.querySelector('[data-started="t2"]').textContent,
+      "Just started"
+    );
+    assert.equal(
+      card.shadowRoot.querySelector('[data-started="t1"]').textContent,
+      ""
+    );
+    // The pin was consumed: a second mount with the same storage
+    // does not re-pin — t1 (300 s, soonest) sorts first again.
+    const second = timerCard([
+      timerState("t1", "Pasta", "active", { remaining: 300 }),
+      timerState("t2", "Rice", "active", { remaining: 600 }),
+    ]);
+    assert.equal(
+      [...second.shadowRoot.querySelectorAll(".dial")][0].dataset.timerId,
+      "t1"
+    );
+  } finally {
+    delete globalThis.sessionStorage;
+  }
+});
+
+// -- Wave 1: finished-section collapse rules (D1.2) ------------------------
+
+test("the finished section is forced open while any timer is ringing, collapsed otherwise with timers running", () => {
+  const card = timerCard([
+    timerState("t1", "Pasta", "active", { remaining: 600 }),
+    timerState("t2", "Tea", "ringing", {
+      finishedAt: new Date(Date.now() - 20000).toISOString(),
+    }),
+  ]);
+  const header = card.shadowRoot.querySelector(".finished-header");
+  assert.equal(header.getAttribute("aria-expanded"), "true");
+  assert.equal(
+    card.shadowRoot.querySelector('[data-finished-sub="t2"]').textContent,
+    "Ringing · Tap to dismiss"
+  );
+  // Ringing over, finished only: the section falls back to the
+  // running-timers rule (collapsed while a timer runs).
+  const settled = timerCard([
+    timerState("t1", "Pasta", "active", { remaining: 600 }),
+    timerState("t2", "Tea", "finished", {
+      finishedAt: new Date(Date.now() - 20000).toISOString(),
+    }),
+  ]);
+  assert.equal(
+    settled.shadowRoot.querySelector(".finished-header").getAttribute("aria-expanded"),
+    "false"
+  );
+  // Nothing running: expanded on arrival.
+  const alone = timerCard([
+    timerState("t2", "Tea", "finished", {
+      finishedAt: new Date(Date.now() - 20000).toISOString(),
+    }),
+  ]);
+  assert.equal(
+    alone.shadowRoot.querySelector(".finished-header").getAttribute("aria-expanded"),
+    "true"
+  );
+});
+
+test("the finished section closes again on the same mount once the ringing window ends", () => {
+  const card = timerCard([
+    timerState("t1", "Pasta", "active", { remaining: 600 }),
+    timerState("t2", "Tea", "ringing", {
+      finishedAt: new Date(Date.now() - 20000).toISOString(),
+    }),
+  ]);
+  const header = () => card.shadowRoot.querySelector(".finished-header");
+  // Forced open while ringing.
+  assert.equal(header().getAttribute("aria-expanded"), "true");
+  // Ringing over on the SAME card: re-sync with Tea settled finished.
+  // The old code stored the ringing force in _finishedOpen, so the
+  // section stuck open after the window (rig: still expanded 90 s
+  // after the ring with Pasta running). D1.2 says collapsed by default
+  // whenever anything runs, so it must fall back to collapsed.
+  card.hass = fakeHass([
+    timerState("t1", "Pasta", "active", { remaining: 600 }),
+    timerState("t2", "Tea", "finished", {
+      finishedAt: new Date(Date.now() - 20000).toISOString(),
+    }),
+  ]);
+  assert.equal(header().getAttribute("aria-expanded"), "false");
+});
+
+test("the finished-section toggle flips it and survives a re-sync", () => {
+  const card = timerCard([
+    timerState("t1", "Pasta", "active", { remaining: 600 }),
+    timerState("t2", "Tea", "finished", {}),
+  ]);
+  const header = () => card.shadowRoot.querySelector(".finished-header");
+  assert.equal(header().getAttribute("aria-expanded"), "false");
+  card._onClick({
+    target: { closest: () => ({ dataset: { action: "finished-toggle" } }) },
+  });
+  assert.equal(header().getAttribute("aria-expanded"), "true");
+  // A re-sync (same timers) keeps the user's toggle state.
+  card.hass = fakeHass([
+    timerState("t1", "Pasta", "active", { remaining: 600 }),
+    timerState("t2", "Tea", "finished", {}),
+  ]);
+  assert.equal(header().getAttribute("aria-expanded"), "true");
+});
+
+// -- Wave 1: time fit inside the ring (T-IMPL-5 / NAV-O2) -----------------
+
+test("_fitTimes: a time that fits at CSS size is untouched; one wider than the ring steps to the 40px floor", () => {
+  const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+  const refs = card._dialEls.get("t1")._refs;
+  refs.button._rect = { top: 0, bottom: 200, left: 0, right: 200, width: 200, height: 200 };
+  // Fits: 150px wide in a 200px ring (limit 184px).
+  refs.time.scrollWidth = 150;
+  card._fitTimes();
+  assert.equal(refs.time.style.fontSize, undefined);
+  // Too wide: the pinned scrollWidth never shrinks, so the fit runs
+  // the whole ladder and lands on the 40px floor.
+  refs.time.scrollWidth = 500;
+  card._fitTimes();
+  assert.equal(refs.time.style.fontSize, "40px");
+});
+
+test("_fitTimes: skips silently with no layout engine (no scrollWidth, zero ring width)", () => {
+  const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+  const refs = card._dialEls.get("t1")._refs;
+  // No scrollWidth pinned at all: the guard skips the dial.
+  card._fitTimes();
+  assert.equal(refs.time.style.fontSize, undefined);
+  // A zero-width ring is skipped too.
+  refs.time.scrollWidth = 500;
+  refs.button._rect = { top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0 };
+  card._fitTimes();
+  assert.equal(refs.time.style.fontSize, undefined);
+});
+
+// -- Wave 1: soon flip from the sensor's remaining (T-IMPL-13 / OQ-5) -----
+
+test("the soon word flips at 59 s from the sensor remaining, not the displayed time", () => {
+  const soon = timerCard([timerState("t1", "Pasta", "active", { remaining: 59 })]);
+  assert.equal(
+    soon.shadowRoot.querySelector('[data-state="t1"]').textContent,
+    "Soon · Tap to pause"
+  );
+  assert.equal(soon.shadowRoot.querySelector('[data-hint="t1"]').textContent, "");
+  const notSoon = timerCard([timerState("t1", "Pasta", "active", { remaining: 60 })]);
+  assert.equal(notSoon.shadowRoot.querySelector('[data-state="t1"]').textContent, "");
+  assert.equal(
+    notSoon.shadowRoot.querySelector('[data-hint="t1"]').textContent,
+    "Tap to pause"
+  );
+  // Paused at 30 s: "Paused", never "Soon".
+  const paused = timerCard([timerState("t1", "Pasta", "paused", { remaining: 30 })]);
+  assert.equal(paused.shadowRoot.querySelector('[data-state="t1"]').textContent, "Paused");
+  assert.equal(
+    paused.shadowRoot.querySelector('[data-hint="t1"]').textContent,
+    "Tap to resume"
+  );
 });

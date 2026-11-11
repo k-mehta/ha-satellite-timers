@@ -147,7 +147,7 @@ const TIMER = [
   // shorthand of the token's #FFFFFF) — same value, shorter spelling.
   // Asserted in context (the full rule), not as a bare "#fff".
   ["palette", "color-on-accent", () => `.nav-strip-button.active { background: ${tokenValue("palette", "color-accent")}; border-color: ${tokenValue("palette", "color-accent")}; color: #fff; font-weight: 800; }`],
-  ["palette", "color-on-error", () => `.controls button.cancel { background: ${tokenValue("palette", "color-danger")}; border-color: ${tokenValue("palette", "color-danger")}; color: #fff; }`],
+  ["palette", "color-on-error", () => `.controls button.cancel { background: ${tokenValue("palette", "color-danger")}; border-color: ${tokenValue("palette", "color-danger")}; color: #fff;`],
   // Card surfaces use the HA var with the #fff shorthand fallback.
   ["palette", "color-card", () => "background: var(--card-background-color, #fff);"],
   // Borders are the line token (the card used #e0e0e0 until this fix
@@ -155,47 +155,54 @@ const TIMER = [
   ["palette", "color-line", (v) => `border: 1px solid ${v};`],
   // Paused ring opacity (the token lives in the palette group).
   ["palette", "state-paused-opacity", (v) => `.ring.paused { stroke: ${tokenValue("palette", "color-timer-running")}; opacity: ${v}; }`],
-  // Motion: the soon pulse and the cancel-arm pulse.
+  // Motion: the soon pulse only. The cancel-arm pulse is gone in
+  // Wave 1 — the arm is a width drain (arm-drain), not a pulse
+  // (see SKIPPED).
   ["motion", "motion-soon-pulse", (v) => `animation: soon-pulse ${v};`],
-  ["motion", "motion-cancel-arm-pulse", (v) => `animation: cancel-arm-pulse ${v};`],
-  // Dial type (TIMER-6 hub minima).
-  ["type", "font-dial-name-hub", (v) => new RegExp(`\\.name \\{[^}]*font-size: ${esc(v)};`)],
+  // Dial type (TIMER-6 hub minima). Wave 1: the name class is
+  // .dial-name now (the old .name overlay is deleted).
+  ["type", "font-dial-name-hub", (v) => new RegExp(`\\.dial-name \\{[^}]*font-size: ${esc(v)};`)],
   ["type", "font-dial-time-hub", (v) => `font-size: clamp(40px, 11vw, ${v});`],
   ["type", "font-dial-state-hub", (v) => new RegExp(`\\.state \\{[^}]*font-size: ${esc(v)};`)],
   ["type", "font-dial-hint-hub", (v) => new RegExp(`\\.hint \\{[^}]*font-size: ${esc(v)};`)],
-  ["type", "line-height-timer-name", (v) => new RegExp(`\\.name \\{[^}]*line-height: ${esc(v)};`)],
-  // Targets: hub controls 80px, hub strip button 64px, tablet
-  // controls 64px / strip 56px, phone strip button 48px.
+  ["type", "line-height-timer-name", (v) => new RegExp(`\\.dial-name \\{[^}]*line-height: ${esc(v)};`)],
+  // Targets: hub controls 80px, tablet controls 64px. The strip
+  // buttons are the full bar height now (D-N1, wave 1 — 96/72/64/56 px
+  // bars, no min-height), so target-hub-min / target-tablet-min /
+  // target-phone-min are no longer consumed here (see SKIPPED).
   ["targets", "target-hub-max", (v) => new RegExp(`\\.controls button \\{[^}]*min-height: ${esc(v)};`)],
-  ["targets", "target-hub-min", (v) => new RegExp(`\\.nav-strip-button \\{[^}]*min-height: ${esc(v)};`)],
   ["targets", "target-tablet-max", (v) => `.screen.dev-tablet .controls button { min-height: ${v};`],
-  ["targets", "target-tablet-min", (v) => `.screen.dev-tablet .nav-strip-button { min-height: ${v};`],
-  ["targets", "target-phone-min", (v) => `.screen.dev-mobile .nav-strip-button { min-height: ${v};`],
   // Radii: rows 16px, the circular dial button 50%.
   ["radius", "radius-row", (v) => `border-radius: ${v};`],
   ["radius", "radius-dial", (v) => `.dial-button:focus-visible { outline: 2px solid ${tokenValue("palette", "color-accent")}; outline-offset: 4px; border-radius: ${v}; }`],
-  // Spacing: strip bottom pad 4px, dial-text side pad 8px, controls
-  // gap 12px, screen gap 16px, screen padding 24px.
-  ["spacing", "space-1", (v) => `padding: 16px 0 ${v};`],
-  ["spacing", "space-2", (v) => `padding: 0 ${v} var(--controls-reserve) ${v};`],
+  // Spacing: controls gap 12px, screen gap 16px, screen padding
+  // 24px. space-2 was the .dial-text overlay's side pad
+  // (padding: 0 8px var(--controls-reserve) 8px) — the overlay is
+  // deleted in Wave 1, so space-2 is no longer consumed here (see
+  // SKIPPED). space-1 was the strip's bottom pad (16px 0 4px) — the
+  // strip has no padding now (D-N1, wave 1), so space-1 is no longer
+  // consumed here (see SKIPPED).
   ["spacing", "space-3", (v) => `.controls { display: flex; gap: ${v};`],
   ["spacing", "space-4", (v) => new RegExp(`\\.screen \\{[^}]*gap: ${esc(v)};`)],
   ["spacing", "space-5", (v) => new RegExp(`\\.screen \\{[^}]*padding: ${esc(v)};`)],
-  // Elevation: the strip button's card shadow and its hover lift.
-  ["elevation", "shadow-card", (v) => `box-shadow: ${v};`],
-  ["elevation", "shadow-lift", (v) => `box-shadow: ${v};`],
+  // Elevation: the strip buttons are flat now (D-N1, wave 1 — no
+  // card shadow, no hover lift, no box-shadow anywhere in the card),
+  // so shadow-card / shadow-lift are no longer consumed here (see
+  // SKIPPED).
 ];
 
 test("DESIGN-1 Part B: the timer card inlines the tokens it consumes (values read from the JSON)", () => {
   for (const [group, key, pattern] of TIMER) {
     has(TIMER_CSS, pattern(tokenValue(group, key)), `timer card must inline ${group}.${key}`);
   }
-  // The line token's count pins all six border rules (controls,
-  // back-bar, preset chip, nav-strip button, compact row,
-  // compact restart) — a seventh border, or a drifted one, fails.
+  // The line token's count pins all seven border rules (controls,
+  // add-timer button, back-bar, preset chip, finished header,
+  // finished row, finished restart — the nav-strip button is
+  // borderless since wave 1, D-N1) — an eighth border, or a drifted
+  // one, fails.
   const line = tokenValue("palette", "color-line");
   const count = TIMER_CSS.split(`border: 1px solid ${line};`).length - 1;
-  assert.equal(count, 6, `expected 6 borders in ${line}, found ${count}`);
+  assert.equal(count, 7, `expected 7 borders in ${line}, found ${count}`);
 });
 
 // Tokens Part B does NOT assert, with the reason each is skipped.
@@ -212,7 +219,7 @@ const SKIPPED = {
     "palette.color-warning",
     "palette.color-on-warning",
   ],
-  "screen is transparent; the strip uses HA --primary-background-color": [
+  "screen is transparent; the strip is solid dark #171717 (D-N1, wave 1 — not a token)": [
     "palette.color-screen-bg",
   ],
   "no notes/paper surfaces in the timer card": [
@@ -229,6 +236,14 @@ const SKIPPED = {
     "elevation.shadow-accent",
     "elevation.shadow-tab",
   ],
+  "wave 1 (D-N1): the strip buttons are flat, full-bar-height, borderless — no min-height, no strip padding, no shadow": [
+    "targets.target-hub-min",
+    "targets.target-tablet-min",
+    "targets.target-phone-min",
+    "spacing.space-1",
+    "elevation.shadow-card",
+    "elevation.shadow-lift",
+  ],
   "no icons sized by the timer card": [
     "icon.icon-desktop",
     "icon.icon-hub",
@@ -238,6 +253,12 @@ const SKIPPED = {
   "no screensaver in the timer card": [
     "motion.motion-screensaver-enter",
     "motion.motion-screensaver-exit",
+  ],
+  "wave 1: the cancel arm is a width drain (arm-drain), not a pulse — the arm-pulse token is not consumed": [
+    "motion.motion-cancel-arm-pulse",
+  ],
+  "wave 1: the .dial-text overlay (and its --controls-reserve padding) is deleted — the name sits above the ring": [
+    "spacing.space-2",
   ],
   "radius tokens for surfaces the timer card does not have": [
     "radius.radius-chip",
@@ -324,6 +345,6 @@ test("DESIGN-1 Part B completeness: every scalar token is asserted, Part-A-cover
     all,
     "every scalar token must be asserted, Part-A-covered, or skipped with a reason"
   );
-  assert.equal(asserted.length, 35, `expected 35 asserted tokens, got ${asserted.length}`);
-  assert.equal(skipped.length, 82, `expected 82 skipped tokens, got ${skipped.length}`);
+  assert.equal(asserted.length, 27, `expected 27 asserted tokens, got ${asserted.length}`);
+  assert.equal(skipped.length, 90, `expected 90 skipped tokens, got ${skipped.length}`);
 });

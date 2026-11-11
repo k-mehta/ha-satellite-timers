@@ -36,6 +36,7 @@ for dashboard dials instead of driving a clock.
 from __future__ import annotations
 
 from collections.abc import Callable
+import uuid
 from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 import logging
@@ -52,6 +53,23 @@ _LOGGER = logging.getLogger(__name__)
 DOMAIN = "satellite_timers"
 TIMER_DATA = "intent.timer"  # homeassistant.components.intent.const.TIMER_DATA
 _TAP = f"{DOMAIN}_assist_tap"
+# How long a finished timer reports as "ringing" after it goes off
+# (RINGING-1, Timers wave 1): Home Assistant cannot observe when the
+# satellite stops its alarm — the FINISHED event is forwarded one-way
+# (HA 2026.10.4: TimerManager pops the timer at finish, cancel_timer
+# raises TimerNotFoundError for a finished id, and the Wyoming satellite
+# handler has no back-channel). The only HA-visible stops are this
+# bridge's dismiss_timer / restart_timer. So the sensor reports
+# "ringing" for a 60 s window after finished_at, then flips to
+# "finished" — the window is a POLICY, not a satellite measurement.
+# 60 s is the design's own idle horizon (ruling 1: the wall may go
+# ambient 60 s after a timer finishes), so a timer finished >60 s ago
+# with no interaction is, by the ruling's own words, a finished timer.
+# A re-asserted FINISHED (satellite reconnect, missed-timer
+# announcement) restarts the window from the announcement — the
+# satellite is ringing again from that moment. Single named constant,
+# trivially adjustable when the live hub (OQ-6) says otherwise.
+RINGING_WINDOW_SECONDS = 60
 # How long a persisted timer for a device this bridge no longer mirrors
 # is kept (P8-1): a finished timer's useful life is hours, and a device
 # absent 7 days is decommissioned, not temporarily disconnected. A ghost
@@ -69,14 +87,24 @@ class TimerSnapshot:
     ``is_finished`` marks a timer that already went off: Home Assistant
     pops it from the TimerManager the moment it finishes, but the bridge
     keeps the record until it is dismissed, so the dashboard can show a
-    "done" state instead of the dial vanishing mid-ring. ``language`` is
-    the timer's language, kept so a finished timer can be restarted with
-    the same voice. ``started_at`` is when the timer started (wall
-    clock), so duplicate names can be told apart ("Pasta — started
-    6:02 PM", TIMER-11). ``started_via_service`` marks timers created
-    through the bridge's ``start_timer`` service (recipe chips, preset
-    chips, Undo) as opposed to voice: the timer-jump automation must
-    NOT fire for those (BRIDGE-1).
+    "done" state instead of the dial vanishing mid-ring. ``is_ringing``
+    marks a finished timer inside its ringing window (RINGING-1): the
+    sensor reports "ringing" for ``RINGING_WINDOW_SECONDS`` after
+    ``finished_at`` (or after a re-asserted FINISHED, see
+    ``ringing_until``), then flips to plain finished. ``ringing_until``
+    is only stored when a re-assertion extends the window past
+    ``finished_at + RINGING_WINDOW_SECONDS``; otherwise it is None and
+    the window is derived from ``finished_at``. A restored finished
+    timer whose record carries ``ringing_until == finished_at`` never
+    reports ringing — it was restored without re-ringing the satellite
+    (see restore_finished). ``language`` is the timer's language, kept
+    so a finished timer can be restarted with the same voice.
+    ``started_at`` is when the timer started (wall clock), so duplicate
+    names can be told apart ("Pasta — started 6:02 PM", TIMER-11).
+    ``started_via_service`` marks timers created through the bridge's
+    ``start_timer`` service (recipe chips, preset chips, Undo) as
+    opposed to voice: the timer-jump automation must NOT fire for
+    those (BRIDGE-1).
     """
 
     timer_id: str
@@ -91,6 +119,8 @@ class TimerSnapshot:
     language: str = "en"
     started_at: datetime | None = None
     started_via_service: bool = False
+    is_ringing: bool = False
+    ringing_until: datetime | None = None
 
 
 # ------------------------------------------------------------------ internals
@@ -333,6 +363,27 @@ class SatelliteTimerBridge:
             if self._hass.data.get(_TAP) is tap:
                 self._hass.data.pop(_TAP, None)
 
+    @staticmethod
+    def _with_ringing(snap: TimerSnapshot, now: datetime) -> TimerSnapshot:
+        """A finished snapshot with ``is_ringing`` derived (RINGING-1).
+
+        Ringing ends at ``ringing_until`` when a re-assertion extended
+        the window, otherwise at ``finished_at + RINGING_WINDOW``. A
+        non-finished snapshot is returned unchanged. The stored record
+        is never mutated here — ringing is derived at read time, so a
+        restart cannot resurrect a window that already expired.
+        """
+        if not snap.is_finished:
+            return snap
+        until = snap.ringing_until
+        if until is None and snap.finished_at is not None:
+            until = snap.finished_at + timedelta(
+                seconds=RINGING_WINDOW_SECONDS
+            )
+        return dataclass_replace(
+            snap, is_ringing=until is not None and now < until
+        )
+
     def snapshot(self, now: datetime) -> dict[str, TimerSnapshot]:
         """Current timers for the chosen satellites, keyed by timer id.
 
@@ -419,9 +470,14 @@ class SatelliteTimerBridge:
                 )
                 self._finished[timer_id] = finished
                 del self._restored[timer_id]
-                self._announce_finished(finished)
+                # _announce_finished returns the stored record with its
+                # ringing window restarted from the announcement (the
+                # satellite rings from NOW, even though finished_at is
+                # in the past) — emit that, not the pre-announcement
+                # copy, so is_ringing is true for the window.
+                finished = self._announce_finished(finished)
                 changed = True
-                out[timer_id] = finished
+                out[timer_id] = self._with_ringing(finished, now)
                 continue
             if restored.is_active and restored.finishes_at is not None:
                 remaining = max(
@@ -432,11 +488,11 @@ class SatelliteTimerBridge:
                     restored, seconds_left=remaining
                 )
             else:
-                out[timer_id] = restored
+                out[timer_id] = self._with_ringing(restored, now)
 
         for timer_id, finished in self._finished.items():
             if finished.device_id in self._devices:
-                out[timer_id] = finished
+                out[timer_id] = self._with_ringing(finished, now)
 
         if changed:
             self._notify_listeners()
@@ -507,6 +563,140 @@ class SatelliteTimerBridge:
         finally:
             self._service_start_in_flight -= 1
         self._service_started.add(timer_id)
+        self._notify_listeners()
+        return timer_id
+
+    # ------------------------------------------------------- undo restore
+    #
+    # D6: Undo on a cancelled or dismissed timer puts the timer back
+    # with its REMAINING time (not the full duration), in the state it
+    # was in (a paused timer comes back paused). There is no
+    # card-side way to do that atomically: re-create-then-pause through
+    # the public services leaves a window where the 1 s sensor tick
+    # can observe the restored timer as active. So the bridge does it
+    # in one call, with no await between start and pause — inside one
+    # event-loop turn nothing else can observe the intermediate state.
+
+    def restore_timer(
+        self,
+        device_id: str,
+        name: str,
+        seconds_left: int,
+        paused: bool,
+        language: str = "en",
+    ) -> str:
+        """Re-create a cancelled timer with its remaining time (D6 Undo).
+
+        ``seconds_left`` is the time left when it was cancelled (min
+        1 s); a paused timer comes back paused, a running one comes
+        back running. The new timer gets a NEW id (ids never repeat)
+        and is marked service-started, so the timer-jump automation
+        does not fire for it. Its started_at is the restore time:
+        the live snapshot derives started_at from the new start, so
+        an original start time passed in would be overwritten on the
+        first tick (a restored timer re-appeared now — that is the
+        honest value, and it still distinguishes duplicate names).
+        Raises ValueError for a bad device, duration or pause failure.
+        """
+        if seconds_left < 1:
+            raise ValueError("Duration must be at least 1 second")
+        if device_id not in self._devices:
+            raise ValueError(f"Device {device_id} is not a configured satellite")
+
+        tm = timer_manager(self._hass)
+        if tm is None:
+            raise ValueError("Assist timer manager is not available")
+
+        hours, remainder = divmod(seconds_left, 3600)
+        mins, secs = divmod(remainder, 60)
+        # Same ordering as start_timer (BRIDGE-1): HA fires STARTED
+        # synchronously inside start_timer, so the in-flight flag marks
+        # the new id in _event before any listener reads a snapshot.
+        self._service_start_in_flight += 1
+        try:
+            timer_id = tm.start_timer(
+                device_id,
+                hours or None,
+                mins or None,
+                secs or None,
+                language,
+                name=name or None,
+            )
+        finally:
+            self._service_start_in_flight -= 1
+        self._service_started.add(timer_id)
+        if paused:
+            try:
+                tm.pause_timer(timer_id)
+            except Exception:
+                # A half-restored timer (running when it should be
+                # paused) is worse than a failed Undo: drop the new
+                # timer and fail loudly, so nothing is left in an
+                # unexpected state.
+                try:
+                    tm.cancel_timer(timer_id)
+                except Exception:
+                    pass
+                self._service_started.discard(timer_id)
+                self._started_at.pop(timer_id, None)
+                raise ValueError(
+                    f"Could not pause restored timer {timer_id}"
+                ) from None
+        self._notify_listeners()
+        return timer_id
+
+    def restore_finished(
+        self,
+        device_id: str,
+        name: str,
+        total_seconds: int,
+        finished_at: datetime,
+        started_via_service: bool,
+        language: str = "en",
+        started_at: datetime | None = None,
+    ) -> str:
+        """Put back a dismissed finished timer, WITHOUT re-ringing (D6).
+
+        Inserts a finished record directly with a NEW timer id — no
+        ``_announce_finished``: the satellite was already told to stop
+        ringing when the timer was dismissed, and Undo must not ring
+        it again. ``finished_at`` is preserved, so "Done — N min ago"
+        is identical to before the dismiss. ``ringing_until`` is set
+        to ``finished_at`` (already expired), so the restored record
+        never reports "ringing" — only a timer the satellite is
+        actually ringing for may report it. Returns the new timer id.
+        Raises ValueError for a bad device, duration or missing
+        finished_at.
+        """
+        if total_seconds < 1:
+            raise ValueError("Duration must be at least 1 second")
+        if device_id not in self._devices:
+            raise ValueError(f"Device {device_id} is not a configured satellite")
+        if finished_at is None:
+            raise ValueError("finished_at is required")
+
+        timer_id = uuid.uuid4().hex
+        if started_at is None:
+            started_at = finished_at - timedelta(seconds=total_seconds)
+        snap = TimerSnapshot(
+            timer_id,
+            name,
+            device_id,
+            False,
+            total_seconds,
+            0,
+            None,
+            is_finished=True,
+            finished_at=finished_at,
+            ringing_until=finished_at,
+            language=language,
+            started_at=started_at,
+            started_via_service=started_via_service,
+        )
+        self._finished[timer_id] = snap
+        if started_via_service:
+            self._service_started.add(timer_id)
+        self._started_at[timer_id] = started_at
         self._notify_listeners()
         return timer_id
 
@@ -748,6 +938,11 @@ class SatelliteTimerBridge:
                         if snap.finished_at is not None
                         else None
                     ),
+                    "ringing_until": (
+                        snap.ringing_until.isoformat()
+                        if snap.ringing_until is not None
+                        else None
+                    ),
                     "started_at": (
                         snap.started_at.isoformat()
                         if snap.started_at is not None
@@ -805,6 +1000,7 @@ class SatelliteTimerBridge:
         state = record.get("state")
         finishes_at = _parse(record.get("finishes_at"))
         finished_at = _parse(record.get("finished_at"))
+        ringing_until = _parse(record.get("ringing_until"))
         started_at = _parse(record.get("started_at"))
         if state == "finished":
             if finished_at is None:
@@ -821,6 +1017,7 @@ class SatelliteTimerBridge:
                 None,
                 is_finished=True,
                 finished_at=finished_at,
+                ringing_until=ringing_until,
                 language=str(record.get("language") or "en"),
                 started_at=started_at,
                 started_via_service=bool(record.get("started_via_service")),
@@ -930,7 +1127,7 @@ class SatelliteTimerBridge:
         """
         self._send_to_satellite(finished, "cancelled")
 
-    def _announce_finished(self, finished: TimerSnapshot) -> None:
+    def _announce_finished(self, finished: TimerSnapshot) -> TimerSnapshot:
         """Tell the satellite a timer finished, so it rings (BRIDGE-3).
 
         Used when the satellite (re)connects with a finished timer
@@ -939,8 +1136,25 @@ class SatelliteTimerBridge:
         to the satellite's ORIGINAL handler, not the tap-wrapped one:
         the bridge already recorded this finish, and re-notifying
         itself would reset the finished_at clock.
+
+        The announcement (re)starts the satellite's alarm from NOW, so
+        the stored record's ringing window restarts from now too
+        (RINGING-1) and the returned snapshot is the stored record
+        with that window — callers must emit the return value, not the
+        snapshot they passed in, or ``is_ringing`` derives from the
+        (possibly long-past) finished_at instead.
         """
+        now = datetime.now(timezone.utc)
+        held = self._finished.get(finished.timer_id)
+        if held is not None:
+            held = dataclass_replace(
+                held,
+                ringing_until=now
+                + timedelta(seconds=RINGING_WINDOW_SECONDS),
+            )
+            self._finished[finished.timer_id] = held
         self._send_to_satellite(finished, "finished")
+        return held if held is not None else finished
 
     def _on_handler_registered(self, device_id: str) -> None:
         """A satellite (re)registered its timer handler.

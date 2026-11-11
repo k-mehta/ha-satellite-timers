@@ -4,13 +4,13 @@ Voice timers set on a satellite live in Home Assistant's memory only, so no
 card or automation can see them. This integration reads them through the
 bridge in ``bridge.py`` and exposes one sensor per timer, which a dial card
 can then show. It registers services (pause_timer, resume_timer,
-cancel_timer, add_time, dismiss_timer, restart_timer, start_timer) so a
-dashboard card can control a timer by its id and start new timers by name
-and duration, and a "dismiss the pasta timer" voice intent (see
-``intents.py``) for the finished timers the built-in sentences cannot
-reach. The bridge persists timers to HA storage and restores them on
-start, so timers survive a restart — the bridge, not the satellite, is
-the source of truth for timer state.
+cancel_timer, add_time, dismiss_timer, restart_timer, start_timer,
+restore_timer, restore_finished_timer) so a dashboard card can control a
+timer by its id and start new timers by name and duration, and a "dismiss
+the pasta timer" voice intent (see ``intents.py``) for the finished timers
+the built-in sentences cannot reach. The bridge persists timers to HA
+storage and restores them on start, so timers survive a restart — the
+bridge, not the satellite, is the source of truth for timer state.
 """
 
 from __future__ import annotations
@@ -51,6 +51,8 @@ from .const import (
     SERVICE_DISMISS_TIMER,
     SERVICE_PAUSE_TIMER,
     SERVICE_RESTART_TIMER,
+    SERVICE_RESTORE_FINISHED_TIMER,
+    SERVICE_RESTORE_TIMER,
     SERVICE_RESUME_TIMER,
     SERVICE_START_TIMER,
 )
@@ -217,6 +219,40 @@ _START_TIMER_SCHEMA = vol.Schema(
         vol.Required("name"): cv.string,
         vol.Required("duration"): vol.Coerce(int),
         vol.Optional("satellite"): cv.string,
+    }
+)
+
+
+def _parse_iso_datetime(value: str, field: str) -> datetime:
+    """Parse an ISO-8601 datetime; a naive value is read as UTC."""
+    from datetime import datetime, timezone
+
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise HomeAssistantError(f"{field} is not a valid ISO-8601 datetime") from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+_RESTORE_TIMER_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): cv.string,
+        vol.Required("duration"): vol.Coerce(int),
+        vol.Optional("paused", default=False): cv.boolean,
+        vol.Optional("satellite"): cv.string,
+    }
+)
+
+_RESTORE_FINISHED_SCHEMA = vol.Schema(
+    {
+        vol.Required("name"): cv.string,
+        vol.Required("total_seconds"): vol.Coerce(int),
+        vol.Required("finished_at"): cv.string,
+        vol.Optional("satellite"): cv.string,
+        vol.Optional("started_via_service", default=False): cv.boolean,
+        vol.Optional("started_at"): cv.string,
     }
 )
 
@@ -447,6 +483,81 @@ def _register_services(
             raise HomeAssistantError(str(err)) from None
         return {"entity_id": f"sensor.satellite_timer_{timer_id.lower()}"}
 
+    async def handle_restore(call) -> dict:
+        """Put a cancelled timer back with its remaining time (D6 Undo).
+
+        ``duration`` is the SECONDS LEFT when it was cancelled (not the
+        full duration); ``paused`` restores it paused. Returns the new
+        timer sensor's entity id. A chip-started Undo must not trigger
+        the timer-jump automation — the bridge marks the restore
+        service-started, like start_timer.
+        """
+        name = str(call.data["name"]).strip()
+        if not name:
+            raise HomeAssistantError("Timer name is required")
+        duration = call.data["duration"]
+        if duration < 1:
+            raise HomeAssistantError(
+                "Duration must be at least 1 second"
+            )
+        satellite = call.data.get("satellite")
+        device_id = _resolve_satellite_device(hass, bridge, satellite)
+        try:
+            timer_id = bridge.restore_timer(
+                device_id,
+                name,
+                duration,
+                call.data["paused"],
+            )
+        except TimersNotSupportedError:
+            label = satellite or "the kitchen satellite"
+            raise HomeAssistantError(
+                f"Satellite {label} is not reachable right now — say "
+                f"'Okay Nabu, set a {name} timer' instead"
+            ) from None
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
+        return {"entity_id": f"sensor.satellite_timer_{timer_id.lower()}"}
+
+    async def handle_restore_finished(call) -> dict:
+        """Put a dismissed finished timer back, WITHOUT re-ringing (D6).
+
+        The finished record is restored with its original ``finished_at``
+        (so "Done — N min ago" is identical) and a NEW timer id. The
+        satellite is NOT told to ring again. Returns the restored timer
+        sensor's entity id.
+        """
+        name = str(call.data["name"]).strip()
+        if not name:
+            raise HomeAssistantError("Timer name is required")
+        total_seconds = call.data["total_seconds"]
+        if total_seconds < 1:
+            raise HomeAssistantError(
+                "total_seconds must be at least 1 second"
+            )
+        satellite = call.data.get("satellite")
+        device_id = _resolve_satellite_device(hass, bridge, satellite)
+        finished_at = _parse_iso_datetime(
+            call.data["finished_at"], "finished_at"
+        )
+        started_at = (
+            _parse_iso_datetime(call.data["started_at"], "started_at")
+            if call.data.get("started_at")
+            else None
+        )
+        try:
+            timer_id = bridge.restore_finished(
+                device_id,
+                name,
+                total_seconds,
+                finished_at,
+                call.data["started_via_service"],
+                started_at=started_at,
+            )
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from None
+        return {"entity_id": f"sensor.satellite_timer_{timer_id.lower()}"}
+
     hass.services.async_register(
         DOMAIN, SERVICE_PAUSE_TIMER, handle_pause, schema=_TIMER_ID_SCHEMA
     )
@@ -472,6 +583,20 @@ def _register_services(
         schema=_START_TIMER_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
     )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESTORE_TIMER,
+        handle_restore,
+        schema=_RESTORE_TIMER_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESTORE_FINISHED_TIMER,
+        handle_restore_finished,
+        schema=_RESTORE_FINISHED_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
 
 
 def _unregister_services(hass: HomeAssistant) -> None:
@@ -484,6 +609,8 @@ def _unregister_services(hass: HomeAssistant) -> None:
         SERVICE_DISMISS_TIMER,
         SERVICE_RESTART_TIMER,
         SERVICE_START_TIMER,
+        SERVICE_RESTORE_TIMER,
+        SERVICE_RESTORE_FINISHED_TIMER,
     ):
         hass.services.async_remove(DOMAIN, service)
 

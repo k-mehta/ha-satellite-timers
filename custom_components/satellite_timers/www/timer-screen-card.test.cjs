@@ -287,19 +287,16 @@ const {
   voiceUnavailable,
   readTimersPin,
   readTimersArrival,
-  detectDevice,
-  isKioskMode,
-  readKioskFlag,
-  storeKioskFlag,
-  isKioskSession,
-  withKioskQuery,
+  CORE_RESOURCE_PATH,
+  CORE_LOOKUP_RETRY_THROTTLE_MS,
+  CORE_LOOKUP_INTERVAL_MS,
+  _setCoreForTests,
   timerBadgeState,
   timerBadgeFromHassStates,
   parseNightSetting,
   readNightSetting,
   isNightNow,
   readBackRecipeContext,
-  readDeviceEnv,
   readRecipeContext,
   NAV_STRIP_VIEWS,
   TimerScreenCard,
@@ -310,6 +307,80 @@ const {
 } = require("./timer-screen-card.js");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// core.js is an ES module in the pi-family-hub repo — node loads it
+// through a byte-identical .mjs copy (same pattern as the core suite).
+// The timer card imports core for identity, so its tests load the
+// real core rather than a stub.
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const timerModule = require("./timer-screen-card.js");
+// FAMILY_HUB_CORE_PATH overrides the core location (default: the
+// shared pi-family-hub worktree's dashboard core).
+const corePath =
+  process.env.FAMILY_HUB_CORE_PATH ||
+  path.join(
+    __dirname,
+    "../../../../local-git/pi-family-hub/installer/dashboard/family-hub-core.js"
+  );
+assert.ok(
+  fs.existsSync(corePath),
+  `family-hub-core.js missing at ${corePath} — the timer card imports it for identity`
+);
+const coreTmp = fs.mkdtempSync(path.join(os.tmpdir(), "family-hub-timer-test-"));
+const coreMjs = path.join(coreTmp, "family-hub-core.mjs");
+fs.copyFileSync(corePath, coreMjs);
+const core = require(coreMjs);
+// The core the tests load must be the R1-3-or-later core: a stale
+// pre-R1-3 core (no deviceFromIdentity) used to fail ~30 tests with
+// "deviceFromIdentity is not a function". Fail once, naming the cause
+// and the override, instead of failing every identity test cryptically.
+assert.equal(
+  typeof core.deviceFromIdentity,
+  "function",
+  `family-hub-core.js at ${corePath} predates deviceFromIdentity — ` +
+    `the pi-family-hub worktree is on a pre-R1-3 branch; switch it to ` +
+    `rebuild/r1, or point FAMILY_HUB_CORE_PATH at a core that exports it`
+);
+assert.equal(
+  typeof core.checkBridgeContract,
+  "function",
+  `family-hub-core.js at ${corePath} predates checkBridgeContract — ` +
+    `the pi-family-hub worktree is on a pre-R1-5 core; switch it to ` +
+    `rebuild/r1, or point FAMILY_HUB_CORE_PATH at a core that exports it`
+);
+const { deviceFromIdentity, HUB_BROWSER_ID } = core;
+
+// Identity helpers for the mapping tests: deviceFromIdentity takes an
+// identify() result + viewport. Wall identities are hub at ANY size
+// (§4 — no size check, ever); unknown identities fall to the viewport
+// + pointer mapping (core's deviceFromIdentity, one copy).
+function wallIdentity() {
+  return { kind: "wall", layout: {} };
+}
+function unknownIdentity(layout) {
+  return { kind: "unknown", layout: layout || {} };
+}
+
+// Inject the real core into the card under test. The wall DOM test
+// registers the wall's id via the sensor leg: the shipped core still
+// carries the unsubstituted __HUB_BROWSER_ID__ placeholder, so the
+// test registers THAT id (the wizard substitutes a real id at deploy;
+// the mechanism — exact match → wall — is what's under test).
+function injectCore() {
+  _setCoreForTests(core);
+}
+function resetCore() {
+  _setCoreForTests(null);
+}
+function wallBrowserPathState(pathname) {
+  return {
+    entity_id: `sensor.${HUB_BROWSER_ID}_browser_path`,
+    state: pathname,
+    attributes: {},
+  };
+}
 
 // -- fixtures ---------------------------------------------------------------
 
@@ -322,6 +393,12 @@ function timerState(id, name, state, overrides = {}) {
     attributes: {
       timer_id: id,
       timer_name: name,
+      // R1-5: fixtures are contract-v2 sensors (the bridge gate admits
+      // only contract_version 2). Pass contractVersion: 1 (or null) for
+      // a v1-shaped sensor in a mismatch test — `in` (not ??) so an
+      // explicit null is kept, and the gate reads it as mismatched.
+      contract_version:
+        "contractVersion" in overrides ? overrides.contractVersion : 2,
       duration,
       remaining,
       finishes_at:
@@ -456,77 +533,72 @@ test("gridColumnsFor on tablet/desktop: by width (>=1600 -> 3, 900-1599 -> 2, <9
 // -- Device detection (shared mechanism; the recipe card carries the
 // identical block — see ADAPTIVE-LAYOUT.md) ---------------------------------
 
-test("detectDevice: the hub is a huge landscape touch screen", () => {
+test("identity: the wall is hub at any size (TIMER-2, §4)", () => {
+  // Kind, not size: the registered wall reads hub whatever its
+  // viewport or pointer — a huge landscape touch screen, a mouse-only
+  // screen, the rotated wall.
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1920, 1200), {
+    category: "hub",
+    orientation: "landscape",
+  });
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1200, 1920), {
+    category: "hub",
+    orientation: "portrait",
+  });
+  // The same viewport WITHOUT the wall identity is not the hub: a
+  // coarse-only touch screen is a mobile by the pointer rule.
   assert.deepEqual(
-    detectDevice({
-      width: 1920,
-      height: 1200,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent:
-        "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }),
-    { category: "hub", orientation: "landscape" }
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      1920,
+      1200
+    ),
+    { category: "mobile", orientation: "landscape" }
   );
 });
 
-test("detectDevice: a mouse is desktop; a phone is mobile in both orientations", () => {
+test("identity: a mouse is desktop; a phone is mobile in both orientations", () => {
   assert.deepEqual(
-    detectDevice({
-      width: 1440,
-      height: 900,
-      coarsePointer: false,
-      finePointer: true,
-      touch: false,
-      userAgent:
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }),
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1440, 900),
     { category: "desktop", orientation: "landscape" }
   );
   assert.deepEqual(
-    detectDevice({
-      width: 390,
-      height: 844,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent:
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      390,
+      844
+    ),
     { category: "mobile", orientation: "portrait" }
   );
   assert.deepEqual(
-    detectDevice({
-      width: 844,
-      height: 390,
-      coarsePointer: true,
-      finePointer: false,
-      touch: true,
-      userAgent:
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      844,
+      390
+    ),
     { category: "mobile", orientation: "landscape" }
   );
 });
 
-test("detectDevice: a mobile user agent wins over a desktop-sized viewport", () => {
+test("identity: no user-agent sniffing — a wide viewport is desktop, not mobile", () => {
+  // The old "iPhone UA wins over a desktop-sized viewport" rule is
+  // gone with the UA sniffing: a 1440px viewport with a fine pointer
+  // is a desktop, whatever the UA string used to say. A phone reads
+  // mobile by its width (<768px), not its UA.
   assert.deepEqual(
-    detectDevice({
-      width: 1440,
-      height: 900,
-      coarsePointer: false,
-      finePointer: true,
-      touch: false,
-      userAgent:
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    }),
-    { category: "mobile", orientation: "landscape" }
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1440, 900),
+    { category: "desktop", orientation: "landscape" }
   );
+  assert.equal(deviceFromIdentity(unknownIdentity({}), 390, 844).category, "mobile");
 });
 
-test("readDeviceEnv returns null outside a browser", () => {
-  assert.equal(readDeviceEnv(), null);
+test("R1: no environment reader — _applyDevice keeps the set device with no window", () => {
+  // readDeviceEnv is deleted; the no-window early return in
+  // _applyDevice is what keeps node tests on the base layout. A card
+  // mounted with no window carries no device classes (see the
+  // no-browser-environment test below).
+  const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+  assert.equal(card._device, null);
 });
 
 // -- device classes on the screen -------------------------------------------
@@ -596,8 +668,10 @@ function fiveTimers() {
 
 test("the screen carries dev-hub + orient-landscape on the kiosk, with the hub grid", () => {
   stubWindow(HUB_WINDOW);
+  globalThis.window.location = { search: "", pathname: "/family-hub/timers" };
+  injectCore();
   try {
-    const card = timerCard(fiveTimers());
+    const card = timerCard([...fiveTimers(), wallBrowserPathState("/family-hub/timers")]);
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-hub"));
     assert.ok(screen.classList.contains("orient-landscape"));
@@ -607,24 +681,28 @@ test("the screen carries dev-hub + orient-landscape on the kiosk, with the hub g
     assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 4);
     assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 1);
   } finally {
+    resetCore();
     clearWindow();
   }
 });
 
 test("the screen carries dev-desktop and two columns at 1440px for five timers", () => {
   stubWindow(DESKTOP_WINDOW);
+  injectCore();
   try {
     const card = timerCard(fiveTimers());
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-desktop"));
     assert.ok(screen.classList.contains("cols-2"));
   } finally {
+    resetCore();
     clearWindow();
   }
 });
 
 test("the screen carries dev-mobile + orient-portrait on a phone", () => {
   stubWindow(PHONE_WINDOW);
+  injectCore();
   try {
     const card = timerCard(fiveTimers());
     const screen = card.shadowRoot.querySelector(".screen");
@@ -634,12 +712,14 @@ test("the screen carries dev-mobile + orient-portrait on a phone", () => {
     assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 4);
     assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 1);
   } finally {
+    resetCore();
     clearWindow();
   }
 });
 
 test("a resize re-detects the device and re-grids", () => {
   stubWindow(PHONE_WINDOW);
+  injectCore();
   try {
     const card = timerCard(fiveTimers());
     const screen = card.shadowRoot.querySelector(".screen");
@@ -651,6 +731,7 @@ test("a resize re-detects the device and re-grids", () => {
     assert.ok(!screen.classList.contains("dev-mobile"));
     assert.ok(screen.classList.contains("cols-2"));
   } finally {
+    resetCore();
     clearWindow();
   }
 });
@@ -812,87 +893,87 @@ test("startedAtMs prefers the sensor attribute, else derives it (TIMER-11)", () 
   assert.equal(startedAtMs(finished, now, null), now - 780 * 1000);
 });
 
-test("detectDevice: unified §3.7 rule — panel signature first, bare width never hub (TIMER-2, P8-16)", () => {
-  const base = {
-    userAgent:
-      "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  };
-  // Hub with a mouse attached (fine + touch at 1920x1200) is the hub,
-  // not a desktop — the old card said desktop here.
-  assert.deepEqual(
-    detectDevice({ ...base, width: 1920, height: 1200, coarsePointer: false, finePointer: true, touch: true }),
-    { category: "hub", orientation: "landscape" }
-  );
-  // 1920x1200 with a mouse only (no touch at all) is still the hub:
-  // the exact panel signature wins over the pointer.
-  assert.deepEqual(
-    detectDevice({ ...base, width: 1920, height: 1200, coarsePointer: false, finePointer: true, touch: false }),
-    { category: "hub", orientation: "landscape" }
-  );
+test("identity: unified rule — wall kind first, bare width never hub (TIMER-2, P8-16)", () => {
+  // Hub with a mouse attached (fine + touch at 1920x1200) is the hub
+  // because its browser id matches — not because of its size.
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1920, 1200), {
+    category: "hub",
+    orientation: "landscape",
+  });
   // Bare width >=1600 + landscape must NEVER imply hub (FORBIDDEN):
   // a 1920x1080 desktop monitor with a mouse is a desktop.
   assert.deepEqual(
-    detectDevice({ ...base, width: 1920, height: 1080, coarsePointer: false, finePointer: true, touch: false }),
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1920, 1080),
     { category: "desktop", orientation: "landscape" }
   );
   assert.deepEqual(
-    detectDevice({ ...base, width: 1680, height: 1050, coarsePointer: false, finePointer: true, touch: false }),
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1680, 1050),
     { category: "desktop", orientation: "landscape" }
   );
-  // P8-16: the old rule 8 (touch + hub-size = hub) is DELETED. A
-  // 1920x1080 touchscreen with a coarse pointer and NO fine pointer
-  // is mobile now — the kiosk itself is caught by rule 1 (the exact
-  // panel signature), not by size + touch. This assertion used to
-  // expect hub; it changed with the rule.
+  // P8-16: a 1920x1080 touchscreen with a coarse pointer and NO fine
+  // pointer is mobile — there is no size rule left that could call
+  // it the hub.
   assert.deepEqual(
-    detectDevice({ ...base, width: 1920, height: 1080, coarsePointer: true, finePointer: false, touch: true }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      1920,
+      1080
+    ),
     { category: "mobile", orientation: "landscape" }
   );
   // A coarse pointer on a tablet-size landscape screen is a tablet
   // (DESIGN-9: 1024x768 must NOT fall to desktop — and not to
   // mobile either).
   assert.deepEqual(
-    detectDevice({ ...base, width: 1024, height: 768, coarsePointer: true, finePointer: false, touch: true }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      1024,
+      768
+    ),
     { category: "tablet", orientation: "landscape" }
   );
   // P8-16 / OQ-7 DECIDED: a touchscreen laptop has a fine pointer
   // (mouse/trackpad) AS WELL as a coarse one, and fine wins — so a
   // 1366x768 touch laptop is a desktop, not a mobile.
   assert.deepEqual(
-    detectDevice({ ...base, width: 1366, height: 768, coarsePointer: true, finePointer: true, touch: true }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, finePointer: true, touchPoints: 1 }),
+      1366,
+      768
+    ),
     { category: "desktop", orientation: "landscape" }
   );
   // O2-07: the same for a portrait touch laptop (1080x1920).
   assert.deepEqual(
-    detectDevice({ ...base, width: 1080, height: 1920, coarsePointer: true, finePointer: true, touch: true }),
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, finePointer: true, touchPoints: 1 }),
+      1080,
+      1920
+    ),
     { category: "desktop", orientation: "portrait" }
   );
 });
 
-test("detectDevice: the rotated panel (1200x1920) is the portrait hub (O2-01)", () => {
-  // The wall rotated is the SAME panel, so rule 1 catches it in
-  // either orientation — it gets the hub layout (with the portrait
-  // reflow), not the phone layout.
-  assert.deepEqual(
-    detectDevice({ width: 1200, height: 1920, coarsePointer: true, touch: true, userAgent: "" }),
-    { category: "hub", orientation: "portrait" }
-  );
-  assert.deepEqual(
-    detectDevice({ width: 1200, height: 1920, finePointer: true, userAgent: "" }),
-    { category: "hub", orientation: "portrait" }
-  );
-  assert.deepEqual(
-    detectDevice({ width: 1200, height: 1920, userAgent: "" }),
-    { category: "hub", orientation: "portrait" }
-  );
-  // 1080x1920 is NOT the panel: a fine pointer is a desktop (O2-07),
-  // and a coarse-only touch screen is a tablet only inside the band.
+test("identity: the rotated wall is the portrait hub (O2-01)", () => {
+  // The wall rotated is the SAME wall, so kind wins in either
+  // orientation — it gets the hub layout (with the portrait reflow),
+  // not the phone layout.
+  assert.deepEqual(deviceFromIdentity(wallIdentity(), 1200, 1920), {
+    category: "hub",
+    orientation: "portrait",
+  });
+  // 1080x1920 is NOT the wall: a fine pointer is a desktop (O2-07),
+  // and a coarse-only touch screen is a mobile outside the band.
   assert.equal(
-    detectDevice({ width: 1080, height: 1920, finePointer: true, userAgent: "" }).category,
+    deviceFromIdentity(unknownIdentity({ finePointer: true }), 1080, 1920).category,
     "desktop"
   );
   assert.equal(
-    detectDevice({ width: 1080, height: 1920, coarsePointer: true, touch: true, userAgent: "" }).category,
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, touchPoints: 1 }),
+      1080,
+      1920
+    ).category,
     "mobile"
   );
 });
@@ -1257,90 +1338,37 @@ test("Back to recipe shows with ?from_recipe= and navigates back at the same ste
 // tablet band is a touch screen 768-1024px wide, either orientation,
 // plus the tablet user agents (iPad; Android without a "Mobi" token).
 
-test("detectDevice: tablet category — band, iPad, Android tablet (DESIGN-9)", () => {
+test("identity: tablet category — band only, no UA (DESIGN-9)", () => {
+  const touch = { coarsePointer: true, touchPoints: 1 };
   // The spec viewports: 1024x768 landscape and 768x1024 portrait.
-  assert.equal(
-    detectDevice({ width: 1024, height: 768, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
-  assert.equal(
-    detectDevice({ width: 768, height: 1024, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 1024, 768).category, "tablet");
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 768, 1024).category, "tablet");
   // The other spec tablet viewports: 900x1440, 768x1366.
-  assert.equal(
-    detectDevice({ width: 900, height: 1440, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
-  assert.equal(
-    detectDevice({ width: 768, height: 1366, coarsePointer: true, touch: true }).category,
-    "tablet"
-  );
-  // iPad user agent is a tablet whatever the viewport (even a wide
-  // one — the UA wins over size, as the mobile UA does for phones).
-  assert.equal(
-    detectDevice({
-      width: 1440,
-      height: 900,
-      userAgent:
-        "Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    }).category,
-    "tablet"
-  );
-  // Android tablet: "Android" with no "Mobi"/"Mobile" token.
-  assert.equal(
-    detectDevice({
-      width: 1280,
-      height: 800,
-      coarsePointer: true,
-      touch: true,
-      userAgent:
-        "Mozilla/5.0 (Linux; Android 13; SM-X710) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    }).category,
-    "tablet"
-  );
-  // Android phone: the same OS string WITH the "Mobile" token.
-  assert.equal(
-    detectDevice({
-      width: 1280,
-      height: 800,
-      coarsePointer: true,
-      touch: true,
-      userAgent:
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    }).category,
-    "mobile"
-  );
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 900, 1440).category, "tablet");
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 768, 1366).category, "tablet");
   // Boundaries of the band: 767px wide is mobile, 1025px wide with a
-  // coarse pointer (and no hub-size landscape) is mobile too.
-  assert.equal(
-    detectDevice({ width: 767, height: 1024, coarsePointer: true, touch: true }).category,
-    "mobile"
-  );
-  assert.equal(
-    detectDevice({ width: 1025, height: 768, coarsePointer: true, touch: true }).category,
-    "mobile"
-  );
+  // coarse pointer is mobile too.
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 767, 1024).category, "mobile");
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 1025, 768).category, "mobile");
+  // Short side under 600px is a phone, not a tablet (844x390).
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 844, 390).category, "mobile");
   // P8-16 / OQ-7 DECIDED: a touchscreen laptop at 1366x768 WITH a
   // fine pointer (mouse/trackpad) is a desktop — fine wins over
   // coarse. Without a fine pointer the same screen is still mobile:
   // a laptop without a mouse is indistinguishable from a touch-only
   // screen outside the tablet band by these signals alone.
   assert.equal(
-    detectDevice({ width: 1366, height: 768, coarsePointer: true, finePointer: true, touch: true }).category,
+    deviceFromIdentity(
+      unknownIdentity({ coarsePointer: true, finePointer: true, touchPoints: 1 }),
+      1366,
+      768
+    ).category,
     "desktop"
   );
-  assert.equal(
-    detectDevice({ width: 1366, height: 768, coarsePointer: true, touch: true }).category,
-    "mobile"
-  );
-  // O2-01: the rotated panel (1200x1920) is the portrait HUB, not
-  // mobile — rule 1 catches the signature in either orientation.
-  // This assertion used to expect mobile; it changed with the rule.
-  assert.equal(
-    detectDevice({ width: 1200, height: 1920, coarsePointer: true, touch: true }).category,
-    "hub"
-  );
+  assert.equal(deviceFromIdentity(unknownIdentity(touch), 1366, 768).category, "mobile");
+  // O2-01: the rotated wall (1200x1920) is the portrait HUB, not
+  // mobile — kind wins over size.
+  assert.equal(deviceFromIdentity(wallIdentity(), 1200, 1920).category, "hub");
 });
 
 // -- Phase 7 CSS: tablet rules, reduced motion, no layout animation ------
@@ -1697,36 +1725,178 @@ test("tapping the scroll pill scrolls the screen down (P8-5)", () => {
 
 // -- Kiosk mode (NAV-1 kiosk-desktop hole) ---------------------------------
 
-test("isKioskMode: only the ?kiosk query counts", () => {
-  assert.equal(isKioskMode("?kiosk"), true);
-  assert.equal(isKioskMode("?kiosk=true"), true);
-  assert.equal(isKioskMode("?foo=1&kiosk&bar=2"), true);
-  assert.equal(isKioskMode(""), false);
-  assert.equal(isKioskMode("?foo=1"), false);
-  assert.equal(isKioskMode("?kiosk-mode=1"), false);
-  assert.equal(isKioskMode("?notkiosk"), false);
-  assert.equal(isKioskMode(null), false);
-  assert.equal(isKioskMode(undefined), false);
+test("R1: the deleted machinery is gone from the timer exports (§19)", () => {
+  for (const name of [
+    "detectDevice",
+    "isKioskMode",
+    "readDeviceEnv",
+    "KIOSK_SESSION_KEY",
+    "readKioskFlag",
+    "storeKioskFlag",
+    "isKioskSession",
+    "withKioskQuery",
+    "reapplyKioskIfNeeded",
+  ]) {
+    assert.equal(timerModule[name], undefined, `${name} must not be exported`);
+  }
+  // The core lookup surface is there instead: the Lovelace resource
+  // path, the throttle/interval mirrors of core's constants, and the
+  // test seam accepts a core module (and null) without throwing.
+  assert.equal(CORE_RESOURCE_PATH, "/local/family-hub-core.js");
+  assert.equal(CORE_LOOKUP_RETRY_THROTTLE_MS, 10 * 1000);
+  assert.equal(CORE_LOOKUP_INTERVAL_MS, 30 * 1000);
+  assert.equal(typeof _setCoreForTests, "function");
+  assert.doesNotThrow(() => _setCoreForTests(null));
+  assert.doesNotThrow(() => _setCoreForTests(core));
+  _setCoreForTests(null);
+});
+
+test("R1: identity banner CSS exists (§4)", () => {
+  // The re-register banner (kiosk launch, mismatched id) is styled,
+  // dark red on white.
+  assert.ok(CARD_CSS.includes(".fh-identity-banner {"));
+  assert.ok(CARD_CSS.includes("background: #7f1d1d;"));
+  assert.ok(CARD_CSS.includes(".fh-identity-banner[hidden] { display: none; }"));
+});
+
+test("R1-5: gate error CSS exists (§9/T-10)", () => {
+  assert.ok(CARD_CSS.includes(".fh-gate-mismatch {"));
+  assert.ok(CARD_CSS.includes(".fh-gate-mismatch[hidden] { display: none; }"));
+});
+
+function gateEl(card) {
+  return card.shadowRoot.querySelector(".fh-gate-mismatch");
+}
+
+test("R1-5: old bridge (no contract_version) + new card -> visible Timer bridge mismatch, no timer UI", () => {
+  injectCore();
+  try {
+    const v1 = [
+      timerState("t1", "Pasta", "active", { contractVersion: null }),
+      timerState("t2", "Rice", "paused", { contractVersion: null }),
+    ];
+    const card = timerCard(v1);
+    assert.equal(
+      card._bridgeMismatch,
+      "Timer bridge mismatch: card expects contract v2 — update Satellite Timers"
+    );
+    assert.equal(card._timers.length, 0);
+    assert.equal(gateEl(card).hidden, false);
+    assert.equal(
+      gateEl(card).textContent,
+      "Timer bridge mismatch: card expects contract v2 — update Satellite Timers"
+    );
+    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 0);
+    assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 0);
+    // No badge counts a mismatched timer.
+    assert.equal(card._timerBadgeEl.hidden, true);
+    // No empty-state hints under the error either.
+    assert.equal(card._emptyEl.hidden, true);
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: a ringing sensor is a mismatch, not a timer", () => {
+  injectCore();
+  try {
+    const card = timerCard([
+      timerState("t1", "Pasta", "ringing", { contractVersion: 2 }),
+    ]);
+    assert.equal(
+      card._bridgeMismatch,
+      "Timer bridge mismatch: card expects contract v2 — update Satellite Timers"
+    );
+    assert.equal(card._timers.length, 0);
+    assert.equal(gateEl(card).hidden, false);
+    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 0);
+    assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 0);
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: mixed v2 + v1 sensors -> the v2 timer renders, the error still shows", () => {
+  injectCore();
+  try {
+    const v1 = timerState("old", "Old", "active", { contractVersion: null });
+    const card = timerCard([timerState("t1", "Pasta", "active", {}), v1]);
+    assert.equal(
+      card._bridgeMismatch,
+      "Timer bridge mismatch: card expects contract v2 — update Satellite Timers"
+    );
+    assert.equal(card._timers.length, 1);
+    assert.equal(card._timers[0].timer_id, "t1");
+    assert.equal(gateEl(card).hidden, false);
+    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 1);
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: core version skew -> visible Hub core mismatch, no timer UI", () => {
+  const wrongCore = {
+    identify: core.identify,
+    deviceFromIdentity: core.deviceFromIdentity,
+    checkCoreVersion: () =>
+      "Hub core mismatch: card needs 2.0.0, core is 9.9.9",
+    checkBridgeContract: core.checkBridgeContract,
+    layoutBand: core.layoutBand,
+  };
+  _setCoreForTests(wrongCore);
+  try {
+    const card = timerCard(fiveTimers());
+    assert.equal(
+      card._coreMismatch,
+      "Hub core mismatch: card needs 2.0.0, core is 9.9.9"
+    );
+    assert.equal(gateEl(card).hidden, false);
+    assert.equal(
+      gateEl(card).textContent,
+      "Hub core mismatch: card needs 2.0.0, core is 9.9.9"
+    );
+    // The core gate replaces the timer UI too: no dials render.
+    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 0);
+  } finally {
+    resetCore();
+  }
+});
+
+test("R1-5: core absent -> no gate evaluation (R1-3 behaviour, documented)", () => {
+  // No injectCore: the v1-shaped sensors render as before, because
+  // there is no core to compare against. The gate is core-dependent
+  // by construction; on the rig and the live hub core is served, so
+  // this path is the no-core fallback only.
+  const v1 = timerState("t1", "Pasta", "active", { contractVersion: null });
+  const card = timerCard([v1]);
+  assert.equal(card._coreMismatch, null);
+  assert.equal(card._bridgeMismatch, null);
+  assert.equal(card._timers.length, 1);
+  assert.equal(gateEl(card).hidden, true);
 });
 
 test("a desktop viewport in kiosk mode carries the kiosk class (strip stays); without it, it does not", () => {
   stubWindow(DESKTOP_WINDOW);
   globalThis.window.location = { search: "?kiosk" };
+  injectCore();
   try {
     const card = timerCard(fiveTimers());
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-desktop"));
     assert.ok(screen.classList.contains("kiosk"));
   } finally {
+    resetCore();
     clearWindow();
   }
   stubWindow(DESKTOP_WINDOW);
+  injectCore();
   try {
     const card = timerCard(fiveTimers());
     const screen = card.shadowRoot.querySelector(".screen");
     assert.ok(screen.classList.contains("dev-desktop"));
     assert.ok(!screen.classList.contains("kiosk"));
   } finally {
+    resetCore();
     clearWindow();
   }
 });
@@ -1747,22 +1917,24 @@ test("removing a timer removes its dial from the DOM synchronously (P8-7 unit bo
 // -- Wave 1 (Navigation N-IMPL-1/2/3/5/6/10/21/24): fixed dark strip, --
 // kiosk as a session property, timers badge, night mode, SPA back-to-recipe
 
-test("Wave 1: kiosk session flag + withKioskQuery (shared with the reference strip)", () => {
+test("R1: _navigate never carries ?kiosk — it is launch-only (§4/§19)", () => {
   const store = new Map();
   globalThis.sessionStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
-    setItem: (k, v) => store.set(k, v),
+    setItem: (k, v) => store.set(k, String(v)),
   };
-  assert.equal(readKioskFlag(), false);
-  storeKioskFlag();
-  assert.equal(readKioskFlag(), true);
-  assert.equal(isKioskSession(""), true);
-  globalThis.window = { location: { search: "" } };
-  assert.equal(withKioskQuery("/family-hub/recipes"), "/family-hub/recipes?kiosk");
-  assert.equal(withKioskQuery("/family-hub/recipes?recipe=x&step=2"), "/family-hub/recipes?recipe=x&step=2&kiosk");
-  delete globalThis.window;
-  store.clear();
-  assert.equal(isKioskSession("?kiosk"), true);
+  try {
+    // A stale flag from the old machinery must not re-attach ?kiosk:
+    // the flag machinery is deleted, and in-app navigation is plain.
+    store.set("family-hub:kiosk", "1");
+    const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    card._navigate("/family-hub/recipes");
+    assert.equal(card._lastNavigation, "/family-hub/recipes");
+    card._navigate("/family-hub/recipes?recipe=x&step=2");
+    assert.equal(card._lastNavigation, "/family-hub/recipes?recipe=x&step=2");
+  } finally {
+    delete globalThis.sessionStorage;
+  }
 });
 
 test("Wave 1: timerBadgeState counts ACTIVE + PAUSED, colour from running/finished only", () => {

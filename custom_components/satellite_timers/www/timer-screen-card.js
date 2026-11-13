@@ -3446,18 +3446,49 @@ class TimerScreenCard extends HTMLElement {
 
   // -- navigation (NAV-1) -------------------------------------------------
   //
-  // history.pushState + a location-changed dispatch — no reload. The
-  // same mechanism the standalone nav strip and the recipe card use.
-  // _lastNavigation is the test hook (also used by the standalone strip).
-  // N-IMPL-6: tapping the already-active strip button (Timers, on
-  // this card) is a no-op — no pushState, no location-changed.
-  // R1: in-app navigation no longer carries ?kiosk — it is launch-only
-  // (§4/§19). (The core SPA helper replaces this whole method in R4.)
+  // RB-R4-2 (§16 as amended, parent BLOCKER 1 decision ~03:49 PST
+  // Nov 13): in-app navigation goes through the core SPA helper
+  // `navigateTo` when the core is loaded — the helper performs the
+  // frontend's own two operations itself (pushState + location-changed
+  // dispatch) and resolves on the observed card mount, never on its
+  // return value alone. `_lastNavigation`
+  // is the test hook (also used by the standalone strip). N-IMPL-6:
+  // tapping the already-active strip button (Timers, on this card)
+  // is a no-op — no pushState, no location-changed. R1: in-app
+  // navigation no longer carries ?kiosk — it is launch-only
+  // (§4/§19); the ?kiosk carry for the return to a recipe lives in
+  // _onBackToRecipe, not here. The legacy pushState +
+  // location-changed path runs only while the core is absent (the
+  // pre-core-load window) — navigation must never dead-end waiting
+  // for the core — and as the fallback when the helper call itself
+  // throws or rejects. (The core SPA helper replaces this whole
+  // method in R4 — this IS that replacement.)
   _navigate(path) {
     const target = String(path || "/family-hub/timers");
     if (target.split("?")[0].replace(/\/+$/, "") === "/family-hub/timers") return;
     const url = target;
     this._lastNavigation = url;
+    if (typeof window === "undefined") return;
+    if (_coreModule && typeof _coreModule.navigateTo === "function") {
+      let result;
+      try {
+        result = _coreModule.navigateTo(url);
+      } catch (_err) {
+        this._legacyNavigate(url);
+        return;
+      }
+      Promise.resolve(result).catch(() => this._legacyNavigate(url));
+      return;
+    }
+    this._legacyNavigate(url);
+  }
+
+  // The card's own pushState + location-changed dispatch — the
+  // mechanism the shell honours, kept as the pre-core-load path and
+  // the fallback when the core helper cannot run. §16: all in-app
+  // URL writes go through navigateTo; this is the helper's fallback,
+  // never a parallel navigation path.
+  _legacyNavigate(url) {
     if (typeof window === "undefined") return;
     try {
       if (window.history && typeof window.history.pushState === "function") {
@@ -3474,23 +3505,32 @@ class TimerScreenCard extends HTMLElement {
 
   _onBackToRecipe() {
     // TIMER-10 + N-IMPL-21: return to the recipe at the same step, by
-    // SPA navigation (history.pushState + location-changed — no
-    // full-page reload, so the recipe card's session restores in
-    // place). The recipe id and step come from the recipe card's
-    // session state first (family-hub:recipe:state openId/step), the
-    // URL ?from_recipe=<id>&step=<n> as the fallback; the recipe card
+    // SPA navigation (the core helper — no full-page reload, so the
+    // recipe card's session restores in place). The recipe id and step
+    // come from the recipe card's session state first
+    // (family-hub:recipe:state openId/step), the URL
+    // ?from_recipe=<id>&step=<n> as the fallback; the recipe card
     // honours ?recipe=<id>&step=<n> as a deep link.
+    // RB-R4-2 (§16): the return carries ?kiosk when the session
+    // launched with it — the kiosk flag is launch-only for ordinary
+    // in-app navigation (R1), but the return to a recipe must keep
+    // the kiosk session alive, or the wall would drop out of kiosk
+    // on the way back.
     if (typeof window === "undefined" || !window.location || !this._recipeContext) {
       return;
     }
     const path = window.location.pathname || "";
     const base = path.replace(/\/[^/]*$/, "") || "/family-hub";
     const step = this._recipeContext.step;
+    const kiosk =
+      typeof window.location.search === "string" &&
+      /(?:^|[?&])kiosk(?:=|&|$)/.test(window.location.search);
     const url =
       `${base}/recipes?recipe=${encodeURIComponent(this._recipeContext.recipeId)}` +
       (step !== null && step !== undefined
         ? `&step=${encodeURIComponent(step)}`
-        : "");
+        : "") +
+      (kiosk ? "&kiosk" : "");
     this._navigate(url);
   }
 
@@ -3540,8 +3580,8 @@ class TimerScreenCard extends HTMLElement {
       return;
     }
     if (action === "nav") {
-      // NAV-1: a strip tap navigates (pushState + location-changed,
-      // no reload) — the same mechanism the recipe card uses.
+      // NAV-1: a strip tap navigates via the core SPA helper (no
+      // reload) — the same mechanism the recipe card uses.
       this._navigate(target.dataset.path || "/family-hub");
       return;
     }

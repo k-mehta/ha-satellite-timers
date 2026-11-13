@@ -1679,6 +1679,150 @@ test("Back to recipe shows with ?from_recipe= and navigates back at the same ste
   assert.equal(plain.shadowRoot.querySelector(".back-bar"), null);
 });
 
+// -- RB-R4-2 (§16): _navigate goes through the core SPA helper, and --
+// "Back to recipe" carries ?kiosk when the session launched with it.
+
+function r42Window({ search, pathname }) {
+  stubWindow(HUB_WINDOW);
+  const pushes = [];
+  const dispatches = [];
+  globalThis.window.location = { search, pathname };
+  globalThis.window.history = {
+    pushState: (_state, _title, url) => pushes.push(url),
+  };
+  globalThis.window.dispatchEvent = (event) => {
+    dispatches.push(event.type);
+    return true;
+  };
+  return { pushes, dispatches };
+}
+
+test("R4-2: _navigate with core loaded calls the core SPA helper, not pushState", () => {
+  const { pushes, dispatches } = r42Window({
+    search: "",
+    pathname: "/family-hub/timers",
+  });
+  const navigated = [];
+  _setCoreForTests({
+    ...core,
+    navigateTo: (url) => {
+      navigated.push(url);
+      return Promise.resolve(true);
+    },
+  });
+  try {
+    const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    card._navigate("/family-hub/recipes");
+    assert.deepEqual(navigated, ["/family-hub/recipes"]);
+    assert.equal(card._lastNavigation, "/family-hub/recipes");
+    assert.deepEqual(pushes, [], "the legacy pushState never runs when the helper is used");
+    assert.deepEqual(dispatches, [], "no location-changed dispatch from the card either");
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("R4-2: _navigate falls back to the legacy pushState when the helper throws", () => {
+  const { pushes, dispatches } = r42Window({
+    search: "",
+    pathname: "/family-hub/timers",
+  });
+  _setCoreForTests({
+    ...core,
+    navigateTo: () => {
+      throw new Error("SPA call unavailable");
+    },
+  });
+  try {
+    const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    card._navigate("/family-hub/recipes");
+    assert.equal(card._lastNavigation, "/family-hub/recipes");
+    assert.deepEqual(pushes, ["/family-hub/recipes"]);
+    assert.deepEqual(dispatches, ["location-changed"]);
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("R4-2: _navigate falls back to the legacy pushState when the helper rejects", async () => {
+  const { pushes, dispatches } = r42Window({
+    search: "",
+    pathname: "/family-hub/timers",
+  });
+  _setCoreForTests({
+    ...core,
+    navigateTo: () => Promise.reject(new Error("SPA call failed")),
+  });
+  try {
+    const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    card._navigate("/family-hub/recipes");
+    assert.equal(card._lastNavigation, "/family-hub/recipes");
+    assert.deepEqual(pushes, [], "nothing synchronous — the rejection lands on a microtask");
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(pushes, ["/family-hub/recipes"]);
+    assert.deepEqual(dispatches, ["location-changed"]);
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("R4-2: _navigate without core uses the legacy pushState (pre-core-load window)", () => {
+  const { pushes, dispatches } = r42Window({
+    search: "",
+    pathname: "/family-hub/timers",
+  });
+  try {
+    const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    card._navigate("/family-hub/recipes");
+    assert.equal(card._lastNavigation, "/family-hub/recipes");
+    assert.deepEqual(pushes, ["/family-hub/recipes"]);
+    assert.deepEqual(dispatches, ["location-changed"]);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("R4-2: Back to recipe carries ?kiosk when the session launched with it", () => {
+  const { pushes } = r42Window({
+    search: "?from_recipe=rec-1&step=3&kiosk",
+    pathname: "/family-hub/timers",
+  });
+  try {
+    const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    card._onClick({
+      target: { closest: () => ({ dataset: { action: "back-recipe" } }) },
+    });
+    assert.equal(
+      card._lastNavigation,
+      "/family-hub/recipes?recipe=rec-1&step=3&kiosk"
+    );
+    assert.deepEqual(pushes, ["/family-hub/recipes?recipe=rec-1&step=3&kiosk"]);
+  } finally {
+    clearWindow();
+  }
+});
+
+test("R4-2: Back to recipe carries no ?kiosk when the session did not launch with it", () => {
+  const { pushes } = r42Window({
+    search: "?from_recipe=rec-1&step=3",
+    pathname: "/family-hub/timers",
+  });
+  try {
+    const card = timerCard([timerState("t1", "Pasta", "active", {})]);
+    card._onClick({
+      target: { closest: () => ({ dataset: { action: "back-recipe" } }) },
+    });
+    assert.equal(card._lastNavigation, "/family-hub/recipes?recipe=rec-1&step=3");
+    assert.deepEqual(pushes, ["/family-hub/recipes?recipe=rec-1&step=3"]);
+  } finally {
+    clearWindow();
+  }
+});
+
 // -- tablet category (DESIGN-9, Phase 7) -----------------------------------
 // The fourth device category: hub / desktop / tablet / mobile. The
 // tablet band is a touch screen 768-1024px wide, either orientation,

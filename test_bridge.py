@@ -2704,11 +2704,19 @@ check("B2: _evaluate_repair_issues docstring drops the supersede clause",
 check("B2: docstring states the single-failure clear range",
       "single failed attempt clears at ~46–91"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
-check("B2: docstring states the range is measured from the last attempt once the ladder is at the 15-minute step",
+check("B2: docstring states the range is measured from the last attempt once the backoff ladder is at the",
       "min from the last attempt once the backoff ladder is at the"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 check("B2: docstring states the 61 min floor is for due-tick failures at the 15-minute step only",
       "61 min is only the floor for failures at due ticks at that"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+# Burst-10 F2: the pin above ends at "at that", so the sentence tail
+# "step." had no coverage — mutating it tripped zero pins. The
+# single-line span below pins the tail; the pin above is labelled
+# for what its span actually covers ("at the", not "the 15-minute
+# step" — the step itself is pinned here and by the B3 pin below).
+check("B2: docstring pins the tail of the range sentence at that step",
+      "step. The skip and the streak-reset-on-failure"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 check("B2: docstring quotes the about-91-minutes overrun",
       "can push it to about 91 minutes"
@@ -3180,6 +3188,27 @@ check("B3 flap-fail: docstring states the early-ladder qualification",
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 check("B3 flap-fail: docstring states the range holds at the 15-minute step",
       "15-minute step; earlier in the ladder it clears sooner, and"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+# Burst-10 F1: the clean-case sentence stated the count>=3 value
+# (just under 46 min) as the clean-case value — the same unstated
+# ladder-position assumption as burst-9's F1. The docstring now
+# qualifies it the same way, and pins the measured off-phase
+# clear times per attempt_count (re-measured this burst with the
+# B3b harness: count 1 +21:59, count 2 +35:59, count 3 +45:59).
+check("B3 clean-case: docstring qualifies just-under-46-min as the 15-minute-step value",
+      "takes just under 46 min once the"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states earlier in the ladder it takes less",
+      "takes less: with the last attempt just before recovery"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states the attempt_count 1 clear time",
+      "1 clears at +21:59 (sents +1:59, +6:59,"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states the attempt_count 2 clear time",
+      "2 clears at +35:59 (sents +5:59, +20:59,"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states the attempt_count 3 clear time",
+      "3 clears at +45:59."
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 b3e.stop()
 

@@ -2896,15 +2896,21 @@ class SatelliteTimerBridge:
         supersedes a CANCELLED. A CANCELLED never purges (B1), so
         clearing depends only on the streak or the prune. In the clean
         case — no skip, no failed attempt — clearing after the
-        satellite recovers takes just under 46 min (round-2 B3;
-        burst-3 critic Finding 1): with the last
-        attempt just before recovery the backoff ladder
-        (60 s, 5 min, 15 min) spaces the three consecutive "sent"
-        attempts at +15, +30 and +45 min — but attempts can only
+        satellite recovers takes just under 46 min once the
+        backoff ladder is at the 15-minute step (round-2 B3;
+        burst-3 critic Finding 1); earlier in the ladder it
+        takes less: with the last attempt just before recovery
+        the backoff ladder (60 s, 5 min, 15 min) spaces the
+        three consecutive "sent" attempts at +15, +30 and +45 min
+        once attempt_count is 3 or more — but attempts can only
         land on 60 s trigger-4 ticks, and every ladder step is a
         multiple of 60 s, so a phase offset of just under 60 s on
         the first attempt is preserved, not accumulated: off-phase
         the attempts land at up to +15:59, +30:59 and +45:59.
+        Measured on that off-phase grid, the clear time depends
+        on attempt_count: 1 clears at +21:59 (sents +1:59, +6:59,
+        +21:59), 2 clears at +35:59 (sents +5:59, +20:59,
+        +35:59), 3 clears at +45:59.
         That bound holds only in the clean case (burst-4 critic
         Finding 1; burst-5 delta critic Findings 1-2): no
         unavailable-skip at a due tick and no failed attempt in

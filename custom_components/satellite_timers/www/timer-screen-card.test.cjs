@@ -3002,3 +3002,78 @@ test("the soon word flips at 59 s from the sensor remaining, not the displayed t
     "Tap to resume"
   );
 });
+
+// -- Screensaver mount (§7.5, RB-R4-1) ---------------------------------------
+//
+// The shared singleton's refcount is file-global (one core module per
+// test file), so these tests read the count before and after instead
+// of assuming it starts at zero.
+
+test("Screensaver mount: connect attaches, hass pushes update without touching the refcount, disconnect detaches", () => {
+  injectCore();
+  try {
+    const before = core.screensaver.getRefcount();
+    const card = timerCard([
+      timerState("t1", "Pasta", "active", { remaining: 600 }),
+    ]);
+    card.connectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    // Every hass push feeds the controller + the PIP Host; the
+    // refcount is mount-scoped and never moves on a push.
+    card.hass = fakeHass([
+      timerState("t1", "Pasta", "active", { remaining: 599 }),
+    ]);
+    card.hass = fakeHass([
+      timerState("t1", "Pasta", "active", { remaining: 598 }),
+    ]);
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    card.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+  } finally {
+    resetCore();
+  }
+});
+
+test("Screensaver mount: two cards mounted at once attach twice; each detach decrements", () => {
+  injectCore();
+  try {
+    const before = core.screensaver.getRefcount();
+    const first = timerCard([
+      timerState("t1", "Pasta", "active", { remaining: 600 }),
+    ]);
+    const second = timerCard([
+      timerState("t2", "Rice", "active", { remaining: 300 }),
+    ]);
+    first.connectedCallback();
+    second.connectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before + 2);
+    first.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    second.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+  } finally {
+    resetCore();
+  }
+});
+
+test("Screensaver mount: attach is once per instance even when core loads after connect", () => {
+  resetCore();
+  try {
+    const before = core.screensaver.getRefcount();
+    const card = timerCard([
+      timerState("t1", "Pasta", "active", { remaining: 600 }),
+    ]);
+    card.connectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+    // Core loads: the re-apply attaches the live card once.
+    injectCore();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    // A second connect-side attach attempt is a no-op (the flag).
+    card._screensaverAttach();
+    assert.equal(core.screensaver.getRefcount(), before + 1);
+    card.disconnectedCallback();
+    assert.equal(core.screensaver.getRefcount(), before);
+  } finally {
+    resetCore();
+  }
+});

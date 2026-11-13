@@ -563,6 +563,8 @@ function _ensureCore(hass) {
         card._clearCoreRetry();
         card._applyDevice();
         card._sync();
+        // Core just loaded: mount the screensaver for this card (§7.5).
+        card._screensaverAttach();
       }
       return mod;
     })
@@ -581,6 +583,24 @@ function _ensureCore(hass) {
       return null;
     });
   return _corePromise;
+}
+
+// The route of the live URL (pathname + query) for the screensaver
+// attach (§7.5): the controller tracks it live from location-changed
+// and popstate afterwards, so the mount-time value only seeds it.
+// Undefined when there is no window/location (node tests) — attach()
+// falls back to its own live-route read then.
+function _currentHubRoute() {
+  try {
+    if (typeof window !== "undefined" && window.location) {
+      return (
+        (window.location.pathname || "") + (window.location.search || "")
+      );
+    }
+  } catch (_err) {
+    // No window — fall through.
+  }
+  return undefined;
 }
 
 // Launch-only ?kiosk read: the same value core reports as
@@ -608,6 +628,7 @@ function _setCoreForTests(mod) {
     card._clearCoreRetry();
     card._applyDevice();
     card._sync();
+    card._screensaverAttach();
   }
 }
 
@@ -1501,6 +1522,7 @@ class TimerScreenCard extends HTMLElement {
     this._bridgeMismatched = new Set(); // entity ids excluded from timer UI by the bridge gate.
     this._gateMismatchEl = null; // visible gate-error element, built in _ensureShell.
     this._coreRetryTimer = null; // 30 s core-lookup retry interval, while mounted.
+    this._screensaverAttached = false; // Whether this instance attached to the shared controller.
     this._pinTimerId = null; // PIP pin, read once per mount
     this._arrivalHome = false; // Home arrival flag, read once per mount
     this._overridesRead = false; // pin/arrival already read this mount
@@ -1573,6 +1595,8 @@ class TimerScreenCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    // Screensaver mount (§7.5 H4): per-push hass delivery, on EVERY push.
+    this._screensaverUpdate();
     const timers = this._refreshGates(
       discoverTimers(hass ? Object.values(hass.states) : [])
     );
@@ -1611,6 +1635,9 @@ class TimerScreenCard extends HTMLElement {
     // the Browser Mod id, so a bare-URL reload still identifies.
     _liveCards.add(this);
     this._ensureCoreForCard();
+    // Screensaver mount (§7.5): attach on mount. If core is not loaded
+    // yet this no-ops and the core-load re-apply attaches instead.
+    this._screensaverAttach();
     this._stopTick();
     this._tick = setInterval(() => this._updateTimes(), 500);
     // The layout follows the viewport: a resize or an orientation
@@ -1647,6 +1674,9 @@ class TimerScreenCard extends HTMLElement {
 
   disconnectedCallback() {
     _liveCards.delete(this);
+    // Screensaver mount (§7.5): detach on unmount; shared state is
+    // never cleared by detach.
+    this._screensaverDetach();
     this._clearCoreRetry();
     this._stopTick();
     // Critic N4: a live pending chip-start must not outlive the card
@@ -1784,6 +1814,47 @@ class TimerScreenCard extends HTMLElement {
     } else {
       this._identityBanner.textContent = "";
       this._identityBanner.hidden = true;
+    }
+  }
+
+  // Screensaver mount protocol (§7.5): attach on mount (once per
+  // instance — connectedCallback and the core-load re-apply both funnel
+  // here, and the flag stops a second attach), detach on unmount,
+  // update on every hass push. The singleton refcount is shared: two
+  // cards mounted at once attach twice.
+  _screensaverAttach() {
+    if (this._screensaverAttached || !_coreModule) return;
+    const screensaver = _coreModule.screensaver;
+    if (!screensaver || typeof screensaver.attach !== "function") return;
+    screensaver.attach(this._hass, _currentHubRoute());
+    this._screensaverAttached = true;
+  }
+
+  _screensaverDetach() {
+    if (!this._screensaverAttached || !_coreModule) return;
+    const screensaver = _coreModule.screensaver;
+    if (screensaver && typeof screensaver.detach === "function") {
+      screensaver.detach();
+    }
+    this._screensaverAttached = false;
+  }
+
+  // Per-push hass delivery (§7.5 H4): replace the controller's and the
+  // PIP Host's stored hass with the fresh object, on EVERY push.
+  // No-op before core loads; never touches the refcount.
+  _screensaverUpdate() {
+    if (!_coreModule) return;
+    if (
+      _coreModule.screensaver &&
+      typeof _coreModule.screensaver.update === "function"
+    ) {
+      _coreModule.screensaver.update(this._hass);
+    }
+    if (
+      _coreModule.pipHost &&
+      typeof _coreModule.pipHost.update === "function"
+    ) {
+      _coreModule.pipHost.update(this._hass);
     }
   }
 

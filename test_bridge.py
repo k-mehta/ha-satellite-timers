@@ -3268,6 +3268,32 @@ check("B3 clean-case: docstring states the attempt_count 2 clear time",
 check("B3 clean-case: docstring states the attempt_count 3 clear time",
       "3 clears at +45:59."
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+# Burst-13 (last pin burst for this passage): the remaining unpinned
+# phrases the burst-12 agent found (bridge.py lines 2897-2925, verified
+# against the actual docstring; the task's L2912 for +21:59 is L2911,
+# +35:59 is L2912). Each phrase is pinned within its own single
+# docstring line (cross-line spans fail, burst-9); each label states
+# only what its span actually says. (1) "every ladder step is a
+# multiple of 60 s" crosses the L2906-07 line break, so it is pinned
+# as its two single-line halves; together they pin the phrase.
+check("B3 clean-case: docstring states every ladder step is a",
+      "every ladder step is a"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states multiple of 60 s",
+      "multiple of 60 s"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states a phase offset of just under 60 s",
+      "phase offset of just under 60 s"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states clearing depends only on the streak or the prune",
+      "depends only on the streak or the prune"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states the satellite recovers",
+      "satellite recovers"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states attempts can only",
+      "attempts can only"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 b3e.stop()
 
 # ------------------------------------------------- burst-6 delta critic Finding 3: pin the docstring numbers

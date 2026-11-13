@@ -283,7 +283,14 @@ const {
   PENDING_START_TIMEOUT_MS,
   discoverTimers,
   gridColumnsFor,
-  voiceUnavailable,
+  // R3 (RB-R3-3): voiceUnavailable is DELETED with the voice-down
+  // display it drove — the duration-picker helpers replace it here.
+  clampDurationPart,
+  parseDurationParts,
+  durationTotalSeconds,
+  formatDurationName,
+  DURATION_MAX_HOURS,
+  DURATION_FIELD_MAX,
   readTimersPin,
   readTimersArrival,
   CORE_RESOURCE_PATH,
@@ -2081,6 +2088,9 @@ test("R1: the deleted machinery is gone from the timer exports (§19)", () => {
     "remainingSeconds",
     "progressFraction",
     "startedAtMs",
+    // R3 (RB-R3-3): the per-card voiceUnavailable derivation is
+    // deleted with the voice-down display it drove.
+    "voiceUnavailable",
   ]) {
     assert.equal(timerModule[name], undefined, `${name} must not be exported`);
   }
@@ -2123,6 +2133,13 @@ test("R2: no per-card time copies and no ringing code in the card source (§19, 
   assert.doesNotMatch(src, /"ringing"/);
   // The card-file sound grep is zero (RB-R2-11 owns this check).
   assert.equal((src.match(/sound/gi) || []).length, 0);
+  // R3 (RB-R3-3): no voice-down strings anywhere in the card source —
+  // not in rendered text, not in a comment quoting the old line. The
+  // provider drives recovery, not display.
+  assert.doesNotMatch(src, /isn't available/);
+  assert.doesNotMatch(src, /voice is down/);
+  assert.doesNotMatch(src, /unavailable/);
+  assert.doesNotMatch(src, /function voiceUnavailable/);
 });
 
 test("R1: identity banner CSS exists (§4)", () => {
@@ -2449,49 +2466,324 @@ test("Wave 1: count badge always shows while timers exist — the scroll pill is
   }
 });
 
-// -- Wave 1: voice fallback trigger (D4 / T-IMPL-12) -----------------------
-// Voice is provably unavailable iff at least one assist_satellite
-// entity exists AND all of them are unavailable/unknown (or muted —
-// the defensive attr leg; HA 2026.10.4 exposes no mute state, so a
-// muted attr only counts when a custom integration provides one).
-// Zero satellites is NOT provably unavailable: fail open, no chips.
+// -- R3: general touch duration control (TIMER-17, Q5 SETTLED) --------
+// Q5 SETTLED ~19:33 PST Nov 12: the touch duration control is NOT a
+// voice-down-only fallback — any duration by touch, ALWAYS. The voice
+// ruling ~19:36 PST Nov 12 deletes every voice-down message: the
+// per-card voiceUnavailable derivation is gone (see the R1 deleted-
+// machinery test), the wall fallback chips are gone, and the control
+// does not read voice state at all. These tests prove the picker
+// logic, the always-present control, and the absence of voice-down
+// text — in every voice state.
 
-test("voiceUnavailable: all satellites down, mixed, none, muted attr", () => {
-  const sat = (id, state, attrs = {}) => ({
-    entity_id: `assist_satellite.${id}`,
-    state,
-    attributes: attrs,
+test("duration helpers: parse/clamp/total/name (TIMER-17, R3)", () => {
+  // Clamping: non-numbers and negatives become 0, over-max clamps.
+  assert.equal(clampDurationPart("hours", "3"), 3);
+  assert.equal(clampDurationPart("minutes", -5), 0);
+  assert.equal(clampDurationPart("seconds", "abc"), 0);
+  assert.equal(clampDurationPart("minutes", 90), 59);
+  assert.equal(clampDurationPart("hours", 150), 99);
+  assert.equal(clampDurationPart("hours", 99), 99);
+  assert.equal(clampDurationPart("nope", 5), 0);
+  // Parsing: missing fields default to 0, strings coerce.
+  assert.deepEqual(parseDurationParts({}), { hours: 0, minutes: 0, seconds: 0 });
+  assert.deepEqual(parseDurationParts({ minutes: "7" }), {
+    hours: 0,
+    minutes: 7,
+    seconds: 0,
   });
-  assert.equal(voiceUnavailable(null), false);
-  assert.equal(voiceUnavailable({}), false);
+  assert.deepEqual(parseDurationParts(null), { hours: 0, minutes: 0, seconds: 0 });
+  // Totals: the leg durations, exactly.
+  assert.equal(durationTotalSeconds({ hours: 0, minutes: 7, seconds: 0 }), 420);
+  assert.equal(durationTotalSeconds({ hours: 0, minutes: 1, seconds: 30 }), 90);
+  assert.equal(durationTotalSeconds({ hours: 1, minutes: 15, seconds: 0 }), 4500);
+  assert.equal(durationTotalSeconds({ hours: 0, minutes: 0, seconds: 0 }), 0);
+  // Names: singular/plural, parts joined, zero named but never started.
+  assert.equal(formatDurationName(420), "7 minute timer");
+  assert.equal(formatDurationName(90), "1 minute 30 second timer");
+  assert.equal(formatDurationName(4500), "1 hour 15 minute timer");
+  assert.equal(formatDurationName(45), "45 second timer");
+  assert.equal(formatDurationName(60), "1 minute timer");
+  assert.equal(formatDurationName(3600), "1 hour timer");
+  assert.equal(formatDurationName(7260), "2 hour 1 minute timer");
+  assert.equal(formatDurationName(0), "0 second timer");
+  assert.equal(DURATION_MAX_HOURS, 99);
+  assert.deepEqual(DURATION_FIELD_MAX, { hours: 99, minutes: 59, seconds: 59 });
+});
+
+function clickAction(card, dataset) {
+  card._onClick({ target: { closest: () => ({ dataset }) } });
+}
+
+test("wall: the duration control is always present, with presets alongside (TIMER-17, R3)", () => {
+  stubWindow(HUB_WINDOW);
+  globalThis.window.location = { search: "", pathname: "/family-hub/timers" };
+  injectCore();
+  try {
+    const card = timerCard([wallBrowserPathState("/family-hub/timers")]);
+    const screen = card.shadowRoot.querySelector(".screen");
+    assert.ok(screen.classList.contains("dev-hub"));
+    // The row is shown (not hidden) on the wall even with no timers
+    // and no voice state at all — the control is unconditional.
+    const row = card.shadowRoot.querySelector(".add-timer-row");
+    assert.equal(row.hidden, false);
+    // Four preset chips, as before — plus the "Set a time" button.
+    const chips = card.shadowRoot.querySelectorAll('[data-action="preset"]');
+    assert.equal(chips.length, 4);
+    assert.deepEqual(
+      chips.map((c) => c.dataset.minutes),
+      ["5", "10", "15", "30"]
+    );
+    const durationButton = card.shadowRoot.querySelector(
+      '[data-action="duration-picker"]'
+    );
+    assert.ok(durationButton, "the Set a time button is present on the wall");
+    assert.equal(durationButton.textContent, "Set a time");
+    // The picker panel starts closed; the "+ Add timer" toggle button
+    // is hidden on the wall (no toggle — the control shows directly).
+    assert.equal(
+      card.shadowRoot.querySelector(".duration-picker").hidden,
+      true
+    );
+    assert.equal(card.shadowRoot.querySelector(".add-timer-button").hidden, true);
+    // No voice-down text anywhere in the rendered card.
+    const html = card.shadowRoot.innerHTML;
+    assert.doesNotMatch(html, /isn't available/);
+    assert.doesNotMatch(html, /voice is down/);
+    assert.doesNotMatch(html, /unavailable/);
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("wall: the control stays present with voice down AND with zero satellites (TIMER-17, R3)", () => {
+  stubWindow(HUB_WINDOW);
+  globalThis.window.location = { search: "", pathname: "/family-hub/timers" };
+  injectCore();
+  try {
+    // Voice DOWN: kitchen satellite unavailable, provider unavailable.
+    const downStates = [
+      wallBrowserPathState("/family-hub/timers"),
+      {
+        entity_id: "assist_satellite.kitchen",
+        state: "unavailable",
+        attributes: {},
+      },
+      {
+        entity_id: "sensor.family_hub_voice_status",
+        state: "unavailable",
+        attributes: { satellite_entity_id: "assist_satellite.kitchen" },
+      },
+    ];
+    const downCard = timerCard(downStates);
+    assert.equal(
+      downCard.shadowRoot.querySelector(".add-timer-row").hidden,
+      false
+    );
+    assert.ok(downCard.shadowRoot.querySelector('[data-action="duration-picker"]'));
+    assert.doesNotMatch(downCard.shadowRoot.innerHTML, /isn't available/);
+    assert.doesNotMatch(downCard.shadowRoot.innerHTML, /voice is down/);
+    assert.doesNotMatch(downCard.shadowRoot.innerHTML, /unavailable/);
+    // ZERO satellites: no assist_satellite entity at all, provider unknown.
+    const zeroStates = [
+      wallBrowserPathState("/family-hub/timers"),
+      {
+        entity_id: "sensor.family_hub_voice_status",
+        state: "unknown",
+        attributes: { satellite_entity_id: "assist_satellite.kitchen" },
+      },
+    ];
+    const zeroCard = timerCard(zeroStates);
+    assert.equal(
+      zeroCard.shadowRoot.querySelector(".add-timer-row").hidden,
+      false
+    );
+    assert.ok(zeroCard.shadowRoot.querySelector('[data-action="duration-picker"]'));
+    assert.doesNotMatch(zeroCard.shadowRoot.innerHTML, /isn't available/);
+    assert.doesNotMatch(zeroCard.shadowRoot.innerHTML, /voice is down/);
+    assert.doesNotMatch(zeroCard.shadowRoot.innerHTML, /unavailable/);
+  } finally {
+    resetCore();
+    clearWindow();
+  }
+});
+
+test("picker: steppers move hours/minutes/seconds and clamp at the bounds (TIMER-17, R3)", () => {
+  const card = timerCard([]);
+  assert.deepEqual(
+    { ...card._picker },
+    { hours: 0, minutes: 0, seconds: 0, open: false }
+  );
+  clickAction(card, { action: "duration-picker" });
+  assert.equal(card._picker.open, true);
   assert.equal(
-    voiceUnavailable({
-      "sensor.temperature": { entity_id: "sensor.temperature", state: "21" },
-    }),
+    card.shadowRoot.querySelector(".duration-picker").hidden,
     false
   );
-  assert.equal(voiceUnavailable({ "assist_satellite.kitchen": sat("kitchen", "unavailable") }), true);
-  assert.equal(voiceUnavailable({ "assist_satellite.kitchen": sat("kitchen", "unknown") }), true);
-  assert.equal(voiceUnavailable({ "assist_satellite.kitchen": sat("kitchen", "idle") }), false);
+  // Stepping below zero stays at zero — the value never goes negative.
+  clickAction(card, { action: "picker-step", unit: "minutes", delta: "-5" });
+  assert.equal(card._picker.minutes, 0);
+  // 7 minutes: +5 then +1 twice. 90 seconds: 1 minute + 30 seconds.
+  clickAction(card, { action: "picker-step", unit: "minutes", delta: "5" });
+  clickAction(card, { action: "picker-step", unit: "minutes", delta: "1" });
+  clickAction(card, { action: "picker-step", unit: "minutes", delta: "1" });
+  assert.equal(card._picker.minutes, 7);
+  assert.equal(card._pickerValueEls.minutes.textContent, "7");
+  clickAction(card, { action: "picker-step", unit: "hours", delta: "1" });
+  assert.equal(card._picker.hours, 1);
+  assert.equal(card._pickerValueEls.hours.textContent, "1");
+  // Clamp: minutes stop at 59 even after repeated +5s.
+  for (let i = 0; i < 20; i++) {
+    clickAction(card, { action: "picker-step", unit: "minutes", delta: "5" });
+  }
+  assert.equal(card._picker.minutes, 59);
+  // Cancel closes the panel and keeps the values for next time.
+  clickAction(card, { action: "picker-cancel" });
+  assert.equal(card._picker.open, false);
   assert.equal(
-    voiceUnavailable({
-      "assist_satellite.kitchen": sat("kitchen", "unavailable"),
-      "assist_satellite.phone": sat("phone", "idle"),
-    }),
-    false
-  );
-  assert.equal(
-    voiceUnavailable({
-      "assist_satellite.kitchen": sat("kitchen", "idle", { muted: true }),
-    }),
+    card.shadowRoot.querySelector(".duration-picker").hidden,
     true
   );
-  assert.equal(
-    voiceUnavailable({
-      "assist_satellite.kitchen": sat("kitchen", "idle", { is_muted: true }),
-    }),
-    true
-  );
+  assert.equal(card._picker.minutes, 59);
+});
+
+test("picker: a zero duration is rejected loudly and starts nothing (TIMER-17, R3)", async () => {
+  injectCore();
+  try {
+    const hass = fakeHass([]);
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    clickAction(card, { action: "duration-picker" });
+    assert.equal(card._picker.open, true);
+    clickAction(card, { action: "picker-start" });
+    await sleep(20);
+    // The error shows, the panel stays open, and NO service call
+    // was made — never a 0 s timer.
+    const errorEl = card.shadowRoot.querySelector(".picker-error");
+    assert.equal(errorEl.hidden, false);
+    assert.match(errorEl.textContent, /Pick a time first/);
+    assert.match(errorEl.textContent, /more than 0 seconds/);
+    assert.equal(card._picker.open, true);
+    assert.deepEqual(
+      hass.wsCalls.filter((c) => c.type === "call_service"),
+      []
+    );
+    // Stepping to a real duration clears the error on the next render.
+    clickAction(card, { action: "picker-step", unit: "minutes", delta: "5" });
+    assert.equal(errorEl.hidden, true);
+  } finally {
+    resetCore();
+  }
+});
+
+test("picker: a 7 minute entry starts through the same service call as a chip (TIMER-17, R3)", async () => {
+  injectCore();
+  try {
+    const hass = fakeHass([]);
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    clickAction(card, { action: "duration-picker" });
+    clickAction(card, { action: "picker-step", unit: "minutes", delta: "5" });
+    clickAction(card, { action: "picker-step", unit: "minutes", delta: "1" });
+    clickAction(card, { action: "picker-step", unit: "minutes", delta: "1" });
+    clickAction(card, { action: "picker-start" });
+    await sleep(20);
+    assert.deepEqual(
+      hass.wsCalls.filter((c) => c.type === "call_service"),
+      [
+        {
+          type: "call_service",
+          domain: "satellite_timers",
+          service: "start_timer",
+          service_data: { name: "7 minute timer", duration: 420 },
+          return_response: true,
+        },
+      ]
+    );
+    // The panel closed on Start, the entry reset to 0:00:00, and the
+    // shared binding path shows the "starting…" dial until the sensor
+    // appears.
+    assert.equal(card._picker.open, false);
+    assert.deepEqual(
+      { hours: card._picker.hours, minutes: card._picker.minutes, seconds: card._picker.seconds },
+      { hours: 0, minutes: 0, seconds: 0 }
+    );
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 1);
+    assert.equal(card._pendingStart.entityId, "sensor.satellite_timer_new10");
+  } finally {
+    resetCore();
+  }
+});
+
+test("picker: a 90 second entry and a 1 hour 15 minute entry start with exact durations (TIMER-17, R3)", async () => {
+  injectCore();
+  try {
+    const hass = fakeHass([]);
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    // 90 s = 1 minute + 30 seconds (six +5 s steps).
+    clickAction(card, { action: "duration-picker" });
+    clickAction(card, { action: "picker-step", unit: "minutes", delta: "1" });
+    for (let i = 0; i < 6; i++) {
+      clickAction(card, { action: "picker-step", unit: "seconds", delta: "5" });
+    }
+    clickAction(card, { action: "picker-start" });
+    await sleep(20);
+    const calls = hass.wsCalls.filter((c) => c.type === "call_service");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].service_data.duration, 90);
+    assert.equal(calls[0].service_data.name, "1 minute 30 second timer");
+    // A second entry in the same mount: 1 hour 15 minutes.
+    card.hass = fakeHass([]);
+    const hass2 = card._hass;
+    clickAction(card, { action: "duration-picker" });
+    clickAction(card, { action: "picker-step", unit: "hours", delta: "1" });
+    for (let i = 0; i < 3; i++) {
+      clickAction(card, { action: "picker-step", unit: "minutes", delta: "5" });
+    }
+    clickAction(card, { action: "picker-start" });
+    await sleep(20);
+    const calls2 = hass2.wsCalls.filter((c) => c.type === "call_service");
+    assert.equal(calls2.length, 1);
+    assert.equal(calls2[0].service_data.duration, 4500);
+    assert.equal(calls2[0].service_data.name, "1 hour 15 minute timer");
+  } finally {
+    resetCore();
+  }
+});
+
+test("phone: the picker rides in the shared chips row — it shows wherever the chips show (TIMER-17, R3, observation only)", () => {
+  // OPEN ITEM for the R7 re-lock (no policy decision here): the picker
+  // is built into the shared chips row, so on phone/tablet it appears
+  // exactly where the preset chips appear — directly with no timers,
+  // behind the "+ Add timer" toggle while timers run. This test
+  // records that behaviour; whether phone/tablet SHOULD get arbitrary
+  // durations is the re-lock's call, not this step's.
+  stubWindow(PHONE_WINDOW);
+  injectCore();
+  try {
+    const empty = timerCard([]);
+    assert.ok(empty.shadowRoot.querySelector('[data-action="duration-picker"]'));
+    assert.equal(
+      empty.shadowRoot.querySelector(".preset-chips").classList.contains("show"),
+      true
+    );
+    const running = timerCard([timerState("t1", "Pasta", "active", {})]);
+    assert.ok(running.shadowRoot.querySelector('[data-action="duration-picker"]'));
+    // While timers run the chips (and the picker button with them)
+    // hide behind the toggle, exactly like the presets.
+    assert.equal(
+      running.shadowRoot.querySelector(".preset-chips").classList.contains("show"),
+      false
+    );
+  } finally {
+    resetCore();
+    clearWindow();
+  }
 });
 
 // -- Wave 1: PIP pin + Home arrival (D7.3 / T-IMPL-20/23) ------------------

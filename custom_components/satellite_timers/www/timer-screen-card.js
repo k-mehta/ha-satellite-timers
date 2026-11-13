@@ -21,13 +21,30 @@
 //            simultaneously — see pointer_diag.mjs.)
 //   TIMER-3  Finished timers show "Done — N min ago", counting up
 //            from finished_at on the tick (same as HOME-3).
-//   TIMER-4  Viewport-split creation: the hub is voice-only + a hint;
-//            phone/tablet get on-screen preset chips (5/10/15/30 min)
-//            that call satellite_timers.start_timer. Wave 1: the chips
+//   TIMER-4  Viewport-split creation (as designed): the hub was
+//            voice-only + a hint; phone/tablet get on-screen preset
+//            chips (5/10/15/30 min) that call
+//            satellite_timers.start_timer. Wave 1: the chips
 //            live in the "+ Add timer" row (shown directly with no
 //            timers, toggled while timers run); the wall shows the
-//            same chips only when voice is provably unavailable (D4
-//            fallback, T-IMPL-12).
+//            same chips only when voice is provably down (D4
+//            fallback, T-IMPL-12). R3 (RB-R3-3, Q5 SETTLED ~19:33 PST
+//            Nov 12 + voice ruling ~19:36 PST Nov 12): the wall
+//            fallback is DELETED — the wall ALWAYS shows a general
+//            touch duration control (a "Set a time" button opening a
+//            duration picker for ANY duration, with the 5/10/15/30
+//            presets as quick options alongside it), in every voice
+//            state, and there is NO voice-down message anywhere in
+//            the card. The picker and the chips start timers through
+//            the SAME service call (see _startNamedTimer).
+//   TIMER-17 (R3, RB-R3-3) General touch duration control: the picker
+//            takes hours/minutes/seconds by stepper buttons only —
+//            no text input, so it needs no on-screen keyboard on the
+//            wall and no fine typing with wet/dirty hands. Every
+//            duration is reachable by stepping alone (hours ±1,
+//            minutes ±1/±5, seconds ±1/±5). A zero/empty duration
+//            never starts a timer: Start with 0 s shows a loud
+//            error in the picker and makes no service call.
 //   TIMER-5  Warm palette, all passing the §3.3 bars: running ring
 //            #C2410C (4.96:1), soon/finished ring #B45309 (4.81:1),
 //            track #757575 (4.41:1), error #B71C1C (6.29:1).
@@ -133,6 +150,60 @@ const ENTER_ANIMATION_MS = 240;
 const TIME_FIT_STEPS = [72, 64, 56, 48, 44, 40];
 // Preset chip durations, minutes (TIMER-4 / D4 fallback).
 const PRESET_MINUTES = [5, 10, 15, 30];
+// Duration picker bounds (TIMER-17, R3 RB-R3-3): hours 0–99, minutes
+// and seconds 0–59 each; the bridge itself caps nothing except
+// duration > 0 (bridge.py start_timer raises below 1 s), so the 99 h
+// cap is a card [CHOICE] — a kitchen timer past 99:59:59 is not a
+// duration anyone sets by touch, and the picker must have a top.
+const DURATION_MAX_HOURS = 99;
+const DURATION_FIELD_MAX = { hours: 99, minutes: 59, seconds: 59 };
+
+// Clamp one picker field to its range: non-numbers and negatives
+// become 0, values above the field max become the max. Pure.
+function clampDurationPart(unit, value) {
+  const max = DURATION_FIELD_MAX[unit];
+  if (max === undefined) return 0;
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, max);
+}
+
+// Normalise a raw { hours, minutes, seconds } (strings or numbers,
+// missing fields allowed) into clamped integers. Pure.
+function parseDurationParts(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  return {
+    hours: clampDurationPart("hours", src.hours),
+    minutes: clampDurationPart("minutes", src.minutes),
+    seconds: clampDurationPart("seconds", src.seconds),
+  };
+}
+
+// Total seconds for a parsed parts object. Pure.
+function durationTotalSeconds(parts) {
+  const p = parseDurationParts(parts);
+  return p.hours * 3600 + p.minutes * 60 + p.seconds;
+}
+
+// Human name for a duration in seconds, as the timer's display name:
+// "45 second timer", "7 minute timer", "1 minute 30 second timer",
+// "1 hour 15 minute timer". Units stay SINGULAR at every value —
+// that is the card's existing naming convention ("10 minute timer"
+// from the preset chips), so a picker timer and a chip timer read
+// the same way. Zero or negative reads "0 second timer" (the picker
+// rejects it before any start — the name is never used for a zero
+// start). Pure.
+function formatDurationName(totalSeconds) {
+  const total = Math.max(0, Math.floor(Number(totalSeconds)) || 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const bits = [];
+  if (hours > 0) bits.push(`${hours} hour`);
+  if (minutes > 0) bits.push(`${minutes} minute`);
+  if (seconds > 0 || bits.length === 0) bits.push(`${seconds} second`);
+  return `${bits.join(" ")} timer`;
+}
 // The PIP pin (written by the recipe card, read once per mount) and
 // the Home arrival flag (written by the Home card, read once per
 // mount) — sessionStorage keys (D7.3 / T-IMPL-20/23).
@@ -305,29 +376,14 @@ function gridColumnsFor(category, orientation, width) {
   return 1;
 }
 
-// Whether voice is provably unavailable (D4 fallback trigger,
-// T-IMPL-12 — resolved against Navigation D-N4 and HA 2026.10.4):
-// at least one assist_satellite entity exists AND every one is
-// unavailable/unknown — or muted, for integrations that publish a
-// muted/is_muted attribute (HA core publishes NO mute state: mute is
-// device-internal, so the state leg is the only provable one). Zero
-// assist_satellite entities is NOT proof of anything (fail-open, like
-// the screensaver voice-as-activity condition): absence is not proof
-// the satellite is down. Pure — pass hass.states (object or array).
-function voiceUnavailable(states) {
-  if (!states) return false;
-  const sats = [];
-  for (const s of Object.values(states)) {
-    if (!s || typeof s.entity_id !== "string") continue;
-    if (s.entity_id.indexOf("assist_satellite.") === 0) sats.push(s);
-  }
-  if (sats.length === 0) return false;
-  return sats.every((s) => {
-    if (s.state === "unavailable" || s.state === "unknown") return true;
-    const attrs = s.attributes || {};
-    return attrs.muted === true || attrs.is_muted === true;
-  });
-}
+// R3 (RB-R3-3, voice ruling ~19:36 PST Nov 12): the per-card
+// voiceUnavailable derivation is DELETED with the voice-down display
+// it drove. There is no voice-down message anywhere in this card
+// — the Voice Status Provider (R3-1) exists to drive automatic
+// recovery, not display — and the touch duration control does not
+// depend on voice state at all, so nothing in this card reads voice
+// state any more. (RB-R3-4's grep confirms zero per-card voice
+// derivations remain across the cards; this card's copy dies here.)
 
 // The PIP pin (D7.3 / T-IMPL-20): the recipe card writes
 // family-hub:timers:pin = {timerId} when the user taps a PIP. Read
@@ -945,17 +1001,20 @@ const CARD_CSS = `
   .empty svg { width: 72px; height: 72px; opacity: 0.6; margin-bottom: 12px; }
   .empty-title { font-size: 32px; line-height: 1.25; color: #212121; }
   .voice-hint { font-size: 20px; line-height: 1.4; max-width: 640px; }
-  /* When the wall fallback chips show, the voice hints hide — they
-     contradict the "Voice isn't available" line (T-IMPL-12). */
-  .empty.voice-down .voice-hint { display: none; }
+  /* R3 (RB-R3-3): the .empty.voice-down rule is DELETED with the
+     voice-down display — there is no voice-down state in this
+     card any more, so the hints never hide for it. */
   .empty-error { color: #B71C1C; font-size: 18px; }
   .empty-error[hidden] { display: none; }
-  /* "+ Add timer" row (T-IMPL-10) + fallback chips (T-IMPL-12): one
-     full-width row at the top, above the dials. Non-hub only: a
-     persistent "+ Add timer" button when timers run, toggling the
-     chip row; the chips show directly when there are no timers. On
-     the wall the row appears only when voice is down (fallback), with
-     the plain line instead of the button. */
+  /* "+ Add timer" row (T-IMPL-10): one full-width row at the top,
+     above the dials. Non-hub only: a persistent "+ Add timer" button
+     when timers run, toggling the chip row; the chips show directly
+     when there are no timers. On the wall the row is ALWAYS shown
+     (R3, RB-R3-3 — the touch duration control is not gated on voice
+     state): the preset chips plus the "Set a time" button, directly,
+     with no toggle. The old "row appears only while voice was down"
+     rule and its fallback line are DELETED with the voice-down
+     display. */
   .add-timer-row { display: flex; flex-direction: column; gap: 12px; }
   .add-timer-row[hidden] { display: none; }
   .add-timer-button {
@@ -971,7 +1030,9 @@ const CARD_CSS = `
     cursor: pointer;
   }
   .add-timer-hint { color: #57534E; font-size: 18px; line-height: 1.4; }
-  .fallback-line { color: #212121; font-size: 20px; font-weight: 700; line-height: 1.4; }
+  /* R3 (RB-R3-3): the .fallback-line rule is DELETED with the
+     voice-down display — the voice-down line
+     no longer exists in this card. */
   .preset-chips { display: none; flex-wrap: wrap; gap: 12px; justify-content: center; }
   .preset-chips.show { display: flex; }
   .preset-chips .chip-label { font-size: 20px; align-self: center; }
@@ -988,6 +1049,63 @@ const CARD_CSS = `
     cursor: pointer;
   }
   .preset-chips button:disabled { opacity: 0.5; cursor: default; }
+  /* Duration picker (TIMER-17, R3 RB-R3-3): big direct targets for
+     wet/dirty hands — every stepper button is at least 64×64 px, the
+     Start/Cancel buttons at least 80 px tall, no fine control, no
+     hidden menu. The panel sits in the add-timer row below the chips,
+     so the presets stay visible as quick options alongside it. */
+  .duration-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 16px;
+    border: 1px solid #EDE8E3;
+    border-radius: 16px;
+    background: var(--card-background-color, #fff);
+  }
+  .duration-picker[hidden] { display: none; }
+  .picker-fields { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+  .picker-field { display: flex; flex-direction: column; align-items: center; gap: 8px; min-width: 0; }
+  .picker-label { color: #57534E; font-size: 20px; font-weight: 700; line-height: 1.3; }
+  .picker-steppers { display: flex; align-items: center; gap: 8px; }
+  .picker-steppers button {
+    min-width: 64px;
+    min-height: 64px;
+    padding: 8px 12px;
+    border-radius: 16px;
+    border: 1px solid #EDE8E3;
+    background: var(--card-background-color, #fff);
+    color: #212121;
+    font-size: 28px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .picker-steppers button:disabled { opacity: 0.5; cursor: default; }
+  .picker-value {
+    min-width: 64px;
+    text-align: center;
+    color: #212121;
+    font-size: 32px;
+    font-weight: 700;
+    line-height: 1.2;
+  }
+  .picker-error { color: #B71C1C; font-size: 20px; font-weight: 700; line-height: 1.4; text-align: center; }
+  .picker-error[hidden] { display: none; }
+  .picker-actions { display: flex; gap: 12px; }
+  .picker-actions button {
+    flex: 1;
+    min-height: 80px;
+    padding: 12px 8px;
+    border-radius: 16px;
+    border: 1px solid #EDE8E3;
+    background: var(--card-background-color, #fff);
+    color: #212121;
+    font-size: 22px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .picker-actions button:disabled { opacity: 0.5; cursor: default; }
+  .picker-actions button.picker-start { background: #C2410C; border-color: #C2410C; color: #fff; }
   /* Mobile landscape: the open chips anchor above the strip so they
      stay reachable while the view scrolls (T-IMPL-11). */
   .screen.dev-mobile.orient-landscape .preset-chips.show {
@@ -1279,8 +1397,10 @@ const CARD_CSS = `
   /* Mobile: touch targets stay large (a finger is not a mouse) and the
      buttons stay reachable. In portrait the dials stack; the screen
      scrolls when the timers need more room than the phone has.
-     Preset chips (TIMER-4) show on mobile and tablet — the hub is
-     voice-only by deliberate choice. Wave 1: the dial sub-text is
+     Preset chips (TIMER-4) show on mobile and tablet — and, since
+     R3 (RB-R3-3, TIMER-17), the wall always shows the general touch
+     duration control too (presets + "Set a time" picker), so the hub
+     is no longer voice-only. Wave 1: the dial sub-text is
      BELOW the ring at full cell width now, so the old 14px chord
      workaround (Phase 7 Fix 2) is deleted — state/hint are 18px on
      mobile too, and there is no 300px portrait dial minimum. */
@@ -1298,7 +1418,8 @@ const CARD_CSS = `
   /* Tablet (DESIGN-9): 56-64px targets (spec §3.2); dial text at
      the TIMER-6 hub minima (name 20px, state/hint 18px) — readable
      at 1m. Preset chips show here too (TIMER-4: phone/tablet get
-     on-screen presets; hub is voice-only). */
+     on-screen presets; since R3 the wall gets them plus the duration
+     picker — TIMER-17). */
   .screen.dev-tablet { --nav-strip-height: 80px; }
   .screen.dev-tablet .controls button { min-height: 64px; font-size: 18px; }
   .screen.dev-tablet .dial-name { font-size: 20px; }
@@ -1345,11 +1466,20 @@ class TimerScreenCard extends HTMLElement {
     this._emptyEl = null;
     this._emptyErrorEl = null;
     this._backBarEl = null; // built in _sync only when a recipe context exists
-    this._addTimerRowEl = null; // "+ Add timer" / fallback chips row (built in _ensureShell)
+    this._addTimerRowEl = null; // "+ Add timer" / duration-control row (built in _ensureShell)
     this._addTimerButtonEl = null;
     this._addTimerHintEl = null;
-    this._fallbackLineEl = null;
-    this._chipsEl = null; // preset chips row (shared by + Add timer and fallback)
+    this._durationButtonEl = null; // "Set a time" button (TIMER-17, R3)
+    this._pickerEl = null; // duration picker panel (TIMER-17, R3)
+    this._pickerErrorEl = null;
+    this._pickerStartEl = null;
+    this._pickerValueEls = {}; // unit -> value span element
+    // R3 (RB-R3-3): the _voiceDown field is DELETED with the
+    // voice-down display — nothing in this card reads voice state.
+    // Picker state: hours/minutes/seconds as clamped integers, plus
+    // whether the panel is open. Closed and zeroed on mount.
+    this._picker = { hours: 0, minutes: 0, seconds: 0, open: false };
+    this._chipsEl = null; // preset chips row (shared by + Add timer and the wall control)
     this._chipsOpen = false; // "+ Add timer" toggled open (timers running)
     this._finishedSectionEl = null;
     this._finishedHeaderEl = null;
@@ -1371,7 +1501,6 @@ class TimerScreenCard extends HTMLElement {
     this._bridgeMismatched = new Set(); // entity ids excluded from timer UI by the bridge gate.
     this._gateMismatchEl = null; // visible gate-error element, built in _ensureShell.
     this._coreRetryTimer = null; // 30 s core-lookup retry interval, while mounted.
-    this._voiceDown = false; // voice provably unavailable (voiceUnavailable)
     this._pinTimerId = null; // PIP pin, read once per mount
     this._arrivalHome = false; // Home arrival flag, read once per mount
     this._overridesRead = false; // pin/arrival already read this mount
@@ -1450,23 +1579,11 @@ class TimerScreenCard extends HTMLElement {
     const key = JSON.stringify(
       timers.map((t) => [t.entity_id, t.state, t.name, t.duration, t.finishedAt])
     );
-    // The wall fallback chips are state-driven (D4): a voice change
-    // re-syncs even when no timer changed.
-    const voiceDown = voiceUnavailable(hass ? hass.states : null);
-    const voiceChanged = voiceDown !== this._voiceDown;
-    this._voiceDown = voiceDown;
-    // R2 (§14): the clocks re-anchor on EVERY hass push, not only on
-    // a key change. The key deliberately excludes `remaining` — a
-    // per-second push must not rebuild the DOM — so gating the clocks
-    // on it would starve them: the last push before the key changed
-    // would be the only anchor, every active timer would go stale 5 s
-    // after it started and freeze at remaining − 5 s. The DOM rebuild
-    // below stays key-gated; the clock push is a cheap Map update.
-    // `finished_at` IS in the key: the §5.1 <60 s force rule is
-    // driven by its recency, so a push that changes only finished_at
-    // must re-sync the finished section.
+    // R3 (RB-R3-3): no voice state is read here any more — the old
+    // voiceChanged re-sync trigger died with the voice-down display.
+    // The key is the timer list only.
     this._pushClocks(timers);
-    if (key !== this._lastKey || voiceChanged) {
+    if (key !== this._lastKey) {
       this._timers = timers;
       this._lastKey = key;
       const live = new Set(timers.map((t) => t.timer_id));
@@ -1893,29 +2010,72 @@ class TimerScreenCard extends HTMLElement {
     // The back bar is NOT built here: it exists only when a recipe
     // context exists (TIMER-10 / T-IMPL-18) and is created/removed in
     // _sync, so a plain load has zero DOM residue of it.
-    // "+ Add timer" row (T-IMPL-10) + wall fallback chips (T-IMPL-12):
-    // one full-width row at the top, above the dials. Its contents
-    // are shown/hidden in _sync: the button on non-hub while timers
-    // run, the chips directly when there are no timers, the fallback
-    // line + chips on the wall while voice is down.
+    // "+ Add timer" row (T-IMPL-10) + general touch duration control
+    // (TIMER-17, R3 RB-R3-3): one full-width row at the top, above the
+    // dials. Its contents are shown/hidden in _sync: the button on
+    // non-hub while timers run, the chips directly when there are no
+    // timers, and on the wall the chips + "Set a time" button directly
+    // and ALWAYS (voice state plays no part). The old fallback line
+    // (the voice-down line) is DELETED with the
+    // voice-down display. The picker panel lives in this row below
+    // the chips, so the presets stay visible as quick options while
+    // it is open. Stepper buttons only, no text input (TIMER-17):
+    // hours ±1, minutes ±1/±5, seconds ±1/±5 — every duration is
+    // reachable by stepping alone.
     this._addTimerRowEl = document.createElement("div");
     this._addTimerRowEl.className = "add-timer-row";
     this._addTimerRowEl.hidden = true;
     this._addTimerRowEl.innerHTML =
       '<button class="add-timer-button" data-action="add-timer" aria-expanded="false">+ Add timer</button>' +
       '<div class="add-timer-hint" hidden></div>' +
-      '<div class="fallback-line" hidden>Voice isn\'t available right now — tap a time to start a timer</div>' +
       '<div class="preset-chips"><span class="chip-label">Start a timer:</span>' +
       PRESET_MINUTES.map(
         (m) =>
           `<button data-action="preset" data-minutes="${m}" aria-label="Start a ${m} minute timer">${m} min</button>`
       ).join("") +
+      '<button class="duration-button" data-action="duration-picker" aria-label="Set a timer for any length of time">Set a time</button>' +
+      "</div>" +
+      '<div class="duration-picker" hidden>' +
+      '<div class="picker-fields">' +
+      '<div class="picker-field"><span class="picker-label">Hours</span><div class="picker-steppers">' +
+      '<button data-action="picker-step" data-unit="hours" data-delta="-1" aria-label="One hour less">−</button>' +
+      '<span class="picker-value" data-unit="hours">0</span>' +
+      '<button data-action="picker-step" data-unit="hours" data-delta="1" aria-label="One hour more">+</button>' +
+      "</div></div>" +
+      '<div class="picker-field"><span class="picker-label">Minutes</span><div class="picker-steppers">' +
+      '<button data-action="picker-step" data-unit="minutes" data-delta="-5" aria-label="Five minutes less">−5</button>' +
+      '<button data-action="picker-step" data-unit="minutes" data-delta="-1" aria-label="One minute less">−</button>' +
+      '<span class="picker-value" data-unit="minutes">0</span>' +
+      '<button data-action="picker-step" data-unit="minutes" data-delta="1" aria-label="One minute more">+</button>' +
+      '<button data-action="picker-step" data-unit="minutes" data-delta="5" aria-label="Five minutes more">+5</button>' +
+      "</div></div>" +
+      '<div class="picker-field"><span class="picker-label">Seconds</span><div class="picker-steppers">' +
+      '<button data-action="picker-step" data-unit="seconds" data-delta="-5" aria-label="Five seconds less">−5</button>' +
+      '<button data-action="picker-step" data-unit="seconds" data-delta="-1" aria-label="One second less">−</button>' +
+      '<span class="picker-value" data-unit="seconds">0</span>' +
+      '<button data-action="picker-step" data-unit="seconds" data-delta="1" aria-label="One second more">+</button>' +
+      '<button data-action="picker-step" data-unit="seconds" data-delta="5" aria-label="Five seconds more">+5</button>' +
+      "</div></div>" +
+      "</div>" +
+      '<div class="picker-error" hidden></div>' +
+      '<div class="picker-actions">' +
+      '<button class="picker-start" data-action="picker-start">Start timer</button>' +
+      '<button data-action="picker-cancel">Cancel</button>' +
+      "</div>" +
       "</div>";
     this._screenEl.appendChild(this._addTimerRowEl);
     this._addTimerButtonEl = this._addTimerRowEl.querySelector(".add-timer-button");
     this._addTimerHintEl = this._addTimerRowEl.querySelector(".add-timer-hint");
-    this._fallbackLineEl = this._addTimerRowEl.querySelector(".fallback-line");
+    this._durationButtonEl = this._addTimerRowEl.querySelector(".duration-button");
     this._chipsEl = this._addTimerRowEl.querySelector(".preset-chips");
+    this._pickerEl = this._addTimerRowEl.querySelector(".duration-picker");
+    this._pickerErrorEl = this._addTimerRowEl.querySelector(".picker-error");
+    this._pickerStartEl = this._addTimerRowEl.querySelector(".picker-start");
+    this._pickerValueEls = {};
+    for (const valueEl of this._pickerEl.querySelectorAll(".picker-value")) {
+      this._pickerValueEls[valueEl.dataset.unit] = valueEl;
+    }
+    this._renderPicker();
     this._emptyEl = document.createElement("div");
     this._emptyEl.className = "empty";
     this._emptyEl.innerHTML =
@@ -2166,7 +2326,8 @@ class TimerScreenCard extends HTMLElement {
       this._backBarEl = null;
     }
 
-    // Add-timer row + fallback chips (T-IMPL-10/12) + empty hints.
+    // Add-timer row + general touch duration control (T-IMPL-10 /
+    // TIMER-17, R3) + empty hints.
     this._updateAddTimerRow();
     this._updateEmptyHints();
 
@@ -2236,57 +2397,105 @@ class TimerScreenCard extends HTMLElement {
     }
   }
 
-  // "+ Add timer" row + fallback chips (T-IMPL-10/12).
+  // "+ Add timer" row + general touch duration control (T-IMPL-10 /
+  // TIMER-17, R3 RB-R3-3).
   //
   // Non-hub: a persistent "+ Add timer" button at the top while timers
   // run (it toggles the chip row below it, above the dials); when
   // there are no timers the chips show directly — creation stays
   // one tap from the empty state. The row also carries the add-time
   // voice hint while timers run (TIMER-14).
-  // Wall fallback (D4, LOCKED): when voice is provably unavailable
-  // the wall shows the same 5/10/15/30 chips plus the plain line
-  // "Voice isn't available right now — tap a time to start a timer",
-  // whether or not timers run (§6 item 6 — the ruling's purpose is
-  // that the wall is never dead when voice is down). When voice
-  // recovers the chips disappear and the voice-only state returns.
-  // The wall voice hints hide while the fallback shows (they would
-  // contradict the "Voice isn't available" line).
+  // Wall (R3): the row is ALWAYS shown — the preset chips plus the
+  // "Set a time" button, directly, with no toggle and no voice
+  // condition. The old D4 fallback (chips only while voice was down,
+  // plus the voice-down line) is DELETED: the
+  // control is always present, in every voice state, and there is no
+  // voice-down message anywhere. The picker panel's own visibility
+  // follows _picker.open on every device.
   _updateAddTimerRow() {
     if (!this._addTimerRowEl) return;
     const isHub = this._identity !== null && this._identity.kind === "wall";
     const hasTimers = this._timers.length > 0;
-    const fallback = isHub && this._voiceDown;
-    const showRow = fallback || !isHub;
-    this._addTimerRowEl.hidden = !showRow;
-    if (!showRow) return;
-    if (fallback) {
+    // The row is always shown now: on the wall the control is
+    // unconditional (Q5 settlement); off the wall the old T-IMPL-10
+    // rule already showed it in every state.
+    this._addTimerRowEl.hidden = false;
+    if (isHub) {
       this._addTimerButtonEl.hidden = true;
       this._addTimerHintEl.hidden = true;
-      this._fallbackLineEl.hidden = false;
       this._chipsEl.classList.add("show");
+    } else if (hasTimers) {
+      this._addTimerButtonEl.hidden = false;
+      this._addTimerButtonEl.textContent = this._chipsOpen
+        ? "Close"
+        : "+ Add timer";
+      this._addTimerButtonEl.setAttribute(
+        "aria-expanded",
+        this._chipsOpen ? "true" : "false"
+      );
+      this._addTimerHintEl.hidden = false;
+      this._addTimerHintEl.textContent =
+        "To add time, tell the kitchen speaker: “Okay Nabu, add 5 more minutes to the pasta timer”";
+      if (this._chipsOpen) this._chipsEl.classList.add("show");
+      else this._chipsEl.classList.remove("show");
     } else {
-      this._fallbackLineEl.hidden = true;
-      if (hasTimers) {
-        this._addTimerButtonEl.hidden = false;
-        this._addTimerButtonEl.textContent = this._chipsOpen
-          ? "Close"
-          : "+ Add timer";
-        this._addTimerButtonEl.setAttribute(
-          "aria-expanded",
-          this._chipsOpen ? "true" : "false"
-        );
-        this._addTimerHintEl.hidden = false;
-        this._addTimerHintEl.textContent =
-          "To add time, tell the kitchen speaker: “Okay Nabu, add 5 more minutes to the pasta timer”";
-        if (this._chipsOpen) this._chipsEl.classList.add("show");
-        else this._chipsEl.classList.remove("show");
-      } else {
-        this._addTimerButtonEl.hidden = true;
-        this._addTimerHintEl.hidden = true;
-        this._chipsEl.classList.add("show");
-      }
+      this._addTimerButtonEl.hidden = true;
+      this._addTimerHintEl.hidden = true;
+      this._chipsEl.classList.add("show");
     }
-    this._emptyEl.classList.toggle("voice-down", fallback);
+    if (this._pickerEl) this._pickerEl.hidden = !this._picker.open;
+  }
+
+  // Duration picker rendering (TIMER-17, R3): the three value spans
+  // show the current picker state; the error line hides whenever the
+  // values change (a new value is a new attempt, not the rejected
+  // zero). No service call happens here — Start is the only path out.
+  _renderPicker() {
+    if (!this._pickerEl) return;
+    for (const unit of ["hours", "minutes", "seconds"]) {
+      const el = this._pickerValueEls && this._pickerValueEls[unit];
+      if (el) el.textContent = String(this._picker[unit]);
+    }
+    if (this._pickerErrorEl) this._pickerErrorEl.hidden = true;
+  }
+
+  // One picker stepper tap: move one unit by the button's delta,
+  // clamped to the field range (hours 0–99, minutes/seconds 0–59),
+  // then re-render. A step that would go below zero stays at zero —
+  // the value never goes negative, so the only zero is 0:00:00.
+  _onPickerStep(unit, delta) {
+    if (DURATION_FIELD_MAX[unit] === undefined) return;
+    this._picker[unit] = clampDurationPart(
+      unit,
+      (Number(this._picker[unit]) || 0) + (Number(delta) || 0)
+    );
+    this._renderPicker();
+  }
+
+  // Picker Start (TIMER-17, R3): a zero/empty duration is rejected
+  // LOUDLY in the picker — the error line shows, the panel stays
+  // open, and NO service call is made (never a 0 s timer). Any
+  // positive duration starts through the SAME shared path as a chip
+  // tap (_startNamedTimer), with the human duration name.
+  _onPickerStart() {
+    const total = durationTotalSeconds(this._picker);
+    if (total <= 0) {
+      if (this._pickerErrorEl) {
+        this._pickerErrorEl.textContent =
+          "Pick a time first — a timer needs more than 0 seconds.";
+        this._pickerErrorEl.hidden = false;
+      }
+      return;
+    }
+    const name = formatDurationName(total);
+    // A successful Start consumes the entry: the picker resets to
+    // 0:00:00 so the next entry starts fresh (a stale previous
+    // duration silently carried into the next timer would be a
+    // wrong-timer bug). Cancel, by contrast, keeps the values.
+    this._picker = { hours: 0, minutes: 0, seconds: 0, open: false };
+    this._renderPicker();
+    this._updateAddTimerRow();
+    this._startNamedTimer(name, total);
   }
 
   // Empty-state voice hints (D4 / contract-hints): the wall gets the
@@ -3059,24 +3268,33 @@ class TimerScreenCard extends HTMLElement {
   async _onPresetTap(minutes) {
     // TIMER-4: preset chips start a timer by duration. The name is
     // the duration ("10 minute timer"); the recipe name comes from
-    // recipe chips instead (RECIPE-5 / BRIDGE-1).
-    //
-    // R2 (§8.1 interim direct binding, until R4's PIP Host lands):
-    // the call runs with return_response: true and the card binds by
-    // the returned entity id from the start — no name matching, no
-    // 15 s window. Until the sensor appears the card shows a
-    // "starting…" dial with no countdown-as-fact; the 10 s timeout
-    // hides it and logs a warning with the entity id (the timer
-    // itself is unaffected — it still shows in the Timers view). A
-    // failed call shows the visible error state naming the failure
-    // and never retries (§8.1 F14); the user re-taps. When the sensor
-    // binds, _sync scrolls the new dial into view and pulses it once.
+    // recipe chips instead (RECIPE-5 / BRIDGE-1). The start itself is
+    // the shared path below — a chip tap and a picker entry start a
+    // timer through the SAME service call (R3, RB-R3-3).
+    await this._startNamedTimer(`${minutes} minute timer`, minutes * 60);
+  }
+
+  // Shared timer-start path (TIMER-4 + TIMER-17, R3 RB-R3-3): preset
+  // chips and the duration picker both arrive here with a name and a
+  // duration in seconds — one service call, one binding, one error
+  // path. Callers validate the duration first (the picker rejects
+  // zero loudly before calling; a preset is always positive).
+  //
+  // R2 (§8.1 interim direct binding, until R4's PIP Host lands):
+  // the call runs with return_response: true and the card binds by
+  // the returned entity id from the start — no name matching, no
+  // 15 s window. Until the sensor appears the card shows a
+  // "starting…" dial with no countdown-as-fact; the 10 s timeout
+  // hides it and logs a warning with the entity id (the timer
+  // itself is unaffected — it still shows in the Timers view). A
+  // failed call shows the visible error state naming the failure
+  // and never retries (§8.1 F14); the user re-taps. When the sensor
+  // binds, _sync scrolls the new dial into view and pulses it once.
+  async _startNamedTimer(name, duration) {
     if (this._presetBusy || !this._hass) return;
     this._presetBusy = true;
     this._setPresetBusy(true);
     try {
-      const name = `${minutes} minute timer`;
-      const duration = minutes * 60;
       const response = await this._callStartTimer(name, duration);
       const entityId =
         response && typeof response.entity_id === "string"
@@ -3128,10 +3346,7 @@ class TimerScreenCard extends HTMLElement {
     } catch (err) {
       this._clearPendingStart();
       if (typeof console !== "undefined") {
-        console.warn(
-          `Family Hub: could not start the ${minutes} minute timer:`,
-          err
-        );
+        console.warn(`Family Hub: could not start the ${name}:`, err);
       }
       if (this._emptyErrorEl) {
         const message = String((err && err.message) || err || "");
@@ -3153,6 +3368,9 @@ class TimerScreenCard extends HTMLElement {
     )) {
       button.disabled = busy;
     }
+    // The picker Start shares the same in-flight guard: while a start
+    // is in flight the picker cannot fire a second one (R3).
+    if (this._pickerStartEl) this._pickerStartEl.disabled = busy;
   }
 
   // -- navigation (NAV-1) -------------------------------------------------
@@ -3216,6 +3434,34 @@ class TimerScreenCard extends HTMLElement {
     }
     if (action === "preset") {
       this._onPresetTap(Number(target.dataset.minutes) || 0);
+      return;
+    }
+    if (action === "duration-picker") {
+      // TIMER-17 (R3): toggle the duration picker panel. Opening it
+      // keeps the current values (a cook mid-entry does not lose
+      // them by tapping away and back); closing it with Cancel keeps
+      // them too. Only a successful Start resets the entry to 0:00:00
+      // (see _onPickerStart) — a stale duration must never carry
+      // silently into the next timer.
+      this._picker.open = !this._picker.open;
+      this._renderPicker();
+      this._updateAddTimerRow();
+      return;
+    }
+    if (action === "picker-step") {
+      this._onPickerStep(target.dataset.unit, Number(target.dataset.delta) || 0);
+      return;
+    }
+    if (action === "picker-start") {
+      this._onPickerStart();
+      return;
+    }
+    if (action === "picker-cancel") {
+      // Cancel closes the panel and clears the loud zero error; the
+      // values stay (reopening shows the same entry, not a reset).
+      this._picker.open = false;
+      this._renderPicker();
+      this._updateAddTimerRow();
       return;
     }
     if (action === "back-recipe") {
@@ -3325,7 +3571,15 @@ if (typeof module !== "undefined" && module.exports) {
     PENDING_START_TIMEOUT_MS,
     discoverTimers,
     gridColumnsFor,
-    voiceUnavailable,
+    // R3 (RB-R3-3): voiceUnavailable is DELETED with the voice-down
+    // display it drove — the Voice Status Provider drives recovery,
+    // not display, and nothing in this card reads voice state.
+    clampDurationPart,
+    parseDurationParts,
+    durationTotalSeconds,
+    formatDurationName,
+    DURATION_MAX_HOURS,
+    DURATION_FIELD_MAX,
     readTimersPin,
     readTimersArrival,
     CORE_RESOURCE_PATH,

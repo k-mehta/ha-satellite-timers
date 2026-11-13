@@ -195,14 +195,15 @@ test("DESIGN-1 Part B: the timer card inlines the tokens it consumes (values rea
   for (const [group, key, pattern] of TIMER) {
     has(TIMER_CSS, pattern(tokenValue(group, key)), `timer card must inline ${group}.${key}`);
   }
-  // The line token's count pins all seven border rules (controls,
+  // The line token's count pins all ten border rules (controls,
   // add-timer button, back-bar, preset chip, finished header,
-  // finished row, finished restart — the nav-strip button is
-  // borderless since wave 1, D-N1) — an eighth border, or a drifted
-  // one, fails.
+  // finished row, finished restart, duration-picker panel, picker
+  // stepper button, picker action button — the nav-strip button is
+  // borderless since wave 1, D-N1) — an eleventh border, or a drifted
+  // one, fails. R3 (RB-R3-3) added the last three with the picker.
   const line = tokenValue("palette", "color-line");
   const count = TIMER_CSS.split(`border: 1px solid ${line};`).length - 1;
-  assert.equal(count, 7, `expected 7 borders in ${line}, found ${count}`);
+  assert.equal(count, 10, `expected 10 borders in ${line}, found ${count}`);
 });
 
 // Tokens Part B does NOT assert, with the reason each is skipped.

@@ -3210,6 +3210,52 @@ check("B3 clean-case: docstring qualifies just-under-46-min as the 15-minute-ste
 check("B3 clean-case: docstring states the 15-minute-step value holds once attempt_count is 3 or more",
       "once attempt_count is 3 or more"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+# Burst-12 (union of burst-11 verifier h1-h5 and delta critic G1-G10):
+# the same class again — more load-bearing phrases in the clean-case
+# passage (bridge.py lines 2898-2916) tripped zero pins when mutated.
+# Each phrase is pinned within its own single docstring line
+# (cross-line spans fail, burst-9); each label states only what its
+# span actually says. G3's bare phrase "earlier in the ladder it"
+# occurs twice (clean case L2901, flap-fail L2952), so it is scoped
+# with its line's "Finding 1);" prefix to the clean-case occurrence.
+# The G5/h2 span pins all three aligned times at once; the G7/h5
+# span pins all three off-phase landing times at once.
+check("B3 clean-case: docstring defines the clean case as no skip, no failed attempt",
+      "no skip, no failed attempt"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states clearing after the",
+      "clearing after the"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states earlier in the ladder it",
+      "Finding 1); earlier in the ladder it"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+# G8: the ladder values are ALSO pinned behaviourally via
+# _CANCELLED_BACKOFF, so this pin is docstring-text drift coverage
+# only — it guards the docstring wording, not the behaviour.
+check("B3 clean-case: docstring states the backoff ladder (60 s, 5 min, 15 min)",
+      "(60 s, 5 min, 15 min)"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states three consecutive \"sent\" attempts",
+      "three consecutive \"sent\" attempts"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring spaces the sent attempts at +15, +30 and +45 min",
+      "+15, +30 and +45 min"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states attempts land on 60 s trigger-4 ticks",
+      "land on 60 s trigger-4 ticks"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states the first attempt is preserved, not accumulated",
+      "the first attempt is preserved, not accumulated"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states off-phase attempts land at up to +15:59, +30:59 and +45:59",
+      "up to +15:59, +30:59 and +45:59"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states that bound holds only in the clean case",
+      "That bound holds only in the clean case"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states no unavailable-skip at a due tick and no failed attempt in",
+      "unavailable-skip at a due tick and no failed attempt in"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 check("B3 clean-case: docstring states earlier in the ladder it takes less",
       "takes less: with the last attempt just before recovery"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)

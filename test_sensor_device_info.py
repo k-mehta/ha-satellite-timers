@@ -1,6 +1,8 @@
-"""Verify the sensor's device-info fix without a live Home Assistant.
+"""Verify the sensor's device-info fix + the v2 sensor contract,
+without a live Home Assistant.
 
-Reproduces the exact failure from the HA log (Oct 31, 2026):
+Device-info part — reproduces the exact failure from the HA log
+(Oct 31, 2026):
 
     satellite_timers: Not adding entity, error adding device: Invalid device
     info {'identifiers': set(), 'name': 'kitchen_hub', ...} for
@@ -12,6 +14,14 @@ old sensor code passed that empty set through as its device link, which HA
 rejects. The fix: only attach device info when identifiers or connections
 are non-empty, otherwise the sensor stands alone.
 
+Contract part (RB-R2-6, §5.2): sensor states are exactly
+{active, paused, finished} — no "ringing" — every sensor carries
+``contract_version: 2``, and the deleted fields (``sound_volume_pct``,
+``quiet_hours``, ``is_ringing``, ``ringing_until``) are absent from
+every state. The ``start_timer`` schema is pinned too: name required,
+duration in seconds required (services.yaml + the vol schema in
+``__init__.py``, read by AST so no HA import is needed).
+
 This test stubs the Home Assistant modules sensor.py imports, loads the
 real sensor.py and bridge.py, and runs HA's own validation rule against
 whatever device info the sensor produces.
@@ -19,9 +29,11 @@ whatever device info the sensor produces.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import types
+import yaml
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,15 +100,15 @@ pkg = types.ModuleType("satellite_timers")
 pkg.__path__ = [str(COMPONENTS)]
 sys.modules["satellite_timers"] = pkg
 
-# sensor.py imports .const and .sound relatively — load those first.
-for _name in ("const", "sound"):
-    _spec = importlib.util.spec_from_file_location(
-        f"satellite_timers.{_name}", COMPONENTS / f"{_name}.py"
-    )
-    assert _spec is not None and _spec.loader is not None
-    _mod = importlib.util.module_from_spec(_spec)
-    sys.modules[f"satellite_timers.{_name}"] = _mod
-    _spec.loader.exec_module(_mod)
+# sensor.py imports .const relatively — load it first. (sound.py is
+# DELETED by RB-R2-5; nothing here loads it.)
+_spec = importlib.util.spec_from_file_location(
+    "satellite_timers.const", COMPONENTS / "const.py"
+)
+assert _spec is not None and _spec.loader is not None
+_const_mod = importlib.util.module_from_spec(_spec)
+sys.modules["satellite_timers.const"] = _const_mod
+_spec.loader.exec_module(_const_mod)
 
 spec = importlib.util.spec_from_file_location(
     "satellite_timers.sensor", COMPONENTS / "sensor.py"
@@ -145,21 +157,26 @@ def ha_device_info_valid(device_info) -> bool:
     return bool(device_info.get("identifiers") or device_info.get("connections"))
 
 
-def make_sensor(device):
-    hass = FakeHass(device)
-    # device_registry.async_get(hass) must return the fake registry.
+def _set_registry(device):
     sys.modules[
         "homeassistant.helpers.device_registry"
     ].async_get = lambda _hass: FakeDeviceRegistry(device)
-    snapshot = bridge_mod.TimerSnapshot(
-        timer_id="01K9TESTTIMERID0000000001",
-        name="Pasta",
-        device_id="kitchen-hub-device-id",
-        is_active=True,
-        total_seconds=600,
-        seconds_left=590,
-        finishes_at=datetime.now(timezone.utc),
-    )
+
+
+def make_sensor(device, **record_kwargs):
+    hass = FakeHass(device)
+    _set_registry(device)
+    kwargs = {
+        "timer_id": "01K9TESTTIMERID0000000001",
+        "name": "Pasta",
+        "device_id": "kitchen-hub-device-id",
+        "is_active": True,
+        "total_seconds": 600,
+        "seconds_left": 590,
+        "finishes_at": datetime.now(timezone.utc),
+    }
+    kwargs.update(record_kwargs)
+    snapshot = bridge_mod.TimerRecord(**kwargs)
     return sensor_mod.SatelliteTimerSensor(hass, snapshot)
 
 
@@ -167,6 +184,9 @@ def check(label: str, condition: bool) -> None:
     print(("PASS  " if condition else "FAIL  ") + label)
     if not condition:
         raise SystemExit(1)
+
+
+DELETED_ATTRS = ("sound_volume_pct", "quiet_hours", "is_ringing", "ringing_until")
 
 
 # ------------------------------------------------------------- the cases
@@ -241,110 +261,82 @@ check(
     getattr(sensor, "entity_id", "").startswith("sensor.satellite_timer_"),
 )
 
-# 6. DESIGN-5 (Phase 7): a FINISHED timer carries the sound policy
-#    attributes; an active timer does not. The expected volume is
-#    computed from the sound module at the same instant — the policy
-#    math itself (including the quiet-hours boundary) is covered by
-#    test_sound.py with fixed times; this case proves the sensor wires
-#    the finished timer to the policy. The numbers are the policy, not
-#    a measurement — no speaker is confirmed (S1 unresolved).
-def make_finished_sensor(device, finished_at):
-    hass = FakeHass(device)
-    sys.modules[
-        "homeassistant.helpers.device_registry"
-    ].async_get = lambda _hass: FakeDeviceRegistry(device)
-    snapshot = bridge_mod.TimerSnapshot(
-        timer_id="01K9TESTTIMERID0000000002",
-        name="Pasta",
-        device_id="kitchen-hub-device-id",
-        is_active=False,
-        total_seconds=600,
-        seconds_left=0,
-        finishes_at=finished_at,
-        is_finished=True,
-        finished_at=finished_at,
-    )
-    return sensor_mod.SatelliteTimerSensor(hass, snapshot)
-
-
-sound_mod = sys.modules["satellite_timers.sound"]
+# 6. Contract v2 (§5.2, RB-R2-6): states are exactly
+#    {active, paused, finished}; every sensor carries contract_version 2;
+#    the deleted fields are absent from every state.
 finished_at = datetime.now(timezone.utc)
-finished = make_finished_sensor(kitchen_hub, finished_at)
+finished = make_sensor(
+    kitchen_hub,
+    timer_id="01K9TESTTIMERID0000000002",
+    is_active=False,
+    seconds_left=0,
+    finishes_at=finished_at,
+    is_finished=True,
+    finished_at=finished_at,
+)
 check("finished sensor state is finished", finished._attr_native_value == "finished")
-finished_attrs = finished._attr_extra_state_attributes
-check(
-    "finished sensor carries sound_volume_pct",
-    finished_attrs.get("sound_volume_pct")
-    == sound_mod.current_sound_volume_pct(
-        datetime.now(timezone.utc), finished_at, {}
-    ),
+paused = make_sensor(
+    kitchen_hub,
+    timer_id="01K9TESTTIMERID0000000003",
+    is_active=False,
+    seconds_left=420,
 )
-check(
-    "finished sensor carries quiet_hours",
-    finished_attrs.get("quiet_hours")
-    == sound_mod.is_quiet_hours(datetime.now(timezone.utc), "22:00", "07:00"),
-)
-check(
-    "active sensor carries no sound attributes",
-    "sound_volume_pct" not in sensor._attr_extra_state_attributes
-    and "quiet_hours" not in sensor._attr_extra_state_attributes,
-)
+check("paused sensor state is paused", paused._attr_native_value == "paused")
+for label, s in (("active", sensor), ("paused", paused), ("finished", finished)):
+    attrs = s._attr_extra_state_attributes
+    check(f"contract v2: {label} sensor carries contract_version 2",
+          attrs.get("contract_version") == 2)
+    check(f"contract v2: {label} sensor state is in the contract set",
+          s._attr_native_value in ("active", "paused", "finished"))
+    check(f"contract v2: {label} sensor carries no deleted field",
+          not any(field in attrs for field in DELETED_ATTRS))
+    check(f"contract v2: {label} sensor never reads ringing",
+          s._attr_native_value != "ringing")
+# The §5.2 attribute shape: finished carries finished_at,
+# started_via is always present, started_at only when observed.
+check("contract v2: finished sensor carries finished_at",
+      "finished_at" in finished._attr_extra_state_attributes)
+check("contract v2: finished sensor carries started_via",
+      finished._attr_extra_state_attributes.get("started_via") == "voice")
+check("contract v2: unobserved start omits started_at",
+      "started_at" not in sensor._attr_extra_state_attributes)
 
-# 7. DESIGN-5 follow-up (Phase 7): quiet hours are LOCAL wall-clock
-#    hours, not UTC. The sensor used to pass datetime.now(timezone.utc)
-#    to the policy, so on a hub in America/Los_Angeles a 22:00-07:00
-#    window ran 14:00-23:00 local and sounded at full volume overnight.
-#    A `now` in local quiet hours while UTC is outside them must report
-#    quiet, and vice versa. Local here is a fixed -07:00 offset (PDT);
-#    the wall-clock reading is what matters, not the zone name. The
-#    sensor's update_from_snapshot takes `now` so this pins the caller
-#    without a live hub (the policy math itself is test_sound.py).
-def make_finished_pair(device, finished_at):
-    hass = FakeHass(device)
-    sys.modules[
-        "homeassistant.helpers.device_registry"
-    ].async_get = lambda _hass: FakeDeviceRegistry(device)
-    snapshot = bridge_mod.TimerSnapshot(
-        timer_id="01K9TESTTIMERID0000000003",
-        name="Pasta",
-        device_id="kitchen-hub-device-id",
-        is_active=False,
-        total_seconds=600,
-        seconds_left=0,
-        finishes_at=finished_at,
-        is_finished=True,
-        finished_at=finished_at,
-    )
-    return sensor_mod.SatelliteTimerSensor(hass, snapshot), snapshot
+# 7. start_timer schema (RB-R2-6): name required, duration in seconds
+#    required — pinned in both places the schema lives, so a later edit
+#    cannot silently make the name optional or the duration unit vague.
+services = yaml.safe_load((COMPONENTS / "services.yaml").read_text())
+start_fields = services["start_timer"]["fields"]
+check("start_timer schema: name is required",
+      start_fields["name"].get("required") is True)
+check("start_timer schema: duration is required",
+      start_fields["duration"].get("required") is True)
+check("start_timer schema: duration is in seconds",
+      "SECOND" in start_fields["duration"].get("description", "").upper())
 
-
-LOCAL = timezone(timedelta(hours=-7))
-# Local 02:00 is inside 22:00-07:00 while UTC is 09:00 (outside).
-now_local_quiet = datetime(2026, 11, 8, 2, 0, tzinfo=LOCAL)
-quiet_sensor, quiet_snapshot = make_finished_pair(kitchen_hub, now_local_quiet)
-quiet_sensor.update_from_snapshot(quiet_snapshot, write=False, now=now_local_quiet)
-quiet_attrs = quiet_sensor._attr_extra_state_attributes
-check(
-    "local quiet + UTC loud: quiet_hours is true",
-    quiet_attrs.get("quiet_hours") is True,
+init_tree = ast.parse(
+    (HERE / "custom_components" / "satellite_timers" / "__init__.py").read_text()
 )
-check(
-    "local quiet + UTC loud: volume is the quiet target, ramped from 40%",
-    # 30% of the 100 target, 40% of that at once (elapsed 0).
-    quiet_attrs.get("sound_volume_pct") == 12,
-)
-# Local 16:00 is outside 22:00-07:00 while UTC is 23:00 (inside).
-now_local_loud = datetime(2026, 11, 8, 16, 0, tzinfo=LOCAL)
-loud_sensor, loud_snapshot = make_finished_pair(kitchen_hub, now_local_loud)
-loud_sensor.update_from_snapshot(loud_snapshot, write=False, now=now_local_loud)
-loud_attrs = loud_sensor._attr_extra_state_attributes
-check(
-    "local loud + UTC quiet: quiet_hours is false",
-    loud_attrs.get("quiet_hours") is False,
-)
-check(
-    "local loud + UTC quiet: volume is the full target, ramped from 40%",
-    loud_attrs.get("sound_volume_pct") == 40,
-)
+start_schema = None
+for node in ast.walk(init_tree):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "_START_TIMER_SCHEMA":
+                value = node.value
+                # vol.Schema({...}) — the dict is the call's first arg.
+                if isinstance(value, ast.Call) and value.args:
+                    value = value.args[0]
+                start_schema = value
+required_keys = set()
+if isinstance(start_schema, ast.Dict):
+    for key in start_schema.keys:
+        func = key.func
+        if isinstance(func, ast.Attribute) and func.attr == "Required":
+            arg = key.args[0]
+            if isinstance(arg, ast.Constant):
+                required_keys.add(arg.value)
+check("start_timer vol schema: name is required",
+      "name" in required_keys)
+check("start_timer vol schema: duration is required",
+      "duration" in required_keys)
 
 print("\nAll sensor device-info checks passed.")

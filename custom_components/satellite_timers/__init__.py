@@ -32,13 +32,18 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, SupportsResponse
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent as intent_helpers
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.collection import ItemNotFound
 
-from .bridge import SatelliteTimerBridge, assist_supported, timer_devices, timer_manager
+from .bridge import (
+    SatelliteTimerBridge,
+    assist_supported,
+    resolve_bridge_options,
+    timer_devices,
+    timer_manager,
+)
 from .const import (
     CARD_RESOURCE_TYPE,
     CARD_URL,
@@ -118,7 +123,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if not device_ids:
         device_ids = timer_devices(hass)
 
-    bridge = SatelliteTimerBridge(hass, device_ids)
+    # RB-R2-7: the bridge reads its options at construction from the
+    # config entry (resolve_bridge_options applies the recorded defaults
+    # while unset — Q11 settled never-ring, Q12 settled never re-send,
+    # O1 unsettled, no primary), so the load-time condition is a read
+    # of bridge-held options, not a second store.
+    bridge = SatelliteTimerBridge(
+        hass, device_ids, resolve_bridge_options(entry.options)
+    )
     try:
         restored = await bridge.async_load_persisted()
     except Exception:  # persistence is best effort; sensors must not fail
@@ -126,7 +138,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         restored = 0
     if restored:
         _LOGGER.info("Restored %d timers from storage", restored)
-    if not bridge.start():
+    if not await bridge.start():
         return False
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {"bridge": bridge}
@@ -260,13 +272,15 @@ _RESTORE_FINISHED_SCHEMA = vol.Schema(
 def _resolve_satellite_device(
     hass: HomeAssistant, bridge: SatelliteTimerBridge, satellite: str | None
 ) -> str:
-    """The device id a start_timer call targets (BRIDGE-1).
+    """The device id a start_timer call targets (§5.4, RB-R2-4).
 
-    ``satellite`` is an entity id (e.g. the kitchen satellite's entity).
-    Without one, the default is the kitchen satellite when one can be
-    recognised by name, else the first configured satellite. Raises
-    HomeAssistantError naming the satellite and the voice alternative
-    when nothing usable resolves.
+    Caller → primary → single → loud error. No name-substring matching,
+    ever, and no sort-order fallback: the old "kitchen" substring guess
+    and the ``sorted(devices)[0]`` fallback are deleted (N1). A caller
+    that names an unknown or unconfigured satellite, and an ambiguous
+    house with no primary, both fail LOUDLY, naming the voice
+    alternative — and, for the ambiguous case, the Configure path where
+    the primary is set.
     """
     devices = bridge.devices
     if not devices:
@@ -288,14 +302,23 @@ def _resolve_satellite_device(
                 "satellite — say 'Okay Nabu, set a timer' instead"
             )
         return entity.device_id
+    primary = bridge.primary_satellite
+    if primary is not None:
+        if primary not in devices:
+            raise HomeAssistantError(
+                "The primary timer satellite is no longer configured — "
+                "pick a new one at Settings → Devices & Services → "
+                "Satellite Timers → Configure, or say 'Okay Nabu, "
+                "set a timer' instead"
+            )
+        return primary
     if len(devices) == 1:
         return next(iter(devices))
-    device_reg = dr.async_get(hass)
-    for device_id in sorted(devices):
-        device = device_reg.async_get(device_id)
-        if device is not None and device.name and "kitchen" in device.name.lower():
-            return device_id
-    return sorted(devices)[0]
+    raise HomeAssistantError(
+        "More than one timer satellite is configured and no primary is "
+        "set — pick one at Settings → Devices & Services → Satellite "
+        "Timers → Configure, or say 'Okay Nabu, set a timer' instead"
+    )
 
 
 def _register_services(
@@ -355,6 +378,11 @@ def _register_services(
             ) from None
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the mutation must reach storage before
+        # the service call returns, so it survives an immediate
+        # restart. (For a live timer the tap also schedules a
+        # background save; this await is the guarantee.)
+        await bridge.persist()
 
     async def handle_resume(call) -> None:
         kind, tm, timer = resolve(call.data["timer_id"])
@@ -376,6 +404,11 @@ def _register_services(
             ) from None
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the mutation must reach storage before
+        # the service call returns, so it survives an immediate
+        # restart. (For a live timer the tap also schedules a
+        # background save; this await is the guarantee.)
+        await bridge.persist()
 
     async def handle_cancel(call) -> None:
         kind, tm, timer = resolve(call.data["timer_id"])
@@ -397,6 +430,11 @@ def _register_services(
             ) from None
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the mutation must reach storage before
+        # the service call returns, so it survives an immediate
+        # restart. (For a live timer the tap also schedules a
+        # background save; this await is the guarantee.)
+        await bridge.persist()
 
     async def handle_add_time(call) -> None:
         kind, tm, timer = resolve(call.data["timer_id"])
@@ -421,6 +459,11 @@ def _register_services(
             ) from None
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the mutation must reach storage before
+        # the service call returns, so it survives an immediate
+        # restart. (For a live timer the tap also schedules a
+        # background save; this await is the guarantee.)
+        await bridge.persist()
 
     async def handle_dismiss(call) -> None:
         try:
@@ -434,6 +477,10 @@ def _register_services(
             raise HomeAssistantError(
                 f"Timer {call.data['timer_id']} not found"
             ) from None
+        # Persist site (3): dismiss must not return until the save
+        # lands (§5.3 F3) — a dismiss lost to a restart would resurrect
+        # a finished timer the user already cleared.
+        await bridge.persist()
 
     async def handle_restart(call) -> None:
         try:
@@ -452,6 +499,9 @@ def _register_services(
             ) from None
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the old record is dropped and the new timer
+        # started — both must reach storage before returning.
+        await bridge.persist()
 
     async def handle_start(call) -> dict:
         """Start a timer by name and duration in SECONDS (BRIDGE-1).
@@ -481,6 +531,9 @@ def _register_services(
             ) from None
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the new timer must reach storage before
+        # the service call returns.
+        await bridge.persist()
         return {"entity_id": f"sensor.satellite_timer_{timer_id.lower()}"}
 
     async def handle_restore(call) -> dict:
@@ -517,6 +570,9 @@ def _register_services(
             ) from None
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the restored timer must reach storage
+        # before the service call returns.
+        await bridge.persist()
         return {"entity_id": f"sensor.satellite_timer_{timer_id.lower()}"}
 
     async def handle_restore_finished(call) -> dict:
@@ -556,6 +612,9 @@ def _register_services(
             )
         except ValueError as err:
             raise HomeAssistantError(str(err)) from None
+        # Persist site (3): the restored finished record must reach
+        # storage before the service call returns.
+        await bridge.persist()
         return {"entity_id": f"sensor.satellite_timer_{timer_id.lower()}"}
 
     hass.services.async_register(

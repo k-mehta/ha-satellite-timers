@@ -146,21 +146,20 @@ turning `active` means a timer started; no `active`, `paused` or
 
 ## Sound
 
-The satellite plays its own alarm when a timer finishes — the
-bridge only decides how loud it should be. Configure it in the
-integration's options (Settings → Devices & Services → Satellite
-Timers → Configure): timer volume (0–100, default 100), quiet hours
-(default 22:00–07:00) with a quiet-hours volume (default 30% of the
-timer volume), and escalation (default on: the alarm starts at 40%
-of its target and rises 20 points every 10 seconds, reaching full
-volume in 30 seconds). A finished timer's sensor carries the
-computed level as `sound_volume_pct` (and `quiet_hours`) attributes,
-for a speaker or automation that honours them. Stopping is always
-available: tap the finished dial, or say "dismiss the pasta timer".
+Removed (rebuild R2, RB-R2-5, on the recorded default Q1(a)): the sound
+policy is deleted, not fixed — `sound.py`, the options-flow sound
+fields, and the sensor `sound_volume_pct` / `quiet_hours` attributes
+are all gone. No consumer for a volume value exists through this
+mechanism (Wyoming `TimerFinished(id)` carries no volume; HA Core
+forwards exactly the four timer events; `AssistSatelliteEntity` has no
+volume attribute), so shipping the knobs first and the mechanism never
+was the shortcut. The satellite plays its own alarm at its own volume.
+If a real consumer ever exists, sound returns as a new feature with its
+consumer built first and verified on the live hub. Whether a quieter
+alarm at night is wanted as an outcome at all is user question Q1.
 
-No speaker is specified or assumed by this integration — until a
-speaker exists and something honours these attributes, the policy
-is configuration only and live sound verification stays open.
+Stopping is always available: tap the finished dial, or say "dismiss
+the pasta timer".
 
 ## Troubleshooting
 

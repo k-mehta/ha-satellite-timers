@@ -51,12 +51,29 @@
 //            screensaver pre-view save are automation-side — Phase 6.)
 //   TIMER-11 Duplicates render distinguishably: full name + start
 //            time ("Pasta — started 6:02 PM"), from the sensor's
-//            started_at attribute (the bridge owns it; the card falls
-//            back to deriving it from finishes_at / finished_at).
+//            started_at attribute when the bridge observed the start.
+//            When the bridge did not observe it the attribute is
+//            omitted and the card shows no start line (R2, RB-R2-11:
+//            observed-or-omitted, §5.1 — the finishes_at/finished_at
+//            derivations and the first-sight cache are deleted).
 //   TIMER-12 A finished timer's state persists until dismissed (the
 //            bridge owns this; the card renders the finished state
 //            whenever it next looks). Missed-timer announcement is
-//            bridge-side (replay on satellite reconnect).
+//            bridge-side (queue re-send on a liveness drain, settled
+//            Q11/Q12 — load-time run-outs never ring).
+//   TIMER-16 (R2, RB-R2-11) Countdowns come from core TimerClock
+//            (§14): server `remaining` + monotonic elapsed, 5 s
+//            staleness bound with freeze + stale mark — for ACTIVE
+//            timers. Paused timers show the frozen server `remaining`
+//            (exact; a paused sensor emits no push, so no elapsed
+//            applies and no stale mark ever shows for one). Chip taps
+//            bind by the `return_response: true` entity id from the
+//            start (interim direct binding until R4's PIP Host lands)
+//            with a "starting…" state until the sensor appears.
+//            Sort stays RUNNING-FIRST (R0 coordinator ruling 1 — the
+//            plan row's "finished-first sort (F-T20 lineage)" is a
+//            plan error; architecture §5.1 governs, mandating only the
+//            <60 s finished-section force rule, built below).
 //   TIMER-13 Cancelling shows an Undo toast for 5 s; Undo re-creates
 //            the timer via the bridge restore_timer service with the
 //            same name and the REMAINING time at cancel (min 1 s) —
@@ -97,9 +114,11 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 88;
 // 59, not 60 (Wave 1, OQ-5): the design flips "soon" at 59 s and the
 // flip follows the SENSOR's remaining attribute (sensorRemaining),
 // not the displayed countdown — the two can differ by a second, and
-// the sensor is the source of truth. The strip badge amber stays at
-// <=60 s (coordinator decision #25-D, literal) — a different rule
-// for a different surface.
+// the sensor is the source of truth. The strip badge amber uses this
+// SAME threshold (R2 fix burst, critic F3): one measured rule for
+// both consumers — the badge's old <=60 s was a second rule for the
+// same "last 60 s" window (design D-N1 prose), and the two disagreed
+// for exactly one second of a timer's life.
 const FINISHING_SOON_SECONDS = 59;
 // How long the Cancel button stays armed ("Tap again to cancel") after the
 // first tap, before it disarms itself.
@@ -127,14 +146,55 @@ function displayName(stateObj) {
   return "Timer";
 }
 
-function formatRemaining(totalSeconds) {
-  const total = Math.max(0, Math.floor(totalSeconds || 0));
-  const hours = Math.floor(total / 3600);
-  const minutes = Math.floor((total % 3600) / 60);
-  const seconds = total % 60;
-  const mm = hours > 0 ? String(minutes).padStart(2, "0") : String(minutes);
-  const ss = String(seconds).padStart(2, "0");
-  return hours > 0 ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
+// -- Time discipline (R2, RB-R2-11; architecture §14) ------------------
+//
+// The per-card time copies are DELETED (§19): `formatRemaining`,
+// `remainingSeconds`, `progressFraction` and `startedAtMs` lived here
+// and are now core's — `formatRemaining`, `TimerClock` and
+// `progressFraction` in family-hub-core.js, imported at runtime (see
+// _ensureCore). The card never derives a countdown from `finishes_at`
+// with the wall clock (R2-T7) and never derives a start time
+// (R2-T9): `started_at` is observed-or-omitted (§5.1), so a timer
+// without the attribute shows no start line at all.
+//
+// What remains here are the two pure readers that are NOT core
+// functions: the sensor's own `remaining` attribute (the "soon" flip
+// and the badge read this, not the displayed countdown — the two can
+// differ by a second, T-IMPL-13 / OQ-5) and the finished-section
+// recency rule (§5.1 F6).
+//
+// `recentlyFinished`: a finished timer with now − finished_at < 60 s
+// [CHOICE — timer-card recency policy, owned by the timer card,
+// §5.1] forces the finished section expanded (never inside the
+// collapsed summary), even while running/paused timers exist. After
+// 60 s it falls back to the default collapse rule. A finished_at in
+// the near future (clock skew) counts as recent — showing it is the
+// safe direction.
+
+// How long a just-finished timer forces the finished section expanded
+// (§5.1 F6 — the same 60 s horizon the PIP and the old ringing window
+// used, so the three consumers agree on what "recently finished" means).
+const FINISHED_FORCE_EXPAND_MS = 60 * 1000;
+// How long a chip-started timer may stay in the "starting…" state
+// before the card gives up waiting for its sensor (§8.1 F4; mirrors
+// core PIP_STARTING_TIMEOUT_MS — 10× the ~1 s normal next-sync
+// appearance, not a tuned value).
+const PENDING_START_TIMEOUT_MS = 10 * 1000;
+// How long the chip-start websocket call itself may hang before the
+// card gives up on it (critic N4): the 10 s pending-start timeout
+// above only starts AFTER the call returns, so a hung call left
+// _presetBusy set and every preset chip dead until reload. Same 10 s
+// — a hung call is the same failure class as a sensor that never
+// appears. The call is never retried; a late response is discarded.
+const CALL_WS_TIMEOUT_MS = 10 * 1000;
+
+function recentlyFinished(timer, nowMs) {
+  if (!timer || timer.state !== "finished" || !timer.finishedAt) {
+    return false;
+  }
+  const finishedMs = Date.parse(timer.finishedAt);
+  if (!Number.isFinite(finishedMs)) return false;
+  return nowMs - finishedMs < FINISHED_FORCE_EXPAND_MS;
 }
 
 // Elapsed-since-finish for a finished timer (TIMER-3 / HOME-3).
@@ -161,52 +221,12 @@ function formatStartTime(startedAtMs) {
   });
 }
 
-function remainingSeconds(timer, nowMs) {
-  if (!timer) return 0;
-  if (timer.state === "paused") return Math.max(0, timer.remaining || 0);
-  if (timer.finishesAt) {
-    return Math.max(0, Math.round((Date.parse(timer.finishesAt) - nowMs) / 1000));
-  }
-  return Math.max(0, timer.remaining || 0);
-}
-
 // The sensor's own remaining attribute (T-IMPL-13 / OQ-5): the "soon"
 // flip and the strip badge read this, not the displayed countdown
 // derived from finishes_at — the two can differ by a second.
 function sensorRemaining(timer) {
   if (!timer) return 0;
   return Math.max(0, Number(timer.remaining) || 0);
-}
-
-function progressFraction(timer, nowMs) {
-  if (!timer || !timer.duration || timer.duration <= 0) return 0;
-  return Math.min(1, Math.max(0, remainingSeconds(timer, nowMs) / timer.duration));
-}
-
-// When a timer started, in epoch ms. Prefers the sensor's started_at
-// attribute (the bridge owns it — exact even for timers that were
-// already paused when the card loaded). Falls back to deriving it:
-// active from finishes_at - duration, finished from finished_at -
-// duration, paused from now - elapsed (best effort; the card caches
-// the value the first time it sees the timer, see _startedAtMs).
-function startedAtMs(timer, nowMs, cachedMs) {
-  if (!timer) return null;
-  if (timer.startedAt) {
-    const parsed = Date.parse(timer.startedAt);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-  if (cachedMs) return cachedMs;
-  if (!timer.duration) return null;
-  if (timer.state === "finished" && timer.finishedAt) {
-    return Date.parse(timer.finishedAt) - timer.duration * 1000;
-  }
-  if (timer.finishesAt) {
-    return Date.parse(timer.finishesAt) - timer.duration * 1000;
-  }
-  if (timer.state === "paused") {
-    return nowMs - (timer.duration - (timer.remaining || 0)) * 1000;
-  }
-  return null;
 }
 
 function discoverTimers(states) {
@@ -217,8 +237,7 @@ function discoverTimers(states) {
     if (
       s.state !== "active" &&
       s.state !== "paused" &&
-      s.state !== "finished" &&
-      s.state !== "ringing"
+      s.state !== "finished"
     ) {
       continue;
     }
@@ -240,12 +259,14 @@ function discoverTimers(states) {
       startedViaService: attrs.started_via === "service",
     });
   }
-  const now = Date.now();
-  // Wave 1 sort (T-IMPL-2/3 — the finished-first defect F-T20 is
-  // gone): running timers first (active, soonest first), then paused
-  // (soonest first), then finished and ringing together,
-  // most-recently-finished first. A finished timer no longer takes
-  // focus over a running one.
+  // Running-first sort (R0 coordinator ruling 1 — the plan row's
+  // "finished-first sort (F-T20 lineage)" is a plan error; architecture
+  // §5.1 governs and mandates only the <60 s force rule, not a sort):
+  // running timers first (active, soonest first), then paused (soonest
+  // first), then finished, most-recently-finished first. A finished
+  // timer no longer takes focus over a running one. The soonest-first
+  // order reads the server `remaining` attribute — no wall-clock
+  // derivation anywhere in the sort (R2-T7 dies here too).
   const groupOf = (t) =>
     t.state === "active" ? 0 : t.state === "paused" ? 1 : 2;
   out.sort((a, b) => {
@@ -255,7 +276,7 @@ function discoverTimers(states) {
     if (ga === 2) {
       return String(b.finishedAt || "").localeCompare(String(a.finishedAt || ""));
     }
-    return remainingSeconds(a, now) - remainingSeconds(b, now);
+    return (Number(a.remaining) || 0) - (Number(b.remaining) || 0);
   });
   return out;
 }
@@ -410,9 +431,9 @@ function serializeTimerScroll(state) {
 // this card imports core for identity, and for the §9 version gates
 // (T-6/T-10, RB-R1-5): REQUIRED_CORE + checkCoreVersion, and the
 // bridge-contract gate (checkBridgeContract) wired into the render
-// path below. The `ringing` code deletion itself is T-6/R2 work; with
-// the gate in place a mismatched sensor never reaches those paths
-// while core is loaded.
+// path below. The `ringing` code is DELETED in R2 (RB-R2-11, §5.1:
+// the state no longer exists — contract v2); with the gate in place a
+// mismatched sensor never reaches the timer paths while core is loaded.
 //
 // Unlike the home card and the nav strip (whose URLs the wizard
 // substitutes), this card never passes through the wizard — so it
@@ -540,19 +561,40 @@ function _setCoreForTests(mod) {
 // (amber = a RUNNING timer in its last 60 s; red = any finished
 // timer). Finished-only: when active+paused is 0 but a finished timer
 // exists, the badge shows the finished count in red. Null = no badge.
-// This card calls timerBadgeState(this._timers) directly — the timer
-// objects from discoverTimers already carry {state, remaining}.
-function timerBadgeState(timers) {
+// The "soon" threshold is FINISHING_SOON_SECONDS (59 s) — the SAME
+// measured rule the dial uses (design D5.2 / OQ-5: sensor remaining
+// ≤59 s; the exact 60 s point was never sampled, so the rule becomes
+// ≤60 s only if a re-probe finds the flip at 60 s). D-N1's "last
+// 60 s" is the same final-minute window in prose; a badge flipping
+// at ≤59 s still flips inside the last 60 s. The two consumers must
+// never disagree by a second again (critic F3).
+// `remainingById` (optional Map timer_id → seconds) overrides the
+// stored `remaining`: the stored objects are frozen between
+// structural pushes (the setter key excludes `remaining`), so the
+// card passes the clock-anchored values (_remainingFor) and the tick
+// can flip the badge as the timer counts down. Callers without a
+// clock (the hass-states helper) omit it and the stored value stands.
+function timerBadgeState(timers, remainingById) {
   let count = 0;
   let finished = 0;
   let soon = false;
   for (const timer of timers || []) {
     if (!timer || typeof timer.state !== "string") continue;
     if (timer.state === "active" || timer.state === "paused") count += 1;
-    // Ringing is the finished group (RINGING-1): a ringing timer
-    // counts in the red finished bucket, not the running count.
-    if (timer.state === "finished" || timer.state === "ringing") finished += 1;
-    if (timer.state === "active" && Number(timer.remaining) <= 60) soon = true;
+    // R2 (RB-R2-11): the `ringing` state is deleted — a finished timer
+    // counts in the red finished bucket, never in the running count.
+    if (timer.state === "finished") finished += 1;
+    const override =
+      remainingById && timer.timer_id !== undefined
+        ? remainingById.get(timer.timer_id)
+        : undefined;
+    const remaining = override === undefined ? timer.remaining : override;
+    if (
+      timer.state === "active" &&
+      Number(remaining) > 0 &&
+      Number(remaining) <= FINISHING_SOON_SECONDS
+    )
+      soon = true;
   }
   if (count === 0 && finished === 0) return null;
   const shown = count === 0 ? finished : count;
@@ -832,6 +874,18 @@ const CARD_CSS = `
   }
   .state { color: #57534E; font-size: 18px; line-height: 1.3; }
   .started { color: #57534E; font-size: 16px; line-height: 1.3; }
+  /* Stale mark (R2, §14): when no hass push has arrived within 5 s
+     for an ACTIVE timer the countdown freezes at the staleness
+     boundary and this line shows — the card never shows a confident
+     time it no longer knows. Paused timers never show it (their
+     frozen server remaining is exact). */
+  .stale-mark { color: #B45309; font-size: 16px; line-height: 1.3; }
+  .stale-mark[hidden] { display: none; }
+  /* "starting…" dial (R2, §8.1 interim direct binding): a chip-started
+     timer whose sensor has not appeared yet. No countdown-as-fact —
+     the time line reads "starting…" until the sensor binds. */
+  .dial.starting { opacity: 0.85; }
+  .dial.starting .time { font-size: 32px; }
   .hint { color: #57534E; font-size: 18px; line-height: 1.3; }
   .controls { display: flex; gap: 12px; margin-top: 4px; width: 100%; }
   .controls button {
@@ -962,13 +1016,14 @@ const CARD_CSS = `
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  /* Finished section (TIMER-7, Wave 1): finished and ringing timers
+  /* Finished section (TIMER-7, Wave 1): finished timers
      live here as compact rows, never as dials — a finished timer
      must not take a dial's space. The header collapses the section;
      it is collapsed by default when a timer is running or paused,
      expanded on arrival when none is, and forced expanded while any
-     timer is ringing. Rows are 74px: name + sub-line on the left,
-     Restart on the right. */
+     timer finished < 60 s ago (R2, §5.1 F6 — recency from
+     finished_at, never a ringing state). Rows are 74px: name +
+     sub-line on the left, Restart on the right. */
   .finished-section { display: flex; flex-direction: column; gap: 12px; }
   .finished-section[hidden] { display: none; }
   .finished-header {
@@ -1307,7 +1362,7 @@ class TimerScreenCard extends HTMLElement {
     this._toastTimer = null;
     this._undoTimer = null;
     this._presetBusy = false;
-    this._presetBeforeIds = null; // timer ids before a chip tap (scroll+pulse the new dial)
+    this._presetBeforeIds = null; // timer ids before a bound chip start (scroll+pulse the new dial; set in _sync on bind, §8.1)
     this._device = null; // { category, orientation } from core deviceFromIdentity, or null outside a browser.
     this._identity = null; // Last core identify() result, or null before core loads.
     this._identityBanner = null;
@@ -1328,7 +1383,21 @@ class TimerScreenCard extends HTMLElement {
     this._scrollSaveTimer = null;
     this._screenResizeObserver = null;
     this._duplicateNames = new Set();
-    this._startedAtMs = new Map(); // timer_id -> epoch ms, cached on first sight (TIMER-11)
+    // R2 (RB-R2-11, §14): one core TimerClock per timer sensor,
+    // pushed on every hass push (set hass) — the single countdown
+    // source. Paused timers need no clock (frozen server remaining);
+    // finished timers need none either (0). Vanished timers' clocks
+    // are dropped with the timers.
+    this._clocks = new Map(); // timer_id -> core TimerClock
+    // R2 (RB-R2-11, §8.1 interim direct binding): a chip-started timer
+    // waiting for its sensor — { entityId, timerId, name, timeoutId }
+    // — or null. While set, _sync renders the "starting…" dial.
+    this._pendingStart = null;
+    this._startingEl = null; // the "starting…" dial element, if shown
+    // Last open state actually rendered for the finished section, so
+    // the tick can re-apply the §5.1 force rule without touching the
+    // DOM when nothing changed. Null until the first _sync renders it.
+    this._finishedRenderedOpen = null;
     this._recipeContext = null; // { recipeId, step } from ?from_recipe= (TIMER-10)
     this.attachShadow({ mode: "open" });
     this.shadowRoot.addEventListener("click", (event) => this._onClick(event));
@@ -1379,13 +1448,24 @@ class TimerScreenCard extends HTMLElement {
       discoverTimers(hass ? Object.values(hass.states) : [])
     );
     const key = JSON.stringify(
-      timers.map((t) => [t.entity_id, t.state, t.name, t.duration])
+      timers.map((t) => [t.entity_id, t.state, t.name, t.duration, t.finishedAt])
     );
     // The wall fallback chips are state-driven (D4): a voice change
     // re-syncs even when no timer changed.
     const voiceDown = voiceUnavailable(hass ? hass.states : null);
     const voiceChanged = voiceDown !== this._voiceDown;
     this._voiceDown = voiceDown;
+    // R2 (§14): the clocks re-anchor on EVERY hass push, not only on
+    // a key change. The key deliberately excludes `remaining` — a
+    // per-second push must not rebuild the DOM — so gating the clocks
+    // on it would starve them: the last push before the key changed
+    // would be the only anchor, every active timer would go stale 5 s
+    // after it started and freeze at remaining − 5 s. The DOM rebuild
+    // below stays key-gated; the clock push is a cheap Map update.
+    // `finished_at` IS in the key: the §5.1 <60 s force rule is
+    // driven by its recency, so a push that changes only finished_at
+    // must re-sync the finished section.
+    this._pushClocks(timers);
     if (key !== this._lastKey || voiceChanged) {
       this._timers = timers;
       this._lastKey = key;
@@ -1399,9 +1479,6 @@ class TimerScreenCard extends HTMLElement {
           clearTimeout(timeout);
           this._arming.delete(id);
         }
-      }
-      for (const id of [...this._startedAtMs.keys()]) {
-        if (!live.has(id)) this._startedAtMs.delete(id);
       }
       this._ensureShell();
       this._sync();
@@ -1455,6 +1532,11 @@ class TimerScreenCard extends HTMLElement {
     _liveCards.delete(this);
     this._clearCoreRetry();
     this._stopTick();
+    // Critic N4: a live pending chip-start must not outlive the card
+    // — its timeout would fire on a detached card and call _sync()
+    // on in-memory elements. _clearPendingStart stops the timeout
+    // and drops the "starting…" dial.
+    this._clearPendingStart();
     if (
       typeof window !== "undefined" &&
       this._resizeBound &&
@@ -1631,6 +1713,135 @@ class TimerScreenCard extends HTMLElement {
     }
   }
 
+  // -- TimerClock wiring (R2, RB-R2-11; architecture §14) --------------
+  //
+  // One core TimerClock per timer, pushed ONLY when fresh sensor data
+  // arrives (set hass) — a push anchors the server `remaining` to the
+  // monotonic now, so pushing stale data (e.g. in _sync after core
+  // loads late) would overstate the remaining. Before core loads there
+  // is no clock and the display falls back to the server `remaining`
+  // attribute; the next hass push (≤1 s for an active timer) creates
+  // the clock. Paused timers never need one: their server `remaining`
+  // is frozen and exact, and a paused sensor emits no push
+  // (sensor.py update_from_snapshot early-returns on unchanged attrs),
+  // so a TimerClock would count it down by up to the 5 s staleness
+  // bound between pushes (core's own suite pins that behaviour) and
+  // mark it stale for a value that is exact. Finished timers read 0.
+
+  _pushClocks(timers) {
+    if (!_coreModule || typeof _coreModule.TimerClock !== "function") {
+      return;
+    }
+    const live = new Set();
+    for (const timer of timers || []) {
+      live.add(timer.timer_id);
+      let clock = this._clocks.get(timer.timer_id);
+      if (!clock) {
+        clock = new _coreModule.TimerClock();
+        this._clocks.set(timer.timer_id, clock);
+      }
+      clock.push({
+        id: timer.timer_id,
+        state: timer.state,
+        remaining: timer.remaining,
+        finishesAt: timer.finishesAt,
+      });
+    }
+    for (const id of [...this._clocks.keys()]) {
+      if (!live.has(id)) this._clocks.delete(id);
+    }
+  }
+
+  // Seconds remaining for display. Active: the TimerClock (server
+  // remaining − monotonic elapsed, frozen at the 5 s staleness
+  // boundary). Paused: the frozen server attribute. Finished: 0. No
+  // clock yet (core not loaded): the server attribute — no wall-clock
+  // derivation, ever.
+  _remainingFor(timer) {
+    if (!timer) return 0;
+    if (timer.state === "paused") {
+      return Math.max(0, Number(timer.remaining) || 0);
+    }
+    if (timer.state === "finished") return 0;
+    const clock = this._clocks.get(timer.timer_id);
+    if (clock) {
+      const remaining = clock.remainingSeconds();
+      if (remaining !== null) return remaining;
+    }
+    return Math.max(0, Number(timer.remaining) || 0);
+  }
+
+  // True only for an ACTIVE timer whose clock has seen no push within
+  // the 5 s bound. A paused timer is never stale (its value is frozen
+  // truth); a finished timer is never stale.
+  _isStale(timer) {
+    if (!timer || timer.state !== "active") return false;
+    const clock = this._clocks.get(timer.timer_id);
+    return clock ? clock.isStale() : false;
+  }
+
+  // Format via core (§19 — no per-card copy). Before core loads there
+  // is no formatter: "–" rather than a countdown-as-fact (the core
+  // lookup re-syncs every live card on resolve, so this lasts one
+  // round-trip).
+  _formatRemaining(seconds) {
+    if (_coreModule && typeof _coreModule.formatRemaining === "function") {
+      return _coreModule.formatRemaining(seconds);
+    }
+    return "–";
+  }
+
+  // Ring progress from the same remaining every consumer reads (core
+  // progressFraction when loaded; the one-line clamp otherwise — the
+  // same arithmetic, not a second countdown).
+  _progressFor(timer, left) {
+    if (_coreModule && typeof _coreModule.progressFraction === "function") {
+      return _coreModule.progressFraction(left, timer.duration);
+    }
+    if (!timer || !timer.duration || timer.duration <= 0) return 0;
+    return Math.min(1, Math.max(0, left / timer.duration));
+  }
+
+  // The §5.1 finished-section rule (F6), derived on every read, never
+  // stored: a timer finished < 60 s ago forces the section expanded,
+  // even while running/paused timers exist. Otherwise the arrival rule
+  // (expanded only when nothing runs/paused) or the user's toggle.
+  _finishedOpenFor(now) {
+    if (this._timers.some((t) => recentlyFinished(t, now))) return true;
+    if (this._finishedOpen === null) {
+      return !this._timers.some(
+        (t) => t.state === "active" || t.state === "paused"
+      );
+    }
+    return this._finishedOpen === true;
+  }
+
+  _applyFinishedOpen(open, finishedCount) {
+    this._finishedRenderedOpen = open;
+    this._finishedRowsEl.hidden = !open;
+    const title = this._finishedHeaderEl.querySelector(".finished-title");
+    if (title) title.textContent = `Finished (${finishedCount})`;
+    const chevron = this._finishedHeaderEl.querySelector(".finished-chevron");
+    if (chevron) chevron.textContent = open ? "▴" : "▾";
+    this._finishedHeaderEl.setAttribute(
+      "aria-expanded",
+      open ? "true" : "false"
+    );
+  }
+
+  // Clear a pending chip-start (bound, timed out, or failed): stop its
+  // timeout and drop the "starting…" dial.
+  _clearPendingStart() {
+    if (this._pendingStart && this._pendingStart.timeoutId) {
+      clearTimeout(this._pendingStart.timeoutId);
+    }
+    this._pendingStart = null;
+    if (this._startingEl) {
+      this._startingEl.remove();
+      this._startingEl = null;
+    }
+  }
+
   // -- shell: built once, then kept -------------------------------------
 
   _ensureShell() {
@@ -1714,7 +1925,7 @@ class TimerScreenCard extends HTMLElement {
       '<div class="empty-error" hidden></div>';
     this._screenEl.appendChild(this._emptyEl);
     this._emptyErrorEl = this._emptyEl.querySelector(".empty-error");
-    // Finished section (TIMER-7, Wave 1): finished and ringing timers
+    // Finished section (TIMER-7, Wave 1): finished timers
     // live here as compact rows, never as dials. Built once, hidden
     // while there is nothing finished; the header toggles it.
     this._finishedSectionEl = document.createElement("div");
@@ -1814,10 +2025,11 @@ class TimerScreenCard extends HTMLElement {
     const running = this._timers.filter(
       (t) => t.state === "active" || t.state === "paused"
     );
+    // R2 (RB-R2-11): no `ringing` state exists any more — finished is
+    // exactly the contract-v2 `finished` state.
     const finished = this._timers.filter(
-      (t) => t.state === "finished" || t.state === "ringing"
+      (t) => t.state === "finished"
     );
-    const ringing = this._timers.filter((t) => t.state === "ringing");
 
     // Which names are duplicated (TIMER-11): only those timers get a
     // "started ..." line, so a lone timer stays uncluttered.
@@ -1828,14 +2040,9 @@ class TimerScreenCard extends HTMLElement {
     this._duplicateNames = new Set(
       [...counts.entries()].filter(([, n]) => n > 1).map(([name]) => name)
     );
-    // Cache each timer's start time on first sight: for a paused timer
-    // the exact start is only derivable while it is still active.
-    for (const t of this._timers) {
-      if (!this._startedAtMs.has(t.timer_id)) {
-        const ms = startedAtMs(t, now, null);
-        if (ms) this._startedAtMs.set(t.timer_id, ms);
-      }
-    }
+    // R2 (RB-R2-11): no start-time cache — `started_at` is
+    // observed-or-omitted (§5.1); a timer without the attribute shows
+    // no start line, and nothing caches a derived value.
 
     // Measure positions before moving anything, so a re-sort can be
     // animated back from where each dial was (FLIP).
@@ -1874,12 +2081,41 @@ class TimerScreenCard extends HTMLElement {
         el.remove();
       }
     }
+    // Interim direct binding (§8.1): if the chip-started timer's
+    // sensor has now appeared, the pending start binds — clear it and
+    // scroll/pulse the new dial (via _presetBeforeIds, consumed at the
+    // end of this sync, exactly as a chip tap used to). If it has not
+    // appeared yet the "starting…" dial stays up (rendered below).
+    if (this._pendingStart) {
+      const bound = dialOrder.find(
+        (t) => t.entity_id === this._pendingStart.entityId
+      );
+      if (bound) {
+        this._clearPendingStart();
+        this._presetBeforeIds = new Set(
+          dialOrder
+            .map((t) => t.timer_id)
+            .filter((id) => id !== bound.timer_id)
+        );
+      }
+    }
     // Grid order is DOM order: the finished section sits after the
     // dials, so move it to the end (it was built before any dial
     // existed, and appendChild would otherwise leave it above them).
+    // The "starting…" dial sits between the dials and the finished
+    // section while a chip start is unbound.
+    if (this._pendingStart) {
+      if (!this._startingEl) {
+        this._startingEl = this._buildStartingDial(this._pendingStart);
+      }
+      this._screenEl.appendChild(this._startingEl);
+    } else if (this._startingEl) {
+      this._startingEl.remove();
+      this._startingEl = null;
+    }
     this._screenEl.appendChild(this._finishedSectionEl);
 
-    // Finished section: one compact row per finished/ringing timer,
+    // Finished section: one compact row per finished timer,
     // in the same sort order (most-recently-finished first).
     for (const timer of finished) {
       let row = this._rowEls.get(timer.timer_id);
@@ -1899,26 +2135,19 @@ class TimerScreenCard extends HTMLElement {
     const finishedCount = finished.length;
     this._finishedSectionEl.hidden = finishedCount === 0;
     if (finishedCount > 0) {
-      // Collapse rule (D1.2): forced expanded while any timer is
-      // ringing (a ringing timer must be visible); on arrival expanded
-      // only when nothing is running or paused; otherwise keep the
-      // user's toggle state. The ringing force is DERIVED, not stored:
-      // writing it into _finishedOpen made the section stick open after
-      // the ringing window ended (rig: Finished (1) still expanded 90 s
-      // after the ring, Pasta running — D1.2 says collapsed by default
-      // whenever anything runs). Once the window ends the section falls
-      // back to the default (collapsed while anything runs) unless the
-      // user opened it.
-      let open;
-      if (ringing.length > 0) open = true;
-      else if (this._finishedOpen === null) open = running.length === 0;
-      else open = this._finishedOpen === true;
-      this._finishedRowsEl.hidden = !open;
-      const title = this._finishedHeaderEl.querySelector(".finished-title");
-      if (title) title.textContent = `Finished (${finishedCount})`;
-      const chevron = this._finishedHeaderEl.querySelector(".finished-chevron");
-      if (chevron) chevron.textContent = open ? "▴" : "▾";
-      this._finishedHeaderEl.setAttribute("aria-expanded", open ? "true" : "false");
+      // Collapse rule (D1.2, §5.1 F6): forced expanded while any timer
+      // finished < 60 s ago (a just-finished timer must be visible);
+      // on arrival expanded only when nothing is running or paused;
+      // otherwise keep the user's toggle state. The force is DERIVED,
+      // not stored: writing it into _finishedOpen made the section
+      // stick open after the window ended (rig: Finished (1) still
+      // expanded 90 s after the ring, Pasta running — D1.2 says
+      // collapsed by default whenever anything runs). Once the window
+      // ends the section falls back to the default (collapsed while
+      // anything runs) unless the user opened it. The tick re-applies
+      // this rule every 500 ms (_updateTimes), so the force releases
+      // on time without waiting for the next hass push.
+      this._applyFinishedOpen(this._finishedOpenFor(now), finishedCount);
     }
 
     // Back bar (TIMER-10 / T-IMPL-18): built ONLY when a recipe
@@ -2179,10 +2408,18 @@ class TimerScreenCard extends HTMLElement {
   // (ACTIVE + PAUSED count, amber last-60 s / red finished). Wave 1:
   // it always shows while timers exist — the pill moved out of the
   // strip, so the two no longer share a slot and no reconciliation
-  // is needed. _updateTimerBadge is called from _sync directly.
+  // is needed. Called from _sync (structural pushes) AND from the
+  // 500 ms tick (_updateTimes): the stored objects are frozen between
+  // pushes, so a tick-only call is the only way the amber flip can
+  // happen while a timer counts through 60 s (critic F3). The
+  // soon state reads the clock-anchored remaining (_remainingFor),
+  // never the stale stored `remaining`.
   _updateTimerBadge() {
     if (!this._timerBadgeEl) return;
-    const badge = timerBadgeState(this._timers);
+    const remainingById = new Map(
+      (this._timers || []).map((t) => [t.timer_id, this._remainingFor(t)])
+    );
+    const badge = timerBadgeState(this._timers, remainingById);
     if (!badge) {
       this._timerBadgeEl.hidden = true;
       this._timerBadgeEl.textContent = "";
@@ -2294,6 +2531,7 @@ class TimerScreenCard extends HTMLElement {
         <div class="state" data-state="${escapeHtml(timer.timer_id)}"></div>
         <div class="started" data-started="${escapeHtml(timer.timer_id)}"></div>
         <div class="hint" data-hint="${escapeHtml(timer.timer_id)}"></div>
+        <div class="stale-mark" data-stale="${escapeHtml(timer.timer_id)}" hidden></div>
       </div>
       <div class="controls" data-controls="${escapeHtml(timer.timer_id)}"></div>
       <div class="error" data-error="${escapeHtml(timer.timer_id)}"></div>`;
@@ -2305,6 +2543,7 @@ class TimerScreenCard extends HTMLElement {
       state: el.querySelector(`[data-state="${timer.timer_id}"]`),
       started: el.querySelector(`[data-started="${timer.timer_id}"]`),
       hint: el.querySelector(`[data-hint="${timer.timer_id}"]`),
+      stale: el.querySelector(`[data-stale="${timer.timer_id}"]`),
       controls: el.querySelector(`[data-controls="${timer.timer_id}"]`),
       error: el.querySelector(`[data-error="${timer.timer_id}"]`),
     };
@@ -2313,8 +2552,34 @@ class TimerScreenCard extends HTMLElement {
     return el;
   }
 
+  _buildStartingDial(pending) {
+    // "starting…" dial (R2, §8.1 interim direct binding): a chip-started
+    // timer whose sensor has not appeared yet. The name is real (it
+    // came from the tap); the time is not a countdown — it reads
+    // "starting…" until the sensor binds. No controls, no tap action:
+    // there is nothing to pause yet.
+    const el = document.createElement("div");
+    el.className = "dial starting";
+    el.dataset.timerId = pending.timerId;
+    el.setAttribute("data-action", "starting");
+    el.setAttribute("data-timer", pending.timerId);
+    el.innerHTML = `
+      <div class="dial-name" data-name="${escapeHtml(pending.timerId)}">${escapeHtml(pending.name)}</div>
+      <button class="dial-button" data-action="starting" data-timer="${escapeHtml(pending.timerId)}" aria-label="${escapeHtml(pending.name)} timer starting">
+        <svg viewBox="0 0 200 200" role="img" aria-label="${escapeHtml(pending.name)}">
+          <circle class="track" cx="100" cy="100" r="88" />
+          <circle class="ring" cx="100" cy="100" r="88" transform="rotate(-90 100 100)" />
+        </svg>
+        <div class="time">starting…</div>
+      </button>
+      <div class="dial-sub">
+        <div class="state">Starting…</div>
+      </div>`;
+    return el;
+  }
+
   _buildFinishedRow(timer) {
-    // A finished or ringing timer as a compact row (TIMER-7, Wave 1):
+    // A finished timer as a compact row (TIMER-7, Wave 1):
     // name + sub-line on the left, Restart on the right. The row
     // itself dismisses on tap (same as a dial tap on a finished
     // timer); Restart is its own button inside it.
@@ -2339,28 +2604,32 @@ class TimerScreenCard extends HTMLElement {
 
   _updateFinishedRow(row, timer, now) {
     const refs = row._refs;
-    const isRinging = timer.state === "ringing";
     refs.name.textContent = timer.name;
     const finishedMs = timer.finishedAt ? Date.parse(timer.finishedAt) : null;
-    refs.sub.textContent = isRinging
-      ? "Ringing · Tap to dismiss"
-      : `${formatElapsedSince(finishedMs, now)} · Tap to dismiss`;
+    refs.sub.textContent = `${formatElapsedSince(finishedMs, now)} · Tap to dismiss`;
     row.setAttribute(
       "aria-label",
-      isRinging
-        ? `${timer.name} timer, ringing, tap to dismiss`
-        : `${timer.name} timer, finished, tap to dismiss`
+      `${timer.name} timer, finished, tap to dismiss`
     );
-    row.classList.toggle("ringing", isRinging);
   }
 
   _updateDial(el, timer, now) {
     const refs = el._refs;
     const isPaused = timer.state === "paused";
-    const left = remainingSeconds(timer, now);
-    // The "soon" flip follows the SENSOR's remaining attribute
-    // (T-IMPL-13 / OQ-5), not the displayed countdown.
-    const sensorLeft = sensorRemaining(timer);
+    // R2 (§14): the countdown is the TimerClock, not finishes_at minus
+    // the wall clock. Paused reads the frozen server remaining; active
+    // reads the clock (frozen at the 5 s staleness boundary, §14).
+    const left = this._remainingFor(timer);
+    const stale = this._isStale(timer);
+    // The "soon" flip follows the SENSOR's remaining (T-IMPL-13 /
+    // OQ-5), read from the clock: the clock re-anchors to the server
+    // remaining on every hass push (§14), so its value IS the sensor's
+    // remaining — not a wall-clock derivation, which is what OQ-5
+    // forbids. It must not read the stored timer object: the setter
+    // key excludes `remaining`, so this._timers holds the remaining
+    // from the last structural push and a timer counting down through
+    // 60 s would never flip on the tick.
+    const sensorLeft = left;
     const isSoon =
       !isPaused &&
       timer.state === "active" &&
@@ -2369,6 +2638,7 @@ class TimerScreenCard extends HTMLElement {
 
     el.classList.toggle("paused", isPaused);
     el.classList.toggle("soon", isSoon);
+    el.classList.toggle("stale", stale);
     // A dial is only ever running or paused now (finished timers are
     // rows); the "finished" class stays off so the ring keeps the
     // running colour.
@@ -2390,7 +2660,13 @@ class TimerScreenCard extends HTMLElement {
     // TIMER-1: the full name, wrapping to at most two lines at >=20px
     // on the hub (CSS line-clamp).
     refs.name.textContent = timer.name;
-    refs.time.textContent = formatRemaining(left);
+    refs.time.textContent = this._formatRemaining(left);
+    // §14 stale mark: the countdown is frozen and the mark shows while
+    // no push has arrived within 5 s. A paused timer never shows it.
+    if (refs.stale) {
+      refs.stale.textContent = stale ? "Time may be stale" : "";
+      refs.stale.hidden = !stale;
+    }
     // Soon word (D1): the state line reads exactly
     // "Soon · Tap to pause" and the hint is empty; running shows no
     // state line and "Tap to pause"; paused shows "Paused" +
@@ -2406,25 +2682,26 @@ class TimerScreenCard extends HTMLElement {
       refs.hint.textContent = "Tap to pause";
     }
     // TIMER-11: duplicates get their start time, so two timers with
-    // the same name are distinguishable. The PIP-pinned timer shows
-    // "Just started" instead (D7.3).
+    // the same name are distinguishable — but only when the bridge
+    // OBSERVED the start (§5.1 observed-or-omitted). Without a
+    // `started_at` attribute there is no start line, never a derived
+    // one. The PIP-pinned timer shows "Just started" instead (D7.3).
     if (timer.timer_id === this._pinTimerId) {
       refs.started.textContent = "Just started";
     } else if (this._duplicateNames.has(timer.name)) {
-      const started = startedAtMs(
-        timer,
-        now,
-        this._startedAtMs.get(timer.timer_id)
-      );
-      refs.started.textContent = started
-        ? `Started ${formatStartTime(started)}`
-        : "";
+      const startedMs = timer.startedAt
+        ? Date.parse(timer.startedAt)
+        : NaN;
+      refs.started.textContent =
+        Number.isFinite(startedMs) && startedMs > 0
+          ? `Started ${formatStartTime(startedMs)}`
+          : "";
     } else {
       refs.started.textContent = "";
     }
 
     refs.ring.style.strokeDashoffset = String(
-      RING_CIRCUMFERENCE * (1 - progressFraction(timer, now))
+      RING_CIRCUMFERENCE * (1 - this._progressFor(timer, left))
     );
     refs.ring.classList.toggle("paused", isPaused);
 
@@ -2477,14 +2754,27 @@ class TimerScreenCard extends HTMLElement {
     for (const timer of this._timers) {
       const el = this._dialEls.get(timer.timer_id);
       if (el) {
-        const left = remainingSeconds(timer, now);
-        el._refs.time.textContent = formatRemaining(left);
+        // R2 (§14): the tick reads the TimerClock, never finishes_at
+        // minus the wall clock; paused reads the frozen server value.
+        const left = this._remainingFor(timer);
+        const stale = this._isStale(timer);
+        el._refs.time.textContent = this._formatRemaining(left);
         el._refs.ring.style.strokeDashoffset = String(
-          RING_CIRCUMFERENCE * (1 - progressFraction(timer, now))
+          RING_CIRCUMFERENCE * (1 - this._progressFor(timer, left))
         );
-        // The "soon" flip follows the sensor's remaining attribute
-        // (T-IMPL-13 / OQ-5), not the displayed countdown.
-        const sensorLeft = sensorRemaining(timer);
+        el.classList.toggle("stale", stale);
+        if (el._refs.stale) {
+          el._refs.stale.textContent = stale ? "Time may be stale" : "";
+          el._refs.stale.hidden = !stale;
+        }
+        // The "soon" flip follows the sensor's remaining (T-IMPL-13 /
+        // OQ-5) — read from the clock, which re-anchors to the server
+        // remaining on every hass push (§14). The stored timer object
+        // is stale between structural pushes (the setter key excludes
+        // `remaining`), so reading it here would never flip a timer
+        // counting down through 60 s. The clock value is the sensor's
+        // remaining, not a wall-clock derivation.
+        const sensorLeft = left;
         const isSoon =
           timer.state === "active" &&
           sensorLeft > 0 &&
@@ -2512,6 +2802,24 @@ class TimerScreenCard extends HTMLElement {
     // writes above, so the tick costs one forced layout, not one per
     // dial (T-IMPL-7).
     this._fitTimes();
+    // Re-apply the §5.1 <60 s force rule on the tick: the force must
+    // release when the window ends without waiting for the next hass
+    // push (a just-finished timer's section collapses 60 s after it
+    // finished, even with no other state change).
+    const finishedCount = this._timers.filter(
+      (t) => t.state === "finished"
+    ).length;
+    if (finishedCount > 0 && this._finishedRowsEl && this._finishedHeaderEl) {
+      const open = this._finishedOpenFor(now);
+      if (open !== this._finishedRenderedOpen) {
+        this._applyFinishedOpen(open, finishedCount);
+      }
+    }
+    // Re-apply the badge on the tick too (critic F3): the amber
+    // last-60 s flip happens while a timer counts down, with no
+    // structural push — _updateTimerBadge reads the clock-anchored
+    // remaining, so the badge flips on the tick like the dial does.
+    this._updateTimerBadge();
   }
 
   // Time fit (T-IMPL-7 / D1.4): the rendered countdown must fit
@@ -2619,7 +2927,10 @@ class TimerScreenCard extends HTMLElement {
         startedAt: timer.startedAt,
       };
     } else {
-      const remaining = Math.max(1, remainingSeconds(timer, Date.now()));
+      // R2 (§14): the remaining at cancel comes from the same source
+      // as the display (TimerClock for active, frozen server value for
+      // paused) — never a wall-clock derivation.
+      const remaining = Math.max(1, this._remainingFor(timer));
       this._undoTimer = {
         kind: "cancelled",
         name: timer.name,
@@ -2696,24 +3007,132 @@ class TimerScreenCard extends HTMLElement {
     }
   }
 
+  // Service call with return_response (the recipe card's _callAction
+  // shape): hass.callWS is the stable websocket path; hass.callService
+  // has no documented return-response form from a Lovelace card. The
+  // websocket API wraps a service response as { response: {...} };
+  // a bare response is tolerated, so a future shape change fails soft.
+  async _callStartTimer(name, duration) {
+    if (!this._hass || typeof this._hass.callWS !== "function") {
+      throw new Error("Home Assistant connection is not available");
+    }
+    // Critic N4: the call itself gets a timeout. Without one, a hung
+    // websocket call never reaches the 10 s pending-start timeout
+    // (which only starts after the response returns) and _presetBusy
+    // stays set with every preset chip dead until reload. The timeout
+    // value is an instance override in tests (this._callWsTimeoutMs);
+    // production never sets it.
+    const timeoutMs =
+      typeof this._callWsTimeoutMs === "number"
+        ? this._callWsTimeoutMs
+        : CALL_WS_TIMEOUT_MS;
+    let timeoutId = null;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error("start_timer call timed out")),
+        timeoutMs
+      );
+    });
+    let result;
+    try {
+      const call = this._hass.callWS({
+        type: "call_service",
+        domain: "satellite_timers",
+        service: "start_timer",
+        service_data: { name, duration },
+        return_response: true,
+      });
+      // A late failure after the timeout already won must not surface
+      // as an unhandled rejection: the race has settled and the
+      // response is discarded either way.
+      call.catch(() => {});
+      result = await Promise.race([call, timeout]);
+    } finally {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+    }
+    if (result && typeof result === "object" && "response" in result) {
+      return result.response;
+    }
+    return result;
+  }
+
   async _onPresetTap(minutes) {
     // TIMER-4: preset chips start a timer by duration. The name is
     // the duration ("10 minute timer"); the recipe name comes from
-    // recipe chips instead (RECIPE-5 / BRIDGE-1). After the start,
-    // _sync scrolls the new dial into view and pulses it once — the
-    // ids seen before the tap tell it which dial is new.
+    // recipe chips instead (RECIPE-5 / BRIDGE-1).
+    //
+    // R2 (§8.1 interim direct binding, until R4's PIP Host lands):
+    // the call runs with return_response: true and the card binds by
+    // the returned entity id from the start — no name matching, no
+    // 15 s window. Until the sensor appears the card shows a
+    // "starting…" dial with no countdown-as-fact; the 10 s timeout
+    // hides it and logs a warning with the entity id (the timer
+    // itself is unaffected — it still shows in the Timers view). A
+    // failed call shows the visible error state naming the failure
+    // and never retries (§8.1 F14); the user re-taps. When the sensor
+    // binds, _sync scrolls the new dial into view and pulses it once.
     if (this._presetBusy || !this._hass) return;
     this._presetBusy = true;
     this._setPresetBusy(true);
     try {
-      this._presetBeforeIds = new Set(this._timers.map((t) => t.timer_id));
-      await this._hass.callService("satellite_timers", "start_timer", {
-        name: `${minutes} minute timer`,
-        duration: minutes * 60,
-      });
+      const name = `${minutes} minute timer`;
+      const duration = minutes * 60;
+      const response = await this._callStartTimer(name, duration);
+      const entityId =
+        response && typeof response.entity_id === "string"
+          ? response.entity_id
+          : null;
       if (this._emptyErrorEl) this._emptyErrorEl.hidden = true;
+      if (!entityId) {
+        // No id came back: the timer may still exist, but nothing can
+        // bind to it — log and let the sensor appear on the next push
+        // (no scroll/pulse for an unbound start).
+        if (typeof console !== "undefined") {
+          console.warn(
+            "Family Hub: start_timer returned no entity_id for",
+            name
+          );
+        }
+        return;
+      }
+      if (this._pendingStart) this._clearPendingStart();
+      const timeoutMs =
+        _coreModule &&
+        typeof _coreModule.PIP_STARTING_TIMEOUT_MS === "number"
+          ? _coreModule.PIP_STARTING_TIMEOUT_MS
+          : PENDING_START_TIMEOUT_MS;
+      const pending = {
+        entityId,
+        timerId: entityId.replace("sensor.satellite_timer_", ""),
+        name,
+        timeoutId: null,
+      };
+      pending.timeoutId = setTimeout(() => {
+        if (this._pendingStart !== pending) return;
+        this._pendingStart = null;
+        if (this._startingEl) {
+          this._startingEl.remove();
+          this._startingEl = null;
+        }
+        if (typeof console !== "undefined") {
+          console.warn(
+            `Family Hub: timer ${entityId} did not appear within ` +
+              `${timeoutMs} ms of starting — the timer itself is ` +
+              `unaffected and still shows in the Timers view.`
+          );
+        }
+        this._sync();
+      }, timeoutMs);
+      this._pendingStart = pending;
+      this._sync();
     } catch (err) {
-      this._presetBeforeIds = null;
+      this._clearPendingStart();
+      if (typeof console !== "undefined") {
+        console.warn(
+          `Family Hub: could not start the ${minutes} minute timer:`,
+          err
+        );
+      }
       if (this._emptyErrorEl) {
         const message = String((err && err.message) || err || "");
         this._emptyErrorEl.textContent = /service.*not found/i.test(message)
@@ -2817,12 +3236,12 @@ class TimerScreenCard extends HTMLElement {
     }
     if (action === "finished-toggle") {
       // Flip from the RENDERED state, not from _finishedOpen: while a
-      // timer rings the section is forced open but _finishedOpen is
-      // still null (the force is derived, not stored), so flipping
-      // _finishedOpen alone would no-op on the first tap. During
-      // ringing the force still wins on the next sync (D1.2: the
-      // collapse never hides a ringing timer), so the tap takes effect
-      // once the window ends.
+      // timer finished < 60 s ago the section is forced open but
+      // _finishedOpen is still null (the force is derived, not stored),
+      // so flipping _finishedOpen alone would no-op on the first tap.
+      // During the force window the force still wins on the next sync
+      // (D1.2/§5.1: the collapse never hides a just-finished timer),
+      // so the tap takes effect once the window ends.
       const currentlyOpen = this._finishedRowsEl ? !this._finishedRowsEl.hidden : false;
       this._finishedOpen = !currentlyOpen;
       this._sync();
@@ -2842,10 +3261,10 @@ class TimerScreenCard extends HTMLElement {
       this._clearArm(timerId);
       // One tap on the dial does the primary thing for the timer's
       // state: pause a running timer, resume a paused one, dismiss a
-      // finished or ringing one. Adding time stays voice-only.
+      // finished one. Adding time stays voice-only.
       // Dismissing offers the same 5 s Undo as cancelling (the old
       // dismiss path had no toast — F-T13 asymmetry).
-      if (timer.state === "finished" || timer.state === "ringing") {
+      if (timer.state === "finished") {
         this._control(timerId, "dismiss_timer").then((ok) => {
           if (ok) this._showUndoToast(timer, "dismissed");
         });
@@ -2893,13 +3312,17 @@ customElements.define("timer-screen", TimerScreenCard);
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     displayName,
-    formatRemaining,
+    // R2 (RB-R2-11, §19): formatRemaining / remainingSeconds /
+    // progressFraction / startedAtMs are DELETED — they live in core
+    // now (formatRemaining, TimerClock, progressFraction). The tests
+    // import the core versions directly; recentlyFinished is the
+    // card-owned §5.1 recency rule.
     formatElapsedSince,
     formatStartTime,
-    remainingSeconds,
     sensorRemaining,
-    progressFraction,
-    startedAtMs,
+    recentlyFinished,
+    FINISHED_FORCE_EXPAND_MS,
+    PENDING_START_TIMEOUT_MS,
     discoverTimers,
     gridColumnsFor,
     voiceUnavailable,

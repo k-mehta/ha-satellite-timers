@@ -275,13 +275,12 @@ globalThis.document = { createElement: (tag) => new FakeElement(tag) };
 
 const {
   displayName,
-  formatRemaining,
   formatElapsedSince,
   formatStartTime,
-  remainingSeconds,
   sensorRemaining,
-  progressFraction,
-  startedAtMs,
+  recentlyFinished,
+  FINISHED_FORCE_EXPAND_MS,
+  PENDING_START_TIMEOUT_MS,
   discoverTimers,
   gridColumnsFor,
   voiceUnavailable,
@@ -407,17 +406,31 @@ function timerState(id, name, state, overrides = {}) {
           ? new Date(Date.now() + remaining * 1000).toISOString()
           : null),
       finished_at: overrides.finishedAt ?? null,
+      started_at: overrides.startedAt ?? null,
     },
   };
 }
 
 function fakeHass(states) {
   const calls = [];
+  const wsCalls = [];
   return {
     calls,
+    wsCalls,
     states: states || [],
     callService: async (domain, service, data) => {
       calls.push([domain, service, data]);
+    },
+    // Websocket path the card uses for return_response calls (§8.1)
+    // and the core resource lookup. start_timer answers with the
+    // fixed new-timer entity id; the resource list is empty.
+    callWS: async (msg) => {
+      wsCalls.push(msg);
+      if (msg && msg.type === "lovelace/resources/list") return [];
+      if (msg && msg.type === "call_service") {
+        return { response: { entity_id: "sensor.satellite_timer_new10" } };
+      }
+      return null;
     },
   };
 }
@@ -431,12 +444,14 @@ function timerCard(states) {
 
 // -- pure helpers -----------------------------------------------------------
 
-test("formatRemaining renders mm:ss and h:mm:ss", () => {
-  assert.equal(formatRemaining(0), "0:00");
-  assert.equal(formatRemaining(59), "0:59");
-  assert.equal(formatRemaining(600), "10:00");
-  assert.equal(formatRemaining(3661), "1:01:01");
-  assert.equal(formatRemaining(-5), "0:00");
+test("formatRemaining renders mm:ss and h:mm:ss (core's formatter, R2 §19)", () => {
+  // The card no longer defines formatRemaining — it imports core's.
+  // The core version renders the same shapes the card used to.
+  assert.equal(core.formatRemaining(0), "0:00");
+  assert.equal(core.formatRemaining(59), "0:59");
+  assert.equal(core.formatRemaining(600), "10:00");
+  assert.equal(core.formatRemaining(3661), "1:01:01");
+  assert.equal(core.formatRemaining(-5), "0:00");
 });
 
 test("discoverTimers keeps only satellite timer sensors in a live state, running first (Wave 1 sort)", () => {
@@ -458,7 +473,7 @@ test("discoverTimers keeps only satellite timer sensors in a live state, running
   assert.equal(timers[0].name, "Rice");
 });
 
-test("discoverTimers keeps ringing timers in the finished group, most-recently-finished first", () => {
+test("discoverTimers drops a ringing sensor entirely (R2, §5.1 — the state is deleted)", () => {
   const states = [
     timerState("t-old", "Old", "finished", {
       finishedAt: new Date(Date.now() - 600000).toISOString(),
@@ -472,9 +487,11 @@ test("discoverTimers keeps ringing timers in the finished group, most-recently-f
     timerState("t-run", "Run", "active", { remaining: 60 }),
   ];
   const timers = discoverTimers(states);
+  // A `ringing` sensor is not a timer any more — it is a contract
+  // mismatch (the R1-5 gate test), so discoverTimers never sees one.
   assert.deepEqual(
     timers.map((t) => t.timer_id),
-    ["t-run", "t-ring", "t-new", "t-old"]
+    ["t-run", "t-new", "t-old"]
   );
 });
 
@@ -487,24 +504,66 @@ test("sensorRemaining reads the sensor's remaining attribute (OQ-5)", () => {
   assert.equal(sensorRemaining({}), 0);
 });
 
-test("remainingSeconds counts down from finishes_at and freezes while paused", () => {
-  const active = discoverTimers([
-    timerState("t1", "Pasta", "active", { remaining: 600 }),
-  ])[0];
-  const left = remainingSeconds(active, Date.now());
-  assert.ok(left >= 590 && left <= 600, `left was ${left}`);
-  const paused = discoverTimers([
-    timerState("t2", "Rice", "paused", { remaining: 300 }),
-  ])[0];
-  assert.equal(remainingSeconds(paused, Date.now()), 300);
+test("TimerClock drives the card countdown: active ticks, paused stays frozen, stale freezes + marks (R2, §14)", async () => {
+  injectCore();
+  try {
+    const card = timerCard([
+      timerState("t1", "Pasta", "active", { remaining: 300, duration: 600 }),
+      timerState("t2", "Rice", "paused", { remaining: 300, duration: 600 }),
+    ]);
+    const timeText = (id) =>
+      card.shadowRoot.querySelector(`[data-remaining="${id}"]`).textContent;
+    const staleHidden = (id) =>
+      card.shadowRoot.querySelector(`[data-stale="${id}"]`).hidden;
+    // The active clock floors its remaining, so a fresh 300 s push
+    // renders "4:59" within milliseconds (300 − 0.00x s, floored) —
+    // the same floor the old finishes_at derivation had. The paused
+    // timer reads the frozen server value exactly.
+    assert.ok(["5:00", "4:59"].includes(timeText("t1")), timeText("t1"));
+    assert.equal(timeText("t2"), "5:00");
+    assert.equal(staleHidden("t1"), true);
+    assert.equal(staleHidden("t2"), true);
+    // No new hass push: the active clock counts down on the monotonic
+    // clock; the paused value is the frozen server remaining.
+    await sleep(1200);
+    card._updateTimes();
+    assert.equal(timeText("t1"), "4:58");
+    assert.equal(timeText("t2"), "5:00");
+    assert.equal(staleHidden("t1"), true);
+    assert.equal(staleHidden("t2"), true);
+    // Past the 5 s staleness bound with no push: the active countdown
+    // freezes at the boundary (300 − 5 = 295 s) and the stale mark
+    // shows; the paused timer is never stale and never moves.
+    await sleep(4600);
+    card._updateTimes();
+    assert.equal(timeText("t1"), "4:55");
+    assert.equal(staleHidden("t1"), false);
+    assert.equal(
+      card.shadowRoot.querySelector('[data-stale="t1"]').textContent,
+      "Time may be stale"
+    );
+    assert.equal(timeText("t2"), "5:00");
+    assert.equal(staleHidden("t2"), true);
+    // A fresh push unfreezes it: the clock re-anchors to the new
+    // server remaining.
+    card.hass = fakeHass([
+      timerState("t1", "Pasta", "active", { remaining: 280, duration: 600 }),
+      timerState("t2", "Rice", "paused", { remaining: 300, duration: 600 }),
+    ]);
+    card._updateTimes();
+    // Floor again: the fresh 280 s push renders "4:39" within
+    // milliseconds of the push (280 − 0.00x s, floored).
+    assert.ok(["4:40", "4:39"].includes(timeText("t1")), timeText("t1"));
+    assert.equal(staleHidden("t1"), true);
+  } finally {
+    resetCore();
+  }
 });
 
-test("progressFraction is the share of time left", () => {
-  const timer = discoverTimers([
-    timerState("t1", "Pasta", "paused", { remaining: 450, duration: 900 }),
-  ])[0];
-  assert.equal(progressFraction(timer, Date.now()), 0.5);
-  assert.equal(progressFraction(null, Date.now()), 0);
+test("progressFraction is the share of time left (core's helper, R2 §19)", () => {
+  assert.equal(core.progressFraction(450, 900), 0.5);
+  assert.equal(core.progressFraction(0, 900), 0);
+  assert.equal(core.progressFraction(450, 0), 0);
 });
 
 // -- gridColumnsFor: columns by viewport class only (Wave 1) ----------
@@ -862,8 +921,9 @@ test("formatStartTime renders a clock time (TIMER-11)", () => {
   assert.equal(formatStartTime(null), "");
 });
 
-test("startedAtMs prefers the sensor attribute, else derives it (TIMER-11)", () => {
+test("started_at is observed-or-omitted: no derivation, ever (TIMER-11, R2 §5.1)", () => {
   const now = Date.now();
+  // With the attribute, the timer carries it through discovery.
   const withAttr = discoverTimers([
     {
       entity_id: "sensor.satellite_timer_t1",
@@ -878,19 +938,22 @@ test("startedAtMs prefers the sensor attribute, else derives it (TIMER-11)", () 
       },
     },
   ])[0];
-  assert.equal(startedAtMs(withAttr, now, null), now - 300 * 1000);
-  const active = discoverTimers([
-    timerState("t2", "Rice", "active", { remaining: 600, duration: 900 }),
-  ])[0];
-  const derived = startedAtMs(active, now, null);
-  assert.ok(Math.abs(derived - (now - 300 * 1000)) < 2000);
+  assert.equal(withAttr.startedAt, new Date(now - 300 * 1000).toISOString());
+  // Without the attribute, there is nothing to derive from: the
+  // finished timer below has both finished_at and duration, and the
+  // old code derived started_at = finished_at − duration from them.
+  // The field stays null — the card shows no start line.
   const finished = discoverTimers([
     timerState("t3", "Tea", "finished", {
       duration: 600,
       finishedAt: new Date(now - 180 * 1000).toISOString(),
     }),
   ])[0];
-  assert.equal(startedAtMs(finished, now, null), now - 780 * 1000);
+  assert.equal(finished.startedAt, null);
+  const active = discoverTimers([
+    timerState("t2", "Rice", "active", { remaining: 600, duration: 900 }),
+  ])[0];
+  assert.equal(active.startedAt, null);
 });
 
 test("identity: unified rule — wall kind first, bare width never hub (TIMER-2, P8-16)", () => {
@@ -1033,11 +1096,23 @@ test("a finished timer shows as a compact row: Done — N min ago, counting up (
   );
 });
 
-test("duplicate names get distinct start times; lone timers get none (TIMER-11)", () => {
+test("duplicate names get distinct start times only when observed; lone timers get none (TIMER-11, R2 §5.1)", () => {
+  const now = Date.now();
   const card = timerCard([
-    timerState("t1", "Pasta", "active", { remaining: 600, duration: 900 }),
-    timerState("t2", "Pasta", "active", { remaining: 300, duration: 900 }),
-    timerState("t3", "Rice", "active", { remaining: 600, duration: 900 }),
+    timerState("t1", "Pasta", "active", {
+      remaining: 600,
+      duration: 900,
+      startedAt: new Date(now - 600 * 1000).toISOString(),
+    }),
+    timerState("t2", "Pasta", "active", {
+      remaining: 300,
+      duration: 900,
+      startedAt: new Date(now - 300 * 1000).toISOString(),
+    }),
+    // A duplicate with no observed start shows no start line —
+    // the old code derived one from finishes_at − duration.
+    timerState("t3", "Pasta", "active", { remaining: 450, duration: 900 }),
+    timerState("t4", "Rice", "active", { remaining: 600, duration: 900 }),
   ]);
   const first = card.shadowRoot.querySelector('[data-started="t1"]').textContent;
   const second = card.shadowRoot.querySelector('[data-started="t2"]').textContent;
@@ -1046,6 +1121,10 @@ test("duplicate names get distinct start times; lone timers get none (TIMER-11)"
   assert.notEqual(first, second);
   assert.equal(
     card.shadowRoot.querySelector('[data-started="t3"]').textContent,
+    ""
+  );
+  assert.equal(
+    card.shadowRoot.querySelector('[data-started="t4"]').textContent,
     ""
   );
 });
@@ -1063,20 +1142,237 @@ test("the empty state names the voice paths and offers preset chips (TIMER-4/14)
   );
 });
 
-test("a preset chip starts a timer by duration (TIMER-4)", async () => {
-  const hass = fakeHass([]);
-  const card = new TimerScreenCard();
-  card.setConfig({});
-  card.hass = hass;
-  card._onClick({
-    target: {
-      closest: () => ({ dataset: { action: "preset", minutes: "10" } }),
-    },
-  });
-  await sleep(20);
-  assert.deepEqual(hass.calls, [
-    ["satellite_timers", "start_timer", { name: "10 minute timer", duration: 600 }],
-  ]);
+test("a preset chip binds by the returned entity id and shows starting… until the sensor appears (TIMER-4, §8.1)", async () => {
+  injectCore();
+  try {
+    const hass = fakeHass([]);
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    card._onClick({
+      target: {
+        closest: () => ({ dataset: { action: "preset", minutes: "10" } }),
+      },
+    });
+    await sleep(20);
+    // The call goes over the websocket with return_response: true —
+    // not callService, which has no return-response form from a card.
+    assert.deepEqual(
+      hass.wsCalls.filter((c) => c.type === "call_service"),
+      [
+        {
+          type: "call_service",
+          domain: "satellite_timers",
+          service: "start_timer",
+          service_data: { name: "10 minute timer", duration: 600 },
+          return_response: true,
+        },
+      ]
+    );
+    // While the sensor has not arrived: one "starting…" dial, no
+    // countdown-as-fact, and the pending binding carries the id the
+    // service returned.
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 1);
+    assert.equal(
+      card.shadowRoot.querySelector('[data-action="starting"] .time').textContent,
+      "starting…"
+    );
+    assert.equal(card._pendingStart.entityId, "sensor.satellite_timer_new10");
+    // The sensor arrives on the next push: the starting dial is
+    // replaced by the real dial and the binding clears.
+    card.hass = fakeHass([
+      timerState("new10", "10 minute timer", "active", {
+        remaining: 600,
+        duration: 600,
+      }),
+    ]);
+    await sleep(20);
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 0);
+    assert.equal(card.shadowRoot.querySelectorAll(".dial").length, 1);
+    assert.equal(card._pendingStart, null);
+  } finally {
+    resetCore();
+  }
+});
+
+test("a chip start that never binds hides the starting… dial after 10 s and warns with the entity id (TIMER-4, §8.1 F4)", async () => {
+  injectCore();
+  const realSetTimeout = global.setTimeout;
+  const realWarn = console.warn;
+  let timeoutFn = null;
+  global.setTimeout = (fn, ms, ...rest) => {
+    if (ms === PENDING_START_TIMEOUT_MS) {
+      timeoutFn = fn;
+      return 0;
+    }
+    return realSetTimeout(fn, ms, ...rest);
+  };
+  const warns = [];
+  console.warn = (...args) => {
+    warns.push(args.map(String).join(" "));
+  };
+  try {
+    const hass = fakeHass([]);
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    card._onClick({
+      target: {
+        closest: () => ({ dataset: { action: "preset", minutes: "5" } }),
+      },
+    });
+    await sleep(20);
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 1);
+    assert.ok(timeoutFn, "the 10 s bind timeout is armed");
+    timeoutFn();
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 0);
+    assert.equal(card._pendingStart, null);
+    assert.ok(
+      warns.some(
+        (w) =>
+          w.includes("sensor.satellite_timer_new10") &&
+          w.includes("did not appear")
+      ),
+      `expected a bind-timeout warning, got: ${warns.join(" | ")}`
+    );
+  } finally {
+    global.setTimeout = realSetTimeout;
+    console.warn = realWarn;
+    resetCore();
+  }
+});
+
+test("a failed chip start shows the visible error, warns, and never retries (TIMER-4, §8.1 F14)", async () => {
+  injectCore();
+  const realWarn = console.warn;
+  const warns = [];
+  console.warn = (...args) => {
+    warns.push(args.map(String).join(" "));
+  };
+  try {
+    const hass = fakeHass([]);
+    hass.callWS = async () => {
+      throw new Error("Service satellite_timers.start_timer not found");
+    };
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    card._onClick({
+      target: {
+        closest: () => ({ dataset: { action: "preset", minutes: "15" } }),
+      },
+    });
+    await sleep(20);
+    // No starting dial, no pending binding, and the error is visible
+    // on the empty state — the user re-taps; the card never retries.
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 0);
+    assert.equal(card._pendingStart, null);
+    const errEl = card.shadowRoot.querySelector(".empty-error");
+    assert.equal(errEl.hidden, false);
+    assert.match(errEl.textContent, /updated bridge/);
+    assert.ok(
+      warns.some((w) => w.includes("could not start the 15 minute timer")),
+      `expected a start-failure warning, got: ${warns.join(" | ")}`
+    );
+  } finally {
+    console.warn = realWarn;
+    resetCore();
+  }
+});
+
+test("R2 fix1: a hung chip-start call times out, frees the chips, and shows the error — no retry (critic N4)", async () => {
+  injectCore();
+  const realWarn = console.warn;
+  const warns = [];
+  console.warn = (...args) => {
+    warns.push(args.map(String).join(" "));
+  };
+  try {
+    const hass = fakeHass([]);
+    // A websocket call that never settles: the old code awaited it
+    // forever with _presetBusy set and every chip dead until reload.
+    hass.callWS = async (msg) => {
+      if (msg && msg.type === "call_service") return new Promise(() => {});
+      return null;
+    };
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    card._callWsTimeoutMs = 20;
+    card._onClick({
+      target: {
+        closest: () => ({ dataset: { action: "preset", minutes: "10" } }),
+      },
+    });
+    await sleep(150);
+    // The timeout rejects the race: no starting dial, no pending
+    // binding, the chips are usable again, and the error is visible.
+    assert.equal(card._presetBusy, false);
+    assert.equal(card._pendingStart, null);
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 0);
+    const errEl = card.shadowRoot.querySelector(".empty-error");
+    assert.equal(errEl.hidden, false);
+    assert.match(errEl.textContent, /Couldn't start the timer/);
+    assert.ok(
+      warns.some((w) => w.includes("could not start the 10 minute timer")),
+      `expected a start-failure warning, got: ${warns.join(" | ")}`
+    );
+    // The chips are re-enabled: a second tap issues a second call
+    // (the card never retries on its own, but the user can re-tap).
+    assert.equal(
+      [...card.shadowRoot.querySelectorAll('[data-action="preset"]')].every(
+        (b) => !b.disabled
+      ),
+      true
+    );
+    // _callStartTimer itself rejects on the timeout, not on the hang.
+    const card2 = new TimerScreenCard();
+    card2.setConfig({});
+    card2.hass = hass;
+    card2._callWsTimeoutMs = 10;
+    await assert.rejects(card2._callStartTimer("x", 60), /timed out/);
+  } finally {
+    console.warn = realWarn;
+    resetCore();
+  }
+});
+
+test("R2 fix1: disconnecting the card clears a live pending chip-start (critic N4)", async () => {
+  injectCore();
+  const realSetTimeout = global.setTimeout;
+  let timeoutFn = null;
+  global.setTimeout = (fn, ms, ...rest) => {
+    if (ms === PENDING_START_TIMEOUT_MS) {
+      timeoutFn = fn;
+      return 0;
+    }
+    return realSetTimeout(fn, ms, ...rest);
+  };
+  try {
+    const hass = fakeHass([]);
+    const card = new TimerScreenCard();
+    card.setConfig({});
+    card.hass = hass;
+    card._onClick({
+      target: {
+        closest: () => ({ dataset: { action: "preset", minutes: "5" } }),
+      },
+    });
+    await sleep(20);
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 1);
+    assert.ok(timeoutFn, "the 10 s bind timeout is armed");
+    assert.notEqual(card._pendingStart, null);
+    card.disconnectedCallback();
+    assert.equal(card._pendingStart, null);
+    assert.equal(card.shadowRoot.querySelectorAll('[data-action="starting"]').length, 0);
+    // The orphaned timeout firing afterwards is a no-op (its pending
+    // no longer matches), not a _sync() on a detached card.
+    timeoutFn();
+    assert.equal(card._pendingStart, null);
+  } finally {
+    global.setTimeout = realSetTimeout;
+    resetCore();
+  }
 });
 
 test("the palette is the warm §3.3 set — no HA blue, amber, or #db4437 (TIMER-5)", () => {
@@ -1119,6 +1415,49 @@ test("finished timers live in a collapsible Finished section; running timers kee
   );
   assert.equal(thirteen.shadowRoot.querySelectorAll(".dial").length, 13);
   assert.ok(!thirteen.shadowRoot.querySelector(".screen").classList.contains("many"));
+});
+
+test("a timer finished < 60 s ago forces the Finished section expanded, even with running timers (R2, §5.1 F6)", () => {
+  const now = Date.now();
+  const card = timerCard([
+    timerState("run1", "Pasta", "active", { remaining: 600 }),
+    timerState("done1", "Tea", "finished", {
+      finishedAt: new Date(now - 30000).toISOString(),
+    }),
+  ]);
+  // The force is derived, not stored: _finishedOpen is still null.
+  assert.equal(card._finishedOpen, null);
+  const header = card.shadowRoot.querySelector(".finished-header");
+  assert.equal(header.getAttribute("aria-expanded"), "true");
+  assert.equal(card.shadowRoot.querySelectorAll(".finished-row").length, 1);
+});
+
+test("recentlyFinished: the < 60 s window is a strict boundary (R2, §5.1 F6)", () => {
+  const now = Date.now();
+  const finished = (msAgo) =>
+    discoverTimers([
+      timerState("t1", "Tea", "finished", {
+        finishedAt: new Date(now - msAgo).toISOString(),
+      }),
+    ])[0];
+  assert.equal(recentlyFinished(finished(30000), now), true);
+  assert.equal(recentlyFinished(finished(59000), now), true);
+  assert.equal(recentlyFinished(finished(60000), now), false);
+  assert.equal(recentlyFinished(finished(180000), now), false);
+  // A finished_at in the future (clock skew) still counts as recent.
+  const future = discoverTimers([
+    timerState("t2", "Eggs", "finished", {
+      finishedAt: new Date(now + 5000).toISOString(),
+    }),
+  ])[0];
+  assert.equal(recentlyFinished(future, now), true);
+  // Not finished, or no finished_at at all: never recent.
+  const active = discoverTimers([
+    timerState("t3", "Pasta", "active", { remaining: 600 }),
+  ])[0];
+  assert.equal(recentlyFinished(active, now), false);
+  assert.equal(recentlyFinished(null, now), false);
+  assert.equal(FINISHED_FORCE_EXPAND_MS, 60000);
 });
 
 test("a dial tap clears a pending Cancel arm (TIMER-9)", async () => {
@@ -1736,9 +2075,19 @@ test("R1: the deleted machinery is gone from the timer exports (§19)", () => {
     "isKioskSession",
     "withKioskQuery",
     "reapplyKioskIfNeeded",
+    // R2 (RB-R2-11, §19): the per-card time copies are deleted —
+    // they live in core now.
+    "formatRemaining",
+    "remainingSeconds",
+    "progressFraction",
+    "startedAtMs",
   ]) {
     assert.equal(timerModule[name], undefined, `${name} must not be exported`);
   }
+  // The R2 recency rule and its constant ARE exported.
+  assert.equal(typeof recentlyFinished, "function");
+  assert.equal(FINISHED_FORCE_EXPAND_MS, 60000);
+  assert.equal(PENDING_START_TIMEOUT_MS, 10000);
   // The core lookup surface is there instead: the Lovelace resource
   // path, the throttle/interval mirrors of core's constants, and the
   // test seam accepts a core module (and null) without throwing.
@@ -1749,6 +2098,31 @@ test("R1: the deleted machinery is gone from the timer exports (§19)", () => {
   assert.doesNotThrow(() => _setCoreForTests(null));
   assert.doesNotThrow(() => _setCoreForTests(core));
   _setCoreForTests(null);
+});
+
+test("R2: no per-card time copies and no ringing code in the card source (§19, §5.1)", () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, "timer-screen-card.js"),
+    "utf8"
+  );
+  // The §19 deletion table: these definitions lived in the card and
+  // are now core's. (Comments may still name them; definitions may
+  // not.) The `ringing` state is deleted the same way — the only
+  // surviving mention is the bridge-behaviour prose "WITHOUT
+  // re-ringing" and deletion-history comments.
+  for (const def of [
+    "function formatRemaining",
+    "function remainingSeconds",
+    "function progressFraction",
+    "function startedAtMs",
+  ]) {
+    assert.ok(!src.includes(def), `card source must not define ${def}`);
+  }
+  assert.doesNotMatch(src, /state === "ringing"/);
+  assert.doesNotMatch(src, /state !== "ringing"/);
+  assert.doesNotMatch(src, /"ringing"/);
+  // The card-file sound grep is zero (RB-R2-11 owns this check).
+  assert.equal((src.match(/sound/gi) || []).length, 0);
 });
 
 test("R1: identity banner CSS exists (§4)", () => {
@@ -1960,6 +2334,53 @@ test("Wave 1: timerBadgeState counts ACTIVE + PAUSED, colour from running/finish
   );
 });
 
+test("R2 fix1: badge soon uses the dial's 59 s rule, from the clock-anchored remaining, on the tick (critic F3)", () => {
+  // One threshold for both consumers (design D5.2 / OQ-5, measured
+  // ≤59 s): 60 s is count, 59 s is soon, 0 s is count (an active timer
+  // at exactly 0 s is a finished timer on the next push, not soon).
+  assert.deepEqual(timerBadgeState([{ state: "active", remaining: 60 }]), { count: 1, tone: "count" });
+  assert.deepEqual(timerBadgeState([{ state: "active", remaining: 59 }]), { count: 1, tone: "soon" });
+  assert.deepEqual(timerBadgeState([{ state: "active", remaining: 0 }]), { count: 1, tone: "count" });
+  // The override map wins over the stored value — and the other way:
+  // the card passes clock-anchored values, so a stale stored 300 s
+  // with a live 45 s clock reads soon, and a stale stored 45 s with
+  // a live 300 s clock reads count.
+  assert.deepEqual(
+    timerBadgeState(
+      [{ timer_id: "a", state: "active", remaining: 300 }],
+      new Map([["a", 45]])
+    ),
+    { count: 1, tone: "soon" }
+  );
+  assert.deepEqual(
+    timerBadgeState(
+      [{ timer_id: "a", state: "active", remaining: 45 }],
+      new Map([["a", 300]])
+    ),
+    { count: 1, tone: "count" }
+  );
+  // The tick flips the badge: a lone timer whose stored remaining is
+  // 300 s (frozen between structural pushes) shows count at setup,
+  // then soon once the clock-anchored remaining crosses 59 s — with
+  // no new hass push in between. Before this fix the badge read the
+  // stored object on _sync only and never flipped on the tick.
+  const card = timerCard([
+    timerState("t1", "Pasta", "active", { remaining: 300, duration: 600 }),
+  ]);
+  const badgeEl = () => card.shadowRoot.querySelector(".timer-badge");
+  assert.equal(badgeEl().hidden, false);
+  assert.equal(badgeEl().textContent, "1");
+  assert.ok(!badgeEl().className.includes("soon"), badgeEl().className);
+  card._remainingFor = () => 45;
+  card._updateTimes();
+  assert.ok(badgeEl().className.includes("soon"), badgeEl().className);
+  assert.equal(badgeEl().textContent, "1");
+  // And back: the clock re-anchoring above 59 s clears the amber.
+  card._remainingFor = () => 300;
+  card._updateTimes();
+  assert.ok(!badgeEl().className.includes("soon"), badgeEl().className);
+});
+
 test("Wave 1: night mode has no default hours; overnight spans work", () => {
   assert.equal(parseNightSetting(null), null);
   assert.equal(readNightSetting(), null);
@@ -2151,10 +2572,13 @@ test("a PIP pin puts that timer first with a 'Just started' marker, read once pe
 
 // -- Wave 1: finished-section collapse rules (D1.2) ------------------------
 
-test("the finished section is forced open while any timer is ringing, collapsed otherwise with timers running", () => {
+test("the finished section is forced open while a timer finished < 60 s ago, collapsed otherwise with timers running (R2, §5.1 F6)", () => {
+  // A timer that finished 20 s ago forces the section open even
+  // while another timer runs — this replaces the old ringing force
+  // (the `ringing` state is deleted in R2).
   const card = timerCard([
     timerState("t1", "Pasta", "active", { remaining: 600 }),
-    timerState("t2", "Tea", "ringing", {
+    timerState("t2", "Tea", "finished", {
       finishedAt: new Date(Date.now() - 20000).toISOString(),
     }),
   ]);
@@ -2162,14 +2586,14 @@ test("the finished section is forced open while any timer is ringing, collapsed 
   assert.equal(header.getAttribute("aria-expanded"), "true");
   assert.equal(
     card.shadowRoot.querySelector('[data-finished-sub="t2"]').textContent,
-    "Ringing · Tap to dismiss"
+    "Done — just now · Tap to dismiss"
   );
-  // Ringing over, finished only: the section falls back to the
-  // running-timers rule (collapsed while a timer runs).
+  // Finished 3 min ago: the window has passed, so the section falls
+  // back to the running-timers rule (collapsed while a timer runs).
   const settled = timerCard([
     timerState("t1", "Pasta", "active", { remaining: 600 }),
     timerState("t2", "Tea", "finished", {
-      finishedAt: new Date(Date.now() - 20000).toISOString(),
+      finishedAt: new Date(Date.now() - 180000).toISOString(),
     }),
   ]);
   assert.equal(
@@ -2188,25 +2612,27 @@ test("the finished section is forced open while any timer is ringing, collapsed 
   );
 });
 
-test("the finished section closes again on the same mount once the ringing window ends", () => {
+test("the finished section closes again on the same mount once the < 60 s window ends (R2, §5.1 F6)", () => {
   const card = timerCard([
     timerState("t1", "Pasta", "active", { remaining: 600 }),
-    timerState("t2", "Tea", "ringing", {
+    timerState("t2", "Tea", "finished", {
       finishedAt: new Date(Date.now() - 20000).toISOString(),
     }),
   ]);
   const header = () => card.shadowRoot.querySelector(".finished-header");
-  // Forced open while ringing.
+  // Forced open while the finish is recent.
   assert.equal(header().getAttribute("aria-expanded"), "true");
-  // Ringing over on the SAME card: re-sync with Tea settled finished.
-  // The old code stored the ringing force in _finishedOpen, so the
-  // section stuck open after the window (rig: still expanded 90 s
-  // after the ring with Pasta running). D1.2 says collapsed by default
-  // whenever anything runs, so it must fall back to collapsed.
+  // Window over on the SAME card: re-sync with Tea finished 3 min
+  // ago (the re-sync stands in for the 60 s passing — the unit run
+  // does not wait a minute). The old code stored the ringing force
+  // in _finishedOpen, so the section stuck open after the window
+  // (rig: still expanded 90 s after the ring with Pasta running).
+  // D1.2 says collapsed by default whenever anything runs, so it
+  // must fall back to collapsed.
   card.hass = fakeHass([
     timerState("t1", "Pasta", "active", { remaining: 600 }),
     timerState("t2", "Tea", "finished", {
-      finishedAt: new Date(Date.now() - 20000).toISOString(),
+      finishedAt: new Date(Date.now() - 180000).toISOString(),
     }),
   ]);
   assert.equal(header().getAttribute("aria-expanded"), "false");

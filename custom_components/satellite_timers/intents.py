@@ -28,7 +28,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import intent
 
-from .bridge import SatelliteTimerBridge, TimerSnapshot, normalize_timer_name
+from .bridge import SatelliteTimerBridge, TimerRecord, normalize_timer_name
 from .const import DISMISS_SENTENCES_FILE, DOMAIN, INTENT_DISMISS_TIMER
 
 _LOGGER = logging.getLogger(__name__)
@@ -89,7 +89,7 @@ def _write_dismiss_sentences(path: Path) -> None:
     path.write_text(DISMISS_SENTENCES_YAML, encoding="utf-8")
 
 
-def _describe_finished(snapshot: TimerSnapshot) -> str:
+def _describe_finished(snapshot: TimerRecord) -> str:
     """One finished timer, as spoken back: name + start time.
 
     "Pasta started 6:02 PM" — the start time is what tells two timers
@@ -154,7 +154,7 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
         ]
 
         name = slots.get("name", {}).get("value")
-        target: TimerSnapshot | None = None
+        target: TimerRecord | None = None
 
         if name:
             wanted = normalize_timer_name(str(name))

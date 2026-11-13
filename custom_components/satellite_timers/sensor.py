@@ -1,14 +1,13 @@
 """Sensor platform: one sensor per active voice timer on the chosen satellites.
 
 Each sensor is named after the timer ("Pasta") and carries what a dial card
-needs: state ``active`` / ``paused`` / ``ringing`` / ``finished``, plus
-``duration`` (total seconds), ``remaining`` (seconds left) and
-``finishes_at`` (ISO timestamp) attributes. ``ringing`` is a finished
-timer inside its ringing window (RINGING-1, bridge.py): the satellite's
-alarm cannot be observed by Home Assistant, so the bridge reports
-"ringing" for 60 s after the timer goes off, then flips to "finished".
-The entity id always contains "timer" (``sensor.satellite_timer_<id>``) so
-cards that look for timer-like sensors recognise it.
+needs: state ``active`` / ``paused`` / ``finished``, plus ``duration``
+(total seconds), ``remaining`` (seconds left) and ``finishes_at`` (ISO
+timestamp) attributes. There is no "ringing" state (§5.1): the bridge
+publishes ``finished_at`` and each consumer that needs recency derives a
+window from it. The entity id always contains "timer"
+(``sensor.satellite_timer_<id>``) so cards that look for timer-like
+sensors recognise it.
 
 Sensors appear when a timer starts and disappear when it is cancelled or
 dismissed. A finished timer keeps its sensor with state ``finished`` until
@@ -30,33 +29,10 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 
-from .bridge import SatelliteTimerBridge, TimerSnapshot
-from .const import (
-    CONF_QUIET_HOURS_END,
-    CONF_QUIET_HOURS_START,
-    DOMAIN,
-)
-from .sound import current_sound_volume_pct, is_quiet_hours, sound_options
+from .bridge import SatelliteTimerBridge, TimerRecord
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _local_now() -> datetime:
-    """The hub's local wall-clock time (its configured time zone).
-
-    Quiet hours are wall-clock hours — a user who sets 22:00-07:00
-    means 10pm-7am on the hub, not in UTC. homeassistant.util.dt.now()
-    returns an aware datetime in the hub's configured time zone. The
-    lazy import keeps this module importable without Home Assistant
-    (the plain-python tests stub HA out); outside HA the fallback is
-    the system local time.
-    """
-    try:
-        from homeassistant.util import dt as dt_util
-
-        return dt_util.now()
-    except Exception:  # pragma: no cover - HA is always present live
-        return datetime.now().astimezone()
 
 
 async def async_setup_entry(
@@ -66,9 +42,7 @@ async def async_setup_entry(
     data = hass.data[DOMAIN][entry.entry_id]
     bridge: SatelliteTimerBridge = data["bridge"]
 
-    manager = _SensorManager(
-        hass, bridge, async_add_entities, sound_options(entry.options)
-    )
+    manager = _SensorManager(hass, bridge, async_add_entities)
     await manager.async_start()
 
     entry.async_on_unload(manager.async_stop)
@@ -84,11 +58,9 @@ class SatelliteTimerSensor(SensorEntity):
     def __init__(
         self,
         hass: HomeAssistant,
-        snapshot: TimerSnapshot,
-        sound_opts: dict | None = None,
+        snapshot: TimerRecord,
     ) -> None:
         self._timer_id = snapshot.timer_id
-        self._sound_options = sound_opts or {}
         self._attr_unique_id = f"{DOMAIN}_{snapshot.timer_id}"
         # The entity id must carry the timer id: two timers with the same
         # spoken name ("Pasta") are different timers and need different ids.
@@ -126,22 +98,15 @@ class SatelliteTimerSensor(SensorEntity):
                     self._attr_device_info = device_info
 
     def update_from_snapshot(
-        self, snapshot: TimerSnapshot, write: bool = True, now: datetime | None = None
+        self, snapshot: TimerRecord, write: bool = True
     ) -> None:
-        """Refresh state and attributes from a snapshot; write only on change.
-
-        ``now`` is the time the sound policy is evaluated at — the
-        hub's LOCAL wall-clock time (see _local_now). It is a parameter
-        so the plain-python tests can pin the local-vs-UTC behaviour
-        without a live hub; production callers leave it unset.
-        """
+        """Refresh state and attributes from a snapshot; write only on change."""
         if snapshot.is_finished:
-            # RINGING-1: a finished timer inside its ringing window
-            # reports "ringing" (the satellite is sounding its alarm);
-            # after the window it is plain "finished". The card treats
-            # both as the finished group; the screensaver guard
-            # suppresses only while a timer is ringing.
-            state = "ringing" if snapshot.is_ringing else "finished"
+            # §5.1: there is no "ringing" state — a finished timer is
+            # "finished" from the moment it goes off. The card treats
+            # it as the finished group; the screensaver guard reads
+            # finished_at for recency instead of a ringing flag.
+            state = "finished"
         else:
             state = "active" if snapshot.is_active else "paused"
         attrs: dict = {
@@ -150,6 +115,10 @@ class SatelliteTimerSensor(SensorEntity):
             "timer_name": snapshot.name,
             "timer_id": snapshot.timer_id,
             "device_id": snapshot.device_id,
+            # §5.2 contract version (integer; 2 for this design). The
+            # card reads it to tell a v2 bridge from a v1 bridge, whose
+            # sensors carry no contract_version and may read "ringing".
+            "contract_version": 2,
         }
         if snapshot.finishes_at is not None:
             attrs["finishes_at"] = snapshot.finishes_at.isoformat()
@@ -165,34 +134,6 @@ class SatelliteTimerSensor(SensorEntity):
         attrs["started_via"] = (
             "service" if snapshot.started_via_service else "voice"
         )
-        if snapshot.is_finished:
-            # DESIGN-5: how loud the finished alarm should sound, right
-            # now (target for the finish moment, ramped by the
-            # escalation since then — the 1s tick re-applies this, so
-            # the value steps up every 10s while escalation runs).
-            # Only a finished timer sounds, so only it carries these.
-            # The satellite plays its own alarm; a consumer that
-            # honours the policy reads these attributes. No speaker is
-            # confirmed (S1 unresolved) — until one exists, these are
-            # configuration, not verified sound.
-            # Quiet hours are LOCAL wall-clock hours (the hub's
-            # configured time zone), not UTC: the options UI says
-            # HH:MM with no mention of UTC, and a user who sets
-            # 22:00-07:00 means 10pm-7am on the hub. Passing
-            # datetime.now(timezone.utc) here used to run quiet hours
-            # 14:00-23:00 on a Los Angeles hub and sound at full
-            # volume overnight (Phase 7 follow-up). `now` is injectable
-            # so the plain-python tests can pin this without a live hub.
-            if now is None:
-                now = _local_now()
-            attrs["sound_volume_pct"] = current_sound_volume_pct(
-                now, snapshot.finished_at, self._sound_options
-            )
-            attrs["quiet_hours"] = is_quiet_hours(
-                now,
-                self._sound_options.get(CONF_QUIET_HOURS_START),
-                self._sound_options.get(CONF_QUIET_HOURS_END),
-            )
 
         if state == self._attr_native_value and attrs == self._last_attrs:
             return
@@ -213,12 +154,10 @@ class _SensorManager:
         hass: HomeAssistant,
         bridge: SatelliteTimerBridge,
         async_add_entities: AddEntitiesCallback,
-        sound_opts: dict | None = None,
     ) -> None:
         self._hass = hass
         self._bridge = bridge
         self._async_add_entities = async_add_entities
-        self._sound_options = sound_opts or {}
         self._sensors: dict[str, SatelliteTimerSensor] = {}
         self._unsub_interval = None
 
@@ -264,20 +203,33 @@ class _SensorManager:
 
     @callback
     def _tick(self, now: datetime) -> None:
-        if self._sensors:
+        # BUG-T2 (§5.1): the 1 s tick runs only while an active or
+        # paused sensor needs it. A finished timer's dial never changes
+        # — its remaining time is frozen at 0 — so a finished-only set
+        # must not keep the 1 s sync traffic alive. The interval
+        # subscription stays installed (it is re-created on the next
+        # sensor add); the gate suppresses the sync, it does not
+        # uninstall the timer.
+        if any(
+            sensor._attr_native_value in (None, "active", "paused")
+            for sensor in self._sensors.values()
+        ):
             self._hass.async_create_task(self.async_sync())
 
     async def async_sync(self) -> None:
         """Add, update and remove sensors to match the current timers."""
-        snapshots = self._bridge.snapshot(datetime.now(timezone.utc))
+        now = datetime.now(timezone.utc)
+        # Reconcile BEFORE the snapshot (§5.3, RB-R2-3): the sync that
+        # observes a no-handler vanish must create the finished record
+        # before the snapshot that would otherwise drop the sensor.
+        await self._bridge.reconcile_finished(now)
+        snapshots = self._bridge.snapshot(now)
 
         new_sensors: list[SatelliteTimerSensor] = []
         for timer_id, snapshot in snapshots.items():
             sensor = self._sensors.get(timer_id)
             if sensor is None:
-                sensor = SatelliteTimerSensor(
-                    self._hass, snapshot, self._sound_options
-                )
+                sensor = SatelliteTimerSensor(self._hass, snapshot)
                 self._sensors[timer_id] = sensor
                 new_sensors.append(sensor)
             else:

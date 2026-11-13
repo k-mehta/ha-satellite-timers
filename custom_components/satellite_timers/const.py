@@ -3,22 +3,43 @@
 DOMAIN = "satellite_timers"
 CONF_DEVICES = "devices"
 
-# Sound policy (DESIGN-5, Phase 7). The bridge owns sound, the card
-# owns the visual; these options set HOW LOUD a finished timer
-# sounds. Phase 7 DECISION (the spec gives no numbers): quiet-hours
-# volume is 30% of the timer volume; escalation starts at 40% of the
-# target and rises 20 points every 10s, reaching full volume in 30s.
-CONF_TIMER_VOLUME = "timer_volume"
-CONF_QUIET_HOURS_START = "quiet_hours_start"
-CONF_QUIET_HOURS_END = "quiet_hours_end"
-CONF_QUIET_HOURS_VOLUME_PCT = "quiet_hours_volume_pct"
-CONF_ESCALATION = "escalation"
+# Bridge options (§5.3/§5.4, RB-R2-4/RB-R2-7 — fixes-18 item 30: the exact
+# key strings + value literals are this step's implementation choice,
+# recorded in the rebuild log). The Q11/Q12 fields record the SETTLED
+# answers, not a user choice; O1 stays unsettled until the §25 listen
+# test settles it. There is NO Q13 field — Q13 is DEAD (no bypass exists
+# to suppress).
+CONF_Q11_RING_TIMING = "q11_ring_timing"
+CONF_Q12_AUTO_STOP_RESEND = "q12_auto_stop_resend"
+CONF_O1_ALARM_BEHAVIOUR = "o1_alarm_behaviour"
+CONF_PRIMARY_SATELLITE = "primary_satellite"
 
-DEFAULT_TIMER_VOLUME = 100
-DEFAULT_QUIET_HOURS_START = "22:00"
-DEFAULT_QUIET_HOURS_END = "07:00"
-DEFAULT_QUIET_HOURS_VOLUME_PCT = 30
-DEFAULT_ESCALATION = True
+# Q11 — settled ~15:02 PST Nov 12: a timer that finished while the system
+# was down NEVER rings. "never_ring" is the settled value and the default.
+Q11_NEVER_RING = "never_ring"
+Q11_RING_ON_LIVENESS_DRAIN = "ring_on_liveness_drain"  # rejected (a)
+Q11_RING_AT_BRIDGE_START = "ring_at_bridge_start"  # rejected (b)
+Q11_OPTIONS = (Q11_NEVER_RING, Q11_RING_ON_LIVENESS_DRAIN,
+               Q11_RING_AT_BRIDGE_START)
+DEFAULT_Q11_RING_TIMING = Q11_NEVER_RING
+
+# Q12 — settled (b) ~08:41 PST Nov 12: never re-ring a stopped alarm.
+Q12_NEVER_RESEND = "never_resend"
+Q12_RESEND_ONCE_PER_REGISTRATION = "resend_once_per_registration"  # rejected (a)
+Q12_OPTIONS = (Q12_NEVER_RESEND, Q12_RESEND_ONCE_PER_REGISTRATION)
+DEFAULT_Q12_AUTO_STOP_RESEND = Q12_NEVER_RESEND
+
+# O1 — the satellite firmware's alarm behaviour, measured by the §25
+# listen test (RB-R0-7). "unsettled" is the default until it settles.
+O1_UNSETTLED = "unsettled"
+O1_RINGS_UNTIL_CANCELLED = "rings_until_cancelled"
+O1_AUTO_STOP = "auto_stop"
+O1_OPTIONS = (O1_UNSETTLED, O1_RINGS_UNTIL_CANCELLED, O1_AUTO_STOP)
+DEFAULT_O1_ALARM_BEHAVIOUR = O1_UNSETTLED
+
+# Primary satellite (§5.4): the device id the bridge rings when a chip
+# tap names no satellite. "" in the options flow means unset.
+PRIMARY_SATELLITE_UNSET = ""
 
 SERVICE_PAUSE_TIMER = "pause_timer"
 SERVICE_RESUME_TIMER = "resume_timer"

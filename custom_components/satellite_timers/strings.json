@@ -1,1 +1,47 @@
-{"config":{"abort":{"no_devices":"No voice satellite with timer support was found. Set up a voice satellite first.","not_ready":"Home Assistant has not loaded its voice timer system yet. Try again in a minute.","single_instance_allowed":"Satellite Timers is already set up.","unsupported":"This Home Assistant version changed how voice timers work internally, so Satellite Timers cannot read them."},"error":{"no_selection":"Pick at least one satellite."},"step":{"user":{"data":{"devices":"Voice satellites"},"description":"Pick the voice satellites whose timers should appear as sensors for your dashboard. Timers you set by voice keep working exactly as they do now; this only mirrors them so cards can show them.","title":"Satellite Timers"}}},"issues":{"assist_unsupported":{"description":"Home Assistant changed how voice timers work internally. Satellite Timers has switched itself off rather than risk breaking your voice timers. Check for an update to Satellite Timers.","title":"Satellite Timers cannot read voice timers"}},"options":{"step":{"init":{"data":{"devices":"Voice satellites","timer_volume":"Timer volume (%)","quiet_hours_start":"Quiet hours start (local time, HH:MM)","quiet_hours_end":"Quiet hours end (local time, HH:MM)","quiet_hours_volume_pct":"Quiet-hours volume (% of timer volume)","escalation":"Escalate the alarm volume"},"description":"Pick the voice satellites whose timers should appear as sensors. Timer volume is how loud a finished timer sounds (100 is full volume). During quiet hours it sounds at the quiet-hours volume instead. Escalation starts the alarm quieter and raises it to full volume over 30 seconds.","title":"Satellite Timers"}},"error":{"invalid_time":"Enter a time as HH:MM, for example 22:00."}}}
+{
+  "config": {
+    "abort": {
+      "no_devices": "No voice satellite with timer support was found. Set up a voice satellite first.",
+      "not_ready": "Home Assistant has not loaded its voice timer system yet. Try again in a minute.",
+      "single_instance_allowed": "Satellite Timers is already set up.",
+      "unsupported": "This Home Assistant version changed how voice timers work internally, so Satellite Timers cannot read them."
+    },
+    "error": {
+      "no_selection": "Pick at least one satellite."
+    },
+    "step": {
+      "user": {
+        "data": {
+          "devices": "Voice satellites"
+        },
+        "description": "Pick the voice satellites whose timers should appear as sensors for your dashboard. Timers you set by voice keep working exactly as they do now; this only mirrors them so cards can show them.",
+        "title": "Satellite Timers"
+      }
+    }
+  },
+  "issues": {
+    "assist_unsupported": {
+      "description": "Home Assistant changed how voice timers work internally. Satellite Timers has switched itself off rather than risk breaking your voice timers. Check for an update to Satellite Timers.",
+      "title": "Satellite Timers cannot read voice timers"
+    },
+    "undelivered_timer_events": {
+      "description": "A finished timer was dismissed, but the hub could not confirm the satellite stopped ringing: the stop message could not be delivered. The satellite may still be ringing. The hub keeps retrying the stop and clears this warning when the stop is sent on a liveness signal and leaves the queue, when a newer event for the same timer replaces it, or when the record expires after 24 hours.",
+      "title": "A dismissed timer may still be ringing"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "devices": "Voice satellites",
+          "primary_satellite": "Primary satellite",
+          "q11_ring_timing": "Timer finished while the system was down",
+          "q12_auto_stop_resend": "Stopped alarm re-send",
+          "o1_alarm_behaviour": "Satellite alarm behaviour"
+        },
+        "description": "Pick the voice satellites whose timers should appear as sensors. The primary satellite is the one a dashboard timer rings when no satellite is named; leave it unset with a single satellite. A timer that finished while the system was down never rings \u2014 it is shown, not announced \u2014 and a stopped alarm is never re-rung. Satellite alarm behaviour stays 'Not yet measured' until the listen test measures what the satellite firmware does when a timer finishes.",
+        "title": "Satellite Timers"
+      }
+    }
+  }
+}

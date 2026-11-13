@@ -3198,6 +3198,18 @@ check("B3 flap-fail: docstring states the range holds at the 15-minute step",
 check("B3 clean-case: docstring qualifies just-under-46-min as the 15-minute-step value",
       "takes just under 46 min once the"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+# Burst-11 delta critic finding (test-only): the pin above stops
+# before "15-minute step" — mutating "15-minute"->"15minute" in the
+# clean-case sentence only tripped zero pins, and no check spanned
+# "once attempt_count is 3 or more". Same class as burst-9 F2: the
+# pin label overclaimed its span. Each phrase is pinned within its
+# own single docstring line (cross-line spans fail, burst-9).
+check("B3 clean-case: docstring qualifies just-under-46-min as the 15-minute-step value (15-minute step line)",
+      "backoff ladder is at the 15-minute step"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 clean-case: docstring states the 15-minute-step value holds once attempt_count is 3 or more",
+      "once attempt_count is 3 or more"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 check("B3 clean-case: docstring states earlier in the ladder it takes less",
       "takes less: with the last attempt just before recovery"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)

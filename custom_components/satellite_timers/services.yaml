@@ -55,6 +55,15 @@ dismiss_timer:
       description: The timer_id attribute of the bridge sensor for the timer.
       required: true
       example: "01K8..."
+retry_dismiss:
+  name: Retry dismiss
+  description: Send the stop for a timer that was already dismissed, right now instead of waiting for the next automatic retry. Use it when the satellite is still ringing after a dismiss. The timer stays dismissed either way.
+  fields:
+    timer_id:
+      name: Timer ID
+      description: The timer_id of the dismissed timer (the same id the dismiss used).
+      required: true
+      example: "01K8..."
 start_timer:
   name: Start timer
   description: Start a timer on a satellite by name and duration. Returns the created timer sensor's entity id. Duplicate names are accepted. A chip-started timer does not trigger the timer-jump automation.

@@ -117,13 +117,55 @@ class PendingRecord:
     pops it), so the drain builds its send snapshot from the record
     itself — ``name`` / ``total_seconds`` / ``language`` /
     ``is_finished`` are the send shape captured at enqueue time.
-    ``delivery_failed`` records that at least one send attempt for this
-    record hit an observably-impossible path (one of
+    ``delivery_failed`` records whether the most recent send attempt
+    for this record hit an observably-impossible path (one of
     _send_to_satellite's bare returns, or the handler-raise path) — it
     is the repair-issue condition (§5.3) and is persisted so the
     issue's age (from the original ``enqueued_at``) survives a restart.
+    It clears only after ``_DELIVERY_CLEAR_STREAK`` consecutive
+    attempts that reach the handler ("sent"): a single "sent" is
+    consistent with a silent drop inside the handler (B1), so one
+    clean return is not evidence the path is open again — clearing on
+    it would let the repair issue false-clear and flap on every tick
+    while the handler flaps (fix-burst F3). Clearing the mark is NOT
+    delivery confirmation — the record stays pending regardless; only
+    the observable-failure signal is reset. ``sent_streak`` counts
+    those consecutive "sent" attempts (reset to 0 by any
+    observably-impossible attempt); it is persisted with the mark so
+    a restart does not reset the hysteresis.
+
+    ``attempt_count`` / ``last_attempt_at`` drive the trigger-4
+    backoff for CANCELLED records (fix-burst F2): after the first
+    attempt the next re-send waits 60 s, then 5 min, then 15 min
+    between attempts — a dismissed timer that never gets a liveness
+    signal costs ~100 sends over 24 h, not ~1,440. The backoff
+    applies ONLY to the CANCELLED retry cadence on trigger 4: liveness
+    drains (triggers 1/2/3) re-send immediately when the channel
+    proves live, and FINISHED re-sends are a different mechanism
+    (``_finished_may_resend`` + purge on a liveness drain) with their
+    own exactly-once-attempt rule — they are never gated by this
+    backoff. Every send attempt for the record (immediate dismiss /
+    restart / cancel sends and every drain re-send) bumps the count
+    and re-stamps the time, so the clock restarts on any attempt.
+    Every drain that attempts a send persists the mutated
+    bookkeeping — count, last-attempt time, streak and mark — so a
+    restart resets neither the backoff ladder nor the hysteresis
+    (round-2 B1: pre-fix only a ``delivery_failed`` transition
+    counted as a queue change, so a re-send-only drain left the new
+    streak/count in memory).
     All four are optional with defaults, so records written by the
     store step (RB-R2-1) load cleanly.
+
+    ``started_at`` is the timer's observed start, carried so a pending
+    snapshot can still be told apart from another timer with the same
+    name after the finished record is gone (round-2 B5): the voice
+    re-dismiss listing renders it ("Pasta started 6:02 PM"), the same
+    TIMER-11 rule finished timers use. It is whatever the enqueue
+    site knew — the finished record's start, or the observed start
+    for a live cancel — or None when the start was never observed, in
+    which case the listing falls back to the bare name, exactly as a
+    finished timer with no observed start does. Optional with a
+    default, so records written before this burst load cleanly.
     """
 
     timer_id: str
@@ -136,6 +178,10 @@ class PendingRecord:
     language: str = "en"
     is_finished: bool = False
     delivery_failed: bool = False
+    sent_streak: int = 0
+    attempt_count: int = 0
+    last_attempt_at: datetime | None = None
+    started_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +511,14 @@ class SatelliteTimerBridge:
         # Whether the undelivered_timer_events repair issue is
         # currently open (in-memory mirror of the issue registry).
         self._repair_issue_open: bool = False
+        # How many pending FINISHED records have been purged on an
+        # unconfirmed "sent" (fix-burst F5 observability): every such
+        # purge spends the record's one re-ring attempt on a send that
+        # may have been silently dropped, with no retry and no repair
+        # signal — the counter (and the warning logged per purge) is
+        # the only trace that a first ring may never have happened.
+        # In-memory only; it resets on restart.
+        self._unconfirmed_finished_purges: int = 0
         # HA storage for persistence (BRIDGE-2). None until
         # async_load_persisted() runs — without it the bridge simply
         # keeps everything in memory (unit tests, or a store failure).
@@ -569,10 +623,11 @@ class SatelliteTimerBridge:
         # settled ~15:02 PST Nov 12).) The startup firing below is
         # trigger 1 at HA start: already-registered handlers drain
         # once here, and later (re)registrations drain through the
-        # tap. The drain itself never purges, so no persist is owed
-        # for it — but the drain helper reports whether the queue
-        # changed, and start() awaits the persist when it did (a
-        # re-assert write landing is the §5.1 site-(6) case).
+        # tap. The drain itself never purges, but every attempt it
+        # makes mutates the queue's bookkeeping (round-2 B1), so the
+        # drain helper reports whether the queue changed, and start()
+        # awaits the persist when it did (a re-assert write landing
+        # is the §5.1 site-(6) case).
         tap.handler_listeners.append(self._on_handler_registered)
         tm = timer_manager(self._hass)
         changed = False
@@ -868,6 +923,11 @@ class SatelliteTimerBridge:
                         total_seconds=seen.total_seconds,
                         language=seen.language,
                         is_finished=True,
+                        started_at=(
+                            started_at
+                            if started_at is not None
+                            else seen.started_at
+                        ),
                     )
                 )
                 converted += 1
@@ -908,6 +968,7 @@ class SatelliteTimerBridge:
                         total_seconds=record.total_seconds,
                         language=record.language,
                         is_finished=True,
+                        started_at=record.started_at,
                     )
                 )
                 converted += 1
@@ -1124,9 +1185,13 @@ class SatelliteTimerBridge:
         23, RB-R2-10 decision: CARRY, disclosed) stays in the queue —
         the restore is a cross-id operation (new id) and the §5.3
         supersede rule applies per timer id, so there is nothing to
-        supersede; the pending CANCELLED drains on the next liveness
-        signal as a duplicate stop for an alarm that already stopped
-        at dismiss (a no-op at the satellite). Returns the new timer
+        supersede; the pending CANCELLED keeps retrying on the
+        trigger-4 backoff cadence as a duplicate stop for an alarm
+        that already stopped at dismiss (a no-op at the satellite),
+        and can be re-sent at once with ``redismiss_timer`` for the
+        OLD id — re-dismissing the restored timer sends CANCELLED for
+        the NEW id, which cannot stop the satellite's ringing for the
+        OLD id. Returns the new timer
         id. Raises ValueError for a bad device, duration or missing
         finished_at.
         """
@@ -1227,6 +1292,7 @@ class SatelliteTimerBridge:
                 total_seconds=snap.total_seconds,
                 language=snap.language,
                 is_finished=snap.is_finished,
+                started_at=snap.started_at,
             )
         )
         # No await between the get and the pop, so the record cannot
@@ -1234,6 +1300,9 @@ class SatelliteTimerBridge:
         self._records.pop(timer_id, None)
         self._service_started.discard(timer_id)
         outcome = self._send_to_satellite(snap, "cancelled")
+        # The immediate send counts as attempt 1 for the trigger-4
+        # backoff (F2).
+        self._record_attempt(timer_id)
         if outcome != "sent":
             pending = self._pending.get(timer_id)
             if pending is not None:
@@ -1448,6 +1517,45 @@ class SatelliteTimerBridge:
         delivery_failed = record.get("delivery_failed", False)
         if not isinstance(delivery_failed, bool):
             return None
+        # Hysteresis + backoff state (fix-burst F2/F3): optional with
+        # defaults, so records written before this burst load cleanly
+        # (streak 0, no attempts yet — a legacy record is due at once).
+        sent_streak = record.get("sent_streak", 0)
+        if not isinstance(sent_streak, int) or isinstance(
+            sent_streak, bool
+        ) or sent_streak < 0:
+            return None
+        attempt_count = record.get("attempt_count", 0)
+        if not isinstance(attempt_count, int) or isinstance(
+            attempt_count, bool
+        ) or attempt_count < 0:
+            return None
+        last_attempt_at = record.get("last_attempt_at")
+        if last_attempt_at is not None:
+            if not isinstance(last_attempt_at, str):
+                return None
+            try:
+                last_attempt = datetime.fromisoformat(last_attempt_at)
+            except ValueError:
+                return None
+            if last_attempt.tzinfo is None:
+                last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+        else:
+            last_attempt = None
+        # Observed start (round-2 B5): optional, so records written
+        # before this burst load cleanly with started_at None.
+        started_at = record.get("started_at")
+        if started_at is not None:
+            if not isinstance(started_at, str):
+                return None
+            try:
+                started = datetime.fromisoformat(started_at)
+            except ValueError:
+                return None
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        else:
+            started = None
         return PendingRecord(
             timer_id=timer_id,
             device_id=device_id,
@@ -1459,6 +1567,10 @@ class SatelliteTimerBridge:
             language=language,
             is_finished=is_finished,
             delivery_failed=delivery_failed,
+            sent_streak=sent_streak,
+            attempt_count=attempt_count,
+            last_attempt_at=last_attempt,
+            started_at=started,
         )
 
     @staticmethod
@@ -1560,6 +1672,18 @@ class SatelliteTimerBridge:
                 "language": record.language,
                 "is_finished": record.is_finished,
                 "delivery_failed": record.delivery_failed,
+                "sent_streak": record.sent_streak,
+                "attempt_count": record.attempt_count,
+                "last_attempt_at": (
+                    record.last_attempt_at.isoformat()
+                    if record.last_attempt_at is not None
+                    else None
+                ),
+                "started_at": (
+                    record.started_at.isoformat()
+                    if record.started_at is not None
+                    else None
+                ),
             }
             for record in self._pending.values()
         ]
@@ -1708,7 +1832,7 @@ class SatelliteTimerBridge:
             for timer in tm.timers.values()
         )
 
-    def dismiss_timer(self, timer_id: str) -> TimerRecord:
+    def dismiss_timer(self, timer_id: str) -> tuple[TimerRecord, str]:
         """Drop a finished timer's record so its sensor disappears.
 
         Dismissing also tells the satellite to stop ringing: the
@@ -1718,9 +1842,35 @@ class SatelliteTimerBridge:
         TimerManager the moment it goes off). Clearing only the
         bridge's record leaves the satellite ringing.
 
+        Returns ``(finished_record, outcome)``: the outcome is the
+        immediate send's result ("sent" / "no-handler" / ..., see
+        ``_send_to_satellite``), returned directly so the caller —
+        the voice reply — reports THIS dismiss's outcome. It is
+        deliberately not kept on the bridge (round-2 B6): a
+        bridge-global "last outcome" read after an ``await`` lets a
+        concurrent dismiss on another satellite overwrite the field,
+        so one handler reports another's outcome.
+
+        Durability is ordering, not a durability guarantee: the
+        enqueue reaches storage before the dismiss returns ONLY on
+        paths that await ``persist()`` afterwards (the service path
+        and the voice path) — and ``persist()`` logs a save failure
+        instead of raising, per its contract, so a failed save still
+        returns success with no signal to the caller (round-2 B7).
+        This method itself is sync and persists nothing.
+
         Raises KeyError when there is no such timer at all, and ValueError
         when the timer is still running (cancel it instead — a running
         timer has not finished, so there is nothing to dismiss).
+
+        FOLLOW-UP (fix-burst F4, not built here): dismissing drops the
+        sensor at once, so the dashboard gives no sign the stop is
+        still retrying — no "dismissing" sensor state, and no
+        re-dismiss button on the card. The bridge-level half is built
+        (``pending_cancelled`` / ``redismiss_timer`` + the
+        ``retry_dismiss`` service + voice re-dismiss), but the sensor
+        "dismissing" state and its card affordance remain a follow-up
+        — the retry is automatic and invisible until then.
         """
         finished = self._records.pop(timer_id, None)
         if finished is not None:
@@ -1730,11 +1880,17 @@ class SatelliteTimerBridge:
             # immediate send is attempted at once — but the attempt is
             # NOT a liveness signal and does NOT purge (a Wyoming
             # silent drop returns cleanly while the event never
-            # arrives). The record stays pending until a liveness
-            # drain purges it, a supersede replaces it, or the 24 h
-            # prune removes it. The handler awaits persist() before
-            # returning (site (3)), so the enqueue is durable before
-            # the dismiss returns.
+            # arrives). The record stays pending until the 24 h prune
+            # removes it — no drain purges a CANCELLED on "sent" (B1:
+            # "sent" is not delivery confirmation), and supersede is
+            # not an exit for a finished id (F2). On durability, see
+            # the docstring: ordering-only on paths that await
+            # persist() afterwards; this method itself is sync and
+            # persists nothing.
+            # The finished record's observed start is carried on the
+            # pending record (round-2 B5), so the re-dismiss listing
+            # can still tell same-name timers apart after the
+            # finished record is gone.
             self._enqueue(
                 PendingRecord(
                     timer_id=finished.timer_id,
@@ -1745,9 +1901,13 @@ class SatelliteTimerBridge:
                     total_seconds=finished.total_seconds,
                     language=finished.language,
                     is_finished=True,
+                    started_at=finished.started_at,
                 )
             )
             outcome = self._stop_satellite_ringing(finished)
+            # The immediate send counts as attempt 1 for the trigger-4
+            # backoff (F2), so the first re-send waits 60 s.
+            self._record_attempt(timer_id)
             if outcome != "sent":
                 pending = self._pending.get(timer_id)
                 if pending is not None:
@@ -1755,12 +1915,52 @@ class SatelliteTimerBridge:
                         pending, delivery_failed=True
                     )
             self._notify_listeners()
-            return finished
+            return finished, outcome
 
         tm = timer_manager(self._hass)
         if tm is not None and timer_id in tm.timers:
             raise ValueError(f"Timer {timer_id} is still running")
         raise KeyError(timer_id)
+
+    def pending_cancelled(self) -> list[TimerRecord]:
+        """Send snapshots for every pending CANCELLED record (F4).
+
+        The voice re-dismiss path and the re-dismiss service list
+        these: after a dismiss the finished record is gone, so the
+        pending CANCELLED is the only thing left that names the timer
+        — without this there is no way to say "stop it again". Sorted
+        by enqueue time, oldest first, so listings are stable.
+        """
+        return [
+            self._snap_for_pending(record)
+            for record in sorted(
+                self._pending.values(), key=lambda r: r.enqueued_at
+            )
+            if record.event_type == "cancelled"
+        ]
+
+    def redismiss_timer(self, timer_id: str) -> str:
+        """Re-send CANCELLED for a pending id, without a finished record (F4).
+
+        The re-dismiss / retry affordance: after a dismiss the
+        finished record is gone, so ``dismiss_timer`` raises KeyError
+        for the id — but the pending CANCELLED is still retrying, and
+        this re-sends it NOW instead of waiting for the trigger-4
+        backoff. Returns the send outcome (see ``_send_to_satellite``)
+        so the caller can surface an observably-failed send. Raises
+        KeyError when no CANCELLED is pending for the id (nothing to
+        re-send — including when only a FINISHED is pending, which is
+        a ringing timer, not a dismissed one). The record stays
+        pending either way: a re-send never purges (B1). The attempt
+        counts toward the backoff clock and the delivery_failed
+        hysteresis, like any drain re-send. The caller persists
+        afterwards (service site (3) / intent handler, F1): the
+        attempt bookkeeping must survive a restart like the record.
+        """
+        pending = self._pending.get(timer_id)
+        if pending is None or pending.event_type != "cancelled":
+            raise KeyError(timer_id)
+        return self._attempt_send_for_pending(pending, "cancelled")
 
     def _stop_satellite_ringing(self, finished: TimerRecord) -> str:
         """Tell the satellite its finished timer is over, so it stops ringing.
@@ -1790,7 +1990,9 @@ class SatelliteTimerBridge:
         reconnect — the handler stays registered across a blip — so
         trigger 1 cannot be the reconnect drain for a blip. A persist
         is issued only when a drain write landed in this registration
-        (§5.1 site (6)); a re-send-only drain writes nothing.
+        (§5.1 site (6)); any drain attempt mutates the queue's
+        bookkeeping (round-2 B1), so a drain that re-sent owes a
+        persist, not only one that purged or flipped the mark.
         """
         if device_id not in self._devices:
             return
@@ -1964,6 +2166,7 @@ class SatelliteTimerBridge:
             None,
             is_finished=record.is_finished,
             language=record.language,
+            started_at=record.started_at,
         )
 
     def _finished_may_resend(
@@ -1976,12 +2179,31 @@ class SatelliteTimerBridge:
         was up, and a re-send restarts its ringing window or rings an
         alarm the firmware already stopped. A ``false``-flag record
         re-sends on a liveness-signalled (purge) drain regardless of
-        O1 — the channel was just proven live and the attempt purges,
-        so there is exactly one re-ring, not a loop. On a non-purge
-        drain it re-sends only when O1 settles "rings until
-        cancelled": never under auto-stop (Q12(b) settled — never
+        O1 — the channel was just proven live and the attempt purges.
+        On a non-purge drain it re-sends only when O1 settles "rings
+        until cancelled": never under auto-stop (Q12(b) settled — never
         re-ring a stopped alarm), and never while O1 is unsettled
         (conservative default).
+
+        What the purge on a liveness drain buys — and what it costs
+        (fix-burst F5): the purge is what stops a re-ring LOOP. Under
+        "rings until cancelled" a ``false``-flag record that never
+        purged would re-ring on every liveness drain and every
+        trigger-4 tick, forever. The purge buys at most ONE re-ring
+        ATTEMPT, not one ring: "sent" is not delivery confirmation
+        (B1 — a Wyoming silent drop returns cleanly), so a purge
+        spends the record's only attempt on a send that may never
+        have arrived, and the record is gone afterwards — no retry,
+        no repair signal. Q11 and Q12 do NOT justify the purge: Q11
+        is a timer that finished while the system was down (restores
+        display-only, never rings) and Q12 is never re-ring a STOPPED
+        alarm — neither covers an undelivered FIRST ring. The real
+        justification is the re-ring-loop avoidance plus the
+        architecture's purge-on-live-send rule; the cost is disclosed
+        here and counted/logged per purge in ``_drain_device``
+        (``unconfirmed_finished_purges``), because no in-HA fix exists
+        for the missing delivery signal itself (same root as C10).
+        The purge behaviour itself is unchanged.
         """
         if record.direct_delivery_attempted is not False:
             return False
@@ -1989,23 +2211,109 @@ class SatelliteTimerBridge:
             return True
         return self._o1_alarm_behaviour == "rings_until_cancelled"
 
+    def _cancelled_backoff_due(
+        self, record: PendingRecord, now: datetime
+    ) -> bool:
+        """Whether a CANCELLED record is due a trigger-4 re-send (F2).
+
+        No attempt yet: due at once (a live-cancel enqueue never had
+        an immediate send). Otherwise the wait after attempt N is 60 s
+        (N=1), 5 min (N=2), then 15 min (N>=3) — the backoff ladder.
+        FINISHED records never reach this helper: their re-send rule
+        is ``_finished_may_resend`` + purge on a liveness drain, and
+        gating them here would break the Q11/Q12 exactly-once-attempt
+        path.
+        """
+        if record.last_attempt_at is None:
+            return True
+        if record.attempt_count <= 1:
+            delay = self._CANCELLED_BACKOFF[0]
+        elif record.attempt_count == 2:
+            delay = self._CANCELLED_BACKOFF[1]
+        else:
+            delay = self._CANCELLED_BACKOFF[2]
+        return now >= record.last_attempt_at + delay
+
+    def _record_attempt(
+        self, timer_id: str, *, now: datetime | None = None
+    ) -> None:
+        """Book one immediate send for a pending record (F2).
+
+        Immediate sends (dismiss / restart / cancel) go through
+        ``_send_to_satellite`` directly, not ``_attempt_send_for_pending``,
+        so they would otherwise leave the backoff clock untouched and
+        trigger 4 would re-send 60 s after a send that just happened.
+        Bumps ``attempt_count`` and re-stamps ``last_attempt_at``; the
+        delivery_failed / streak bookkeeping stays with
+        ``_attempt_send_for_pending`` and the caller's own
+        observably-failed check, so this never clears a failure mark.
+        """
+        pending = self._pending.get(timer_id)
+        if pending is None:
+            return
+        self._pending[timer_id] = dataclass_replace(
+            pending,
+            attempt_count=pending.attempt_count + 1,
+            last_attempt_at=now or datetime.now(timezone.utc),
+        )
+
     def _attempt_send_for_pending(
-        self, record: PendingRecord, event_type: str
+        self, record: PendingRecord, event_type: str,
+        now: datetime | None = None,
     ) -> str:
-        """Re-send a pending record and mark an impossible delivery.
+        """Re-send a pending record and track whether delivery is observably possible.
 
         Returns the send outcome. When the attempt hits an
         observably-impossible path (a bare return or a handler raise),
         the pending record is replaced with ``delivery_failed=True``
-        — the repair-issue condition (§5.3). The mark is persisted by
-        the caller's persist (site (4) for drains, site (3) for
-        service paths, site (5) for taps).
+        and ``sent_streak`` reset to 0. When the attempt reaches the
+        handler ("sent"), the streak increments — but the mark clears
+        only once the streak reaches ``_DELIVERY_CLEAR_STREAK``
+        consecutive "sent" attempts (F3 hysteresis): a single "sent"
+        is consistent with a silent drop inside the handler (B1), so
+        clearing on it would delete the repair issue while the
+        CANCELLED may never have arrived, and a flapping handler
+        would toggle the issue open/closed on every tick. The record
+        stays pending either way — only the observable-failure signal
+        is reset, never the retry. Every attempt bumps
+        ``attempt_count`` and re-stamps ``last_attempt_at`` (F2
+        backoff clock). ``now`` is the drain's clock (trigger 4
+        passes its tick time so the backoff is deterministic in
+        tests); other drains use wall-clock time. Every attempt
+        mutates the record's bookkeeping — ``attempt_count``,
+        ``last_attempt_at``, and the streak / ``delivery_failed``
+        mark — so every attempt is a queue change, and the caller
+        persists it (site (4) for drains, site (3) for service
+        paths, site (5) for taps). A caller that only persists on a
+        mark transition loses the mid-streak values to a restart
+        (round-2 B1).
         """
         snap = self._snap_for_pending(record)
         outcome = self._send_to_satellite(snap, event_type)
+        stamp = now or datetime.now(timezone.utc)
         if outcome != "sent":
             self._pending[record.timer_id] = dataclass_replace(
-                record, delivery_failed=True
+                record,
+                delivery_failed=True,
+                sent_streak=0,
+                attempt_count=record.attempt_count + 1,
+                last_attempt_at=stamp,
+            )
+        elif record.delivery_failed:
+            streak = record.sent_streak + 1
+            self._pending[record.timer_id] = dataclass_replace(
+                record,
+                delivery_failed=streak < self._DELIVERY_CLEAR_STREAK,
+                sent_streak=streak,
+                attempt_count=record.attempt_count + 1,
+                last_attempt_at=stamp,
+            )
+        else:
+            self._pending[record.timer_id] = dataclass_replace(
+                record,
+                sent_streak=0,
+                attempt_count=record.attempt_count + 1,
+                last_attempt_at=stamp,
             )
         return outcome
 
@@ -2016,26 +2324,53 @@ class SatelliteTimerBridge:
 
         CANCELLED records always re-send; FINISHED records re-send
         only per ``_finished_may_resend``. A drain attempt purges a
-        record ONLY when the attempt was made in response to a
-        liveness signal (``purge=True``: trigger 2 out of
+        FINISHED record ONLY when the attempt was made in response to
+        a liveness signal (``purge=True``: trigger 2 out of
         ``unavailable``, trigger 3 voice-STARTED) AND the attempt
         observably succeeded (outcome ``"sent"``) — a purge-drain
         attempt that observably failed (no handler, handler raised)
         does NOT purge: the record stays pending with
         ``delivery_failed=True`` so the retry and the repair signal
-        survive (critic N3; §24-amendment candidate — the
-        architecture's "purge only on a live send-attempt" plus the
-        observably-failed exception). Attempts made by triggers 1 and
-        4 never purge, however cleanly they return — they are
-        unconditioned attempts that may have been silently dropped.
-        Returns True when the queue changed — a purge, or a
-        newly-landed ``delivery_failed`` mark: the mark is the
-        repair-issue condition, and it must be durable across a
-        restart (a reload re-reads the store file, so a mark that
-        never reaches the file is lost and the issue cannot age from
-        its original ``enqueued_at``) — so a mark landing in a drain
-        owes a persist (§5.1 site (4)). Every purge is logged with
-        timer id + reason; every skipped purge is logged the same way.
+        survive (critic N3). The purge buys at most one re-ring
+        ATTEMPT, not one ring (F5 — see ``_finished_may_resend``):
+        "sent" is not delivery confirmation, so the purge is counted
+        (``unconfirmed_finished_purges``) and logged as a warning.
+        A pending CANCELLED is NEVER purged by
+        any drain (B1): "sent" means the handler was invoked without
+        raising, which for Wyoming is consistent with a silent drop
+        inside the handler (``wyoming/assist_satellite.py:913-915``
+        — the handler returns normally while the event never
+        arrives) and otherwise only schedules the write as a
+        background task (``:941-944``) whose outcome the caller never
+        sees — there is no delivery signal in HA 2026.10.4, so a
+        "sent" CANCELLED is unconfirmed and the record stays pending
+        until the 24 h prune removes it. "Supersede" is NOT an exit
+        for it (F2): a FINISHED never supersedes a CANCELLED, and no
+        second CANCELLED can be produced for a finished id — a second
+        dismiss raises KeyError, ``restart_timer`` needs the finished
+        record, a live ``_event`` cancelled fires only for live
+        timers, and ``restore_finished`` mints a new id. The only
+        exits are the prune and a re-dismiss of the same id (which
+        re-sends, it does not purge); trigger 4 keeps re-sending it
+        on the backoff cadence (60 s, then 5 min, then 15 min)
+        until then.
+        Attempts made by triggers 1 and 4 never purge, however
+        cleanly they return — they are unconditioned attempts that
+        may have been silently dropped. Returns True when the queue
+        changed — a purge, or ANY attempt's bookkeeping mutation:
+        every attempt bumps ``attempt_count``, re-stamps
+        ``last_attempt_at`` and moves the streak / ``delivery_failed``
+        mark, so a re-send-only pass still changes the record
+        (round-2 B1: pre-fix only a ``delivery_failed`` transition
+        counted, so mid-streak values 1–2 never reached storage and
+        a restart reset both the backoff ladder and the hysteresis).
+        The mark is the repair-issue condition, and it must be
+        durable across a restart (a reload re-reads the store file,
+        so a mark that never reaches the file is lost and the issue
+        cannot age from its original ``enqueued_at``) — so any
+        attempt in a drain owes a persist (§5.1 site (4)). Every
+        purge is logged with timer id + reason; every skipped purge
+        is logged the same way.
         """
         changed = False
         for record in list(self._pending.values()):
@@ -2049,23 +2384,49 @@ class SatelliteTimerBridge:
                 event_type = "finished"
             else:
                 event_type = "cancelled"
-            was_failed = record.delivery_failed
+            was = record
             outcome = self._attempt_send_for_pending(record, event_type)
-            now_failed = self._pending.get(record.timer_id)
-            if (
-                now_failed is not None
-                and now_failed.delivery_failed
-                and not was_failed
-            ):
-                # A newly-landed delivery_failed mark is a queue
-                # change: it owes a persist, like a purge.
+            after = self._pending.get(record.timer_id)
+            if after is None or after != was:
+                # Any attempt mutates the record's bookkeeping
+                # (attempt count, last-attempt time, streak, mark) —
+                # a queue change that owes a persist, like a purge,
+                # even when the mark itself did not flip (round-2
+                # B1). ``after is None`` is the purge case, already
+                # a change; the comparison covers the re-send-only
+                # pass, where the record survives with new values.
                 changed = True
-            if purge and outcome == "sent":
+            if (
+                purge
+                and outcome == "sent"
+                and record.event_type == "finished"
+            ):
                 del self._pending[record.timer_id]
                 changed = True
+                # F5: the purge spends the record's only re-ring
+                # attempt on an unconfirmed "sent" — count it and log
+                # it distinctly (warning, not info), so a first ring
+                # lost to a silent drop leaves a trace.
+                self._unconfirmed_finished_purges += 1
+                _LOGGER.warning(
+                    "Purged pending finished for timer %s (%s) on an "
+                    "unconfirmed 'sent': the first ring attempt is "
+                    "spent — if the handler dropped it silently the "
+                    "timer never rang, with no retry (unconfirmed "
+                    "purge #%d)",
+                    record.timer_id,
+                    reason,
+                    self._unconfirmed_finished_purges,
+                )
+            elif purge and outcome == "sent":
+                # B1: a CANCELLED is never purged on "sent". "Sent"
+                # is not delivery confirmation — the handler may have
+                # dropped it silently — so the record stays pending
+                # until the 24 h prune removes it (supersede is not
+                # an exit for a finished id — see the docstring).
                 _LOGGER.info(
-                    "Purged pending %s for timer %s (%s)",
-                    record.event_type,
+                    "Not purging pending cancelled for timer %s "
+                    "(%s): 'sent' is not delivery confirmation",
                     record.timer_id,
                     reason,
                 )
@@ -2089,6 +2450,35 @@ class SatelliteTimerBridge:
 
     _PRUNE_AFTER = timedelta(hours=24)
     _REPAIR_ISSUE_AFTER = timedelta(minutes=5)
+    # Hysteresis before the delivery_failed mark clears (fix-burst
+    # F3): a record needs this many consecutive attempts that reach
+    # the handler before the mark lifts. One "sent" proves nothing —
+    # a Wyoming silent drop returns cleanly — so clearing on the first
+    # clean return false-clears the repair issue while the CANCELLED
+    # may never have arrived.
+    _DELIVERY_CLEAR_STREAK = 3
+    # Trigger-4 backoff for CANCELLED re-sends (fix-burst F2): the
+    # wait after attempt N before the next trigger-4 attempt. The
+    # first re-send comes 60 s after the dismiss, the second 5 min
+    # after that, then every 15 min — bounded, never infinite retry.
+    # Applies to CANCELLED records on trigger 4 ONLY (see
+    # PendingRecord); liveness drains and FINISHED re-sends are
+    # untouched.
+    _CANCELLED_BACKOFF = (
+        timedelta(seconds=60),
+        timedelta(minutes=5),
+        timedelta(minutes=15),
+    )
+
+    @property
+    def unconfirmed_finished_purges(self) -> int:
+        """FINISHED records purged on an unconfirmed "sent" (F5).
+
+        Each one spent the record's single re-ring attempt on a send
+        that may have been silently dropped; the counter is the only
+        trace, since the purge leaves no retry and no repair signal.
+        """
+        return self._unconfirmed_finished_purges
 
     def _resolve_device_entities(self) -> None:
         """Resolve each served device to its satellite entity (§5.3 H11).
@@ -2276,14 +2666,17 @@ class SatelliteTimerBridge:
     async def _on_satellite_state_change(self, event: Any) -> None:
         """Trigger 2: any state change of a served satellite entity (§5.3).
 
-        A transition OUT of ``unavailable`` purges (liveness proven —
-        on satellite types whose entity goes ``unavailable``, i.e.
-        ESPHome; O3 settled per type: Wyoming/VoIP entities NEVER go
-        ``unavailable``, so trigger 2 never purges for the kitchen
-        satellite). A transition between two non-``unavailable``
-        states is a drain attempt that does NOT purge. FINISHED
-        re-sends follow ``_finished_may_resend`` (purge drains ignore
-        O1; non-purge drains need O1 "rings until cancelled").
+        A transition OUT of ``unavailable`` purges a re-sent FINISHED
+        record (liveness proven — on satellite types whose entity
+        goes ``unavailable``, i.e. ESPHome; O3 settled per type:
+        Wyoming/VoIP entities NEVER go ``unavailable``, so trigger 2
+        never purges for the kitchen satellite). A pending CANCELLED
+        is re-sent but never purged on "sent" (B1: "sent" is not
+        delivery confirmation). A transition between two
+        non-``unavailable`` states is a drain attempt that does NOT
+        purge. FINISHED re-sends follow ``_finished_may_resend``
+        (purge drains ignore O1; non-purge drains need O1 "rings
+        until cancelled").
         """
         data = getattr(event, "data", {}) or {}
         entity_id = data.get("entity_id")
@@ -2363,16 +2756,23 @@ class SatelliteTimerBridge:
         is logged once when it starts) — on satellite types whose
         entity can read ``unavailable`` (ESPHome) only; for Wyoming /
         VoIP the entity never reads ``unavailable``, so the skip
-        branch can never engage and trigger 4 attempts every 60 s
-        while the satellite is down. Trigger 4 NEVER purges. FINISHED
+        branch can never engage and trigger 4 keeps attempting on the
+        backoff cadence (60 s, then 5 min, then 15 min) while the
+        satellite is down — bounded, never every 60 s flat. Trigger 4 NEVER purges. FINISHED
         re-sends need the flag ``false`` AND O1 "rings until
         cancelled" (never under auto-stop; skipped while O1 is
-        unsettled). A prune persists the queue change (§5.1 site (4));
-        a pass that only re-sends writes nothing — but a newly-landed
-        ``delivery_failed`` mark is a queue change, not a mere
-        re-send, and persists like a prune (the mark must survive a
-        restart for the repair issue to age from its original
-        ``enqueued_at``). The repair-issue state is re-evaluated on
+        unsettled). CANCELLED re-sends are BACKED OFF (F2): the first
+        re-send waits 60 s after the last attempt, the second 5 min,
+        then 15 min between attempts (``_cancelled_backoff_due``) —
+        the retry is bounded, never infinite, and a dismiss that
+        never gets a liveness signal costs ~100 sends over 24 h,
+        not ~1,440. A prune persists the queue change (§5.1 site (4));
+        a pass that re-sends persists too, because every attempt
+        mutates the record's bookkeeping — count, last-attempt time,
+        streak and mark (round-2 B1: pre-fix a re-send-only pass
+        wrote nothing, so a restart reset the backoff ladder and the
+        streak, and the repair issue could never clear under
+        repeated restarts). The repair-issue state is re-evaluated on
         every tick.
         """
         changed = False
@@ -2412,23 +2812,28 @@ class SatelliteTimerBridge:
                         )
                     continue
                 self._trigger4_skip_logged.discard(record.device_id)
-            was_failed = record.delivery_failed
+            was = record
             if record.event_type == "finished":
                 if not self._finished_may_resend(
                     record, purge_drain=False
                 ):
                     continue
-                self._attempt_send_for_pending(record, "finished")
+                self._attempt_send_for_pending(record, "finished", now)
             else:
-                self._attempt_send_for_pending(record, "cancelled")
-            now_failed = self._pending.get(record.timer_id)
-            if (
-                now_failed is not None
-                and now_failed.delivery_failed
-                and not was_failed
-            ):
-                # A newly-landed delivery_failed mark is a queue
-                # change: it owes a persist, like a prune.
+                # F2 backoff: a CANCELLED re-sends only when its wait
+                # since the last attempt has elapsed. Skipping here
+                # costs nothing — the record stays pending and the
+                # next tick re-checks it.
+                if not self._cancelled_backoff_due(record, now):
+                    continue
+                self._attempt_send_for_pending(record, "cancelled", now)
+            after = self._pending.get(record.timer_id)
+            if after is None or after != was:
+                # Any attempt mutates the record's bookkeeping
+                # (attempt count, last-attempt time, streak, mark) —
+                # a queue change that owes a persist, like a prune,
+                # even when the mark itself did not flip (round-2
+                # B1).
                 changed = True
         if changed:
             await self.persist()
@@ -2468,15 +2873,88 @@ class SatelliteTimerBridge:
 
         The bridge creates the issue when a pending CANCELLED record
         ages past 5 min AND its delivery is observably impossible —
-        at least one send attempt for that record hit an
+        the most recent send attempt for that record hit an
         observably-impossible path (``delivery_failed``). A record
-        whose immediate attempt reached the handler NEVER raises the
+        whose latest attempt reached the handler NEVER raises the
         issue, however long it stays pending (an ordinary connected
         dismiss followed by five quiet minutes produces NO issue).
         Only CANCELLED records age toward the issue: a pending
         FINISHED is the expected ringing state, not a failure. The
-        issue clears when the record purges, is superseded, or prunes
-        at 24 h. There is no second escalation step. The wording says
+        issue clears when the path is observably open again — which
+        takes ``_DELIVERY_CLEAR_STREAK`` consecutive attempts that
+        reach the handler (F3 hysteresis), not one: a single "sent"
+        is consistent with a silent drop inside the handler, so
+        clearing on it would false-clear the issue and let a flapping
+        handler toggle it open/closed on every tick. With hysteresis
+        a flap (fail, sent, fail, sent, ...) never reaches the streak
+        and the issue stays open until the path is genuinely, repeatedly
+        open. The issue also clears when the record prunes at 24 h.
+        No newer event can replace it first (round-2 B2): a second
+        dismiss raises KeyError, ``restart_timer`` needs the finished
+        record, a live-cancel tap fires only for live timers, and
+        ``restore_finished`` mints a new id — and a FINISHED never
+        supersedes a CANCELLED. A CANCELLED never purges (B1), so
+        clearing depends only on the streak or the prune. In the clean
+        case — no skip, no failed attempt — clearing after the
+        satellite recovers takes just under 46 min (round-2 B3;
+        burst-3 critic Finding 1): with the last
+        attempt just before recovery the backoff ladder
+        (60 s, 5 min, 15 min) spaces the three consecutive "sent"
+        attempts at +15, +30 and +45 min — but attempts can only
+        land on 60 s trigger-4 ticks, and every ladder step is a
+        multiple of 60 s, so a phase offset of just under 60 s on
+        the first attempt is preserved, not accumulated: off-phase
+        the attempts land at up to +15:59, +30:59 and +45:59.
+        That bound holds only in the clean case (burst-4 critic
+        Finding 1; burst-5 delta critic Findings 1-2): no
+        unavailable-skip at a due tick and no failed attempt in
+        between. A skip at a due tick restarts the backoff clock
+        from the actual (delayed) attempt time, so each skip adds
+        up to one further 60 s tick regardless of position —
+        measured on the B3b 59 s phase grid from the last attempt
+        before recovery: no skip clears at +45:59 (45.98 min), one
+        skip at +46:59 (46.98 min), two skips at +47:59 (47.98 min,
+        consecutive and non-consecutive identical), three skips at
+        +48:59 (48.98 min, consecutive and non-consecutive identical);
+        N skips clear at 45:59 + N min, so a
+        satellite flapping at every due tick pushes clearing
+        arbitrarily far. The skip needs an ESPHome-type satellite
+        (Wyoming / VoIP entities never read ``unavailable``) and a
+        flap landing exactly on a due tick. A failed attempt is
+        strictly worse and is NOT ESPHome-only: any outcome other
+        than "sent" in ``_attempt_send_for_pending`` resets
+        ``sent_streak`` to 0 and re-stamps ``last_attempt_at``,
+        restarting the whole ladder from that attempt — so one
+        failed attempt can add up to a further ~46 min. It is
+        type-agnostic (handler down / no-handler, or handler
+        raising) and hits any satellite whose entity reads
+        available while its handler is down or raising; all drain
+        paths (triggers 1/2/3/4) funnel through that same failure
+        branch. Measured: a single failed trigger-4 attempt at
+        streak 2 clears at +90:59 (90.98 min) from the last attempt
+        before recovery, with no skip, no restart, and the
+        satellite reachable throughout in the entity sense; a
+        handler re-registration whose drain fails clears at +80:59
+        (80.98 min) — 66.98 min even with genuine loud recovery at
+        +36:00; a restart whose startup trigger-1 drain fails
+        clears at +65:59 (65.98 min). A restart on its own does NOT
+        reset the streak: a load-only restart at streak 1 still
+        clears at +45:59, and a restart whose startup drain
+        succeeds advances it — only a failed drain during the
+        restart resets it. A single failed attempt clears at ~46–91
+        min from the last attempt; 61 min is only the floor for
+        failures at due ticks. The skip and the streak-reset-on-failure
+        are both correct and unchanged; the bound is what is
+        overstated, so the user-facing text states the usual case
+        and names the failure overrun separately — usually within
+        about 46 minutes after the satellite is reachable again,
+        but a failed stop attempt restarts the wait, so one failed
+        attempt can push it to about 91 minutes, and if the
+        satellite keeps failing or keeps going unavailable it may
+        not clear until the record expires after 24 hours. Whether the
+        streak-reset-on-failure itself should change is a design
+        question, not settled here.
+        There is no second escalation step. The wording says
         "may still be ringing" — a warning the hub cannot confirm the
         stop, not a claim the speaker is ringing. The Wyoming
         silent-drop gap is disclosed, not closed: a dismiss issued
@@ -2572,7 +3050,8 @@ class SatelliteTimerBridge:
         # record is dropped, and supersedes the pending FINISHED for
         # the old id. If the new start then fails, the old record stays
         # (the sensor remains) and the CANCELLED stays pending — a
-        # duplicate stop that drains on the next liveness signal.
+        # duplicate stop that keeps retrying on the trigger-4 backoff
+        # cadence (60 s, then 5 min, then 15 min) until the 24 h prune.
         self._enqueue(
             PendingRecord(
                 timer_id=finished.timer_id,
@@ -2583,9 +3062,13 @@ class SatelliteTimerBridge:
                 total_seconds=finished.total_seconds,
                 language=finished.language,
                 is_finished=True,
+                started_at=finished.started_at,
             )
         )
         outcome = self._send_to_satellite(finished, "cancelled")
+        # The immediate send counts as attempt 1 for the trigger-4
+        # backoff (F2).
+        self._record_attempt(timer_id)
         if outcome != "sent":
             pending = self._pending.get(timer_id)
             if pending is not None:
@@ -2685,6 +3168,7 @@ class SatelliteTimerBridge:
                 total_seconds=getattr(timer, "created_seconds", 0) or 0,
                 language=getattr(timer, "language", "en") or "en",
                 is_finished=True,
+                started_at=started_at,
             )
         )
 
@@ -2729,14 +3213,18 @@ class SatelliteTimerBridge:
                 # Trigger 3 (§5.3): a voice-originated STARTED — the
                 # voice command had to arrive over the satellite
                 # connection, so the channel was live at that moment.
-                # Pending events for that device are re-sent, and the
-                # attempt purges: it was made while the channel was
-                # just proven live. UPDATED, CANCELLED and FINISHED
-                # events, and service-originated STARTED events, are
-                # NOT liveness signals and never drain the queue. The
-                # re-send runs synchronously here; the persist for a
-                # purge is issued as a background task (site (4)),
-                # like the tap-path save below.
+                # Pending events for that device are re-sent. A
+                # FINISHED re-send on this drain may purge, but a
+                # CANCELLED never purges on "sent" (B1): the voice
+                # command proves the satellite could reach HA, not
+                # that HA's CANCELLED reached the satellite — the
+                # handler may drop it silently, and there is no
+                # delivery signal to confirm it. UPDATED, CANCELLED
+                # and FINISHED events, and service-originated STARTED
+                # events, are NOT liveness signals and never drain
+                # the queue. The re-send runs synchronously here; the
+                # persist for a purge is issued as a background task
+                # (site (4)), like the tap-path save below.
                 changed = self._drain_device(
                     timer.device_id, purge=True, reason="trigger-3"
                 )
@@ -2758,6 +3246,9 @@ class SatelliteTimerBridge:
             # its mark forever (ids never repeat, but the set would
             # otherwise grow without bound). Its observed start goes
             # with it — a cancelled timer has no record to carry one.
+            # The start is read BEFORE the pop below, so the pending
+            # CANCELLED carries it for the re-dismiss listing (B5).
+            cancelled_started_at = self._observed_started_at.get(timer.id)
             self._service_started.discard(timer.id)
             self._observed_started_at.pop(timer.id, None)
             # The live-cancel enqueue site (§5.3): TimerManager's own
@@ -2767,11 +3258,17 @@ class SatelliteTimerBridge:
             # voice-originated CANCELLED is no exception: the command
             # proves the channel live at arrival, but that evidence
             # predates both deliveries, so the record stays pending
-            # like any other until the next voice STARTED purges it or
-            # a supersede replaces it. With no handler registered no
-            # tap fires at all, so no record is enqueued for a
-            # handlerless cancel — the satellite was never told the
-            # timer existed, so there is nothing to retry.
+            # like any other — until the 24 h prune removes it. It is
+            # NEVER purged by a voice STARTED (a liveness drain
+            # re-sends a CANCELLED but never purges it on "sent", B1:
+            # "sent" is not delivery confirmation), and supersede is
+            # not an exit for it (F2: a FINISHED never supersedes a
+            # CANCELLED, and no second CANCELLED can be produced for
+            # a finished id). Trigger 4 re-sends it on the backoff
+            # cadence (60 s, then 5 min, then 15 min). With no handler
+            # registered no tap fires at all, so no record is enqueued
+            # for a handlerless cancel — the satellite was never told
+            # the timer existed, so there is nothing to retry.
             self._enqueue(
                 PendingRecord(
                     timer_id=timer.id,
@@ -2782,6 +3279,7 @@ class SatelliteTimerBridge:
                     total_seconds=getattr(timer, "created_seconds", 0) or 0,
                     language=getattr(timer, "language", "en") or "en",
                     is_finished=False,
+                    started_at=cancelled_started_at,
                 )
             )
 

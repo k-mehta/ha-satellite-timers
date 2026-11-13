@@ -25,7 +25,7 @@
       "title": "Satellite Timers cannot read voice timers"
     },
     "undelivered_timer_events": {
-      "description": "A finished timer was dismissed, but the hub could not confirm the satellite stopped ringing: the stop message could not be delivered. The satellite may still be ringing. The hub keeps retrying the stop and clears this warning when the stop is sent on a liveness signal and leaves the queue, when a newer event for the same timer replaces it, or when the record expires after 24 hours.",
+      "description": "A finished timer was dismissed, but the hub could not confirm the satellite stopped ringing: the stop message could not be delivered. The satellite may still be ringing. The hub keeps retrying the stop and clears this warning after three consecutive stop attempts reach the satellite again \u2014 usually within about 46 minutes after the satellite is reachable again, but a failed stop attempt restarts the wait, so one failed attempt can push it to about 91 minutes, and if the satellite keeps failing or keeps going unavailable it may not clear until the record expires after 24 hours. Reaching the satellite only means it answered — it does not prove the stop arrived — so if the satellite is still ringing, dismiss the timer again.",
       "title": "A dismissed timer may still be ringing"
     }
   },

@@ -46,6 +46,7 @@ SERVICE_RESUME_TIMER = "resume_timer"
 SERVICE_CANCEL_TIMER = "cancel_timer"
 SERVICE_ADD_TIME = "add_time"
 SERVICE_DISMISS_TIMER = "dismiss_timer"
+SERVICE_RETRY_DISMISS = "retry_dismiss"
 SERVICE_RESTART_TIMER = "restart_timer"
 SERVICE_START_TIMER = "start_timer"
 # D6 Undo: put a cancelled / dismissed timer back with its remaining

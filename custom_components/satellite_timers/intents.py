@@ -115,6 +115,15 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
     — the response says so and points at "cancel" instead, because
     dismissing means "clear the done state", not "stop a running timer".
 
+    Re-dismiss (F4): after a dismiss the finished record is gone, so
+    the timer can no longer be found among the finished timers — but
+    its CANCELLED is still pending and retrying. Saying "dismiss the
+    pasta timer" again re-sends the stop for that pending id
+    (``redismiss_timer``) instead of answering "no finished timers".
+    The reply says what is happening either way, and says so plainly
+    when the satellite could not be reached just now — the bridge
+    keeps retrying the stop on its own.
+
     TIMER-11 (lists-and-asks, never silently picks): when several
     finished timers match the name — or several have finished with no
     name given — the handler does NOT pick one. It lists them by name
@@ -155,6 +164,61 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
 
         name = slots.get("name", {}).get("value")
         target: TimerRecord | None = None
+        # Pending CANCELLED snapshots (F4): the timers a dismiss already
+        # cleared, whose stop is still retrying. A bridge without the
+        # affordance (older fakes) simply reports none. Filtered by
+        # device like ``finished`` above (round-2 B4): a pending
+        # snapshot for another satellite must never be re-dismissed
+        # from this one — the same rule Home Assistant's own timer
+        # lookup uses. A command with no device id matches any device.
+        _pending_fn = getattr(bridge, "pending_cancelled", None)
+        pending_snaps = _pending_fn() if callable(_pending_fn) else []
+        if device_id is not None:
+            pending_snaps = [
+                snap
+                for snap in pending_snaps
+                if snap.device_id == device_id
+            ]
+        _redismiss_fn = getattr(bridge, "redismiss_timer", None)
+
+        async def _reply_stopping(label: str, outcome: str | None) -> intent.IntentResponse:
+            """The "stopping" reply, surfacing an observably-failed send (F4).
+
+            A clean send and a failed send never get the same words:
+            when the satellite could not be reached just now, the
+            reply says so — and says the stop keeps being retried, so
+            the failure is a fact with a recovery path, not a dead
+            end and not a "voice is down" banner.
+            """
+            response = intent_obj.create_response()
+            speech = f"Stopping the {label} timer"
+            if outcome is not None and outcome != "sent":
+                speech += (
+                    " — I couldn't reach the satellite just now, "
+                    "so I'll keep trying to stop it"
+                )
+            response.async_set_speech(speech)
+            return response
+
+        async def _persist_bridge() -> None:
+            """Persist the bridge after a dismiss/re-dismiss (F1).
+
+            The voice path persists like the service path (site (3)):
+            without this the enqueue and the ``_records`` pop sit
+            unpersisted until the next tap-path save, and a restart
+            in that window loses the pending CANCELLED and resurrects
+            the finished timer. A bridge without persist (older fakes)
+            simply has nothing to save.
+            """
+            persist = getattr(bridge, "persist", None)
+            if callable(persist):
+                await persist()
+
+        async def _redismiss(snap: TimerRecord) -> intent.IntentResponse:
+            """Re-send the stop for a pending CANCELLED id (F4)."""
+            outcome = _redismiss_fn(snap.timer_id)
+            await _persist_bridge()
+            return await _reply_stopping(snap.name or "Timer", outcome)
 
         if name:
             wanted = normalize_timer_name(str(name))
@@ -180,6 +244,30 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
                     f"The {name} timer is still running — "
                     f"say 'cancel the {name} timer' to stop it"
                 )
+            elif _redismiss_fn is not None:
+                # F4: no finished timer by that name — but a dismiss
+                # already cleared one, and its stop is still pending.
+                pending_matches = [
+                    snapshot
+                    for snapshot in pending_snaps
+                    if normalize_timer_name(snapshot.name) == wanted
+                ]
+                if len(pending_matches) == 1:
+                    return await _redismiss(pending_matches[0])
+                if len(pending_matches) > 1:
+                    listed = "; ".join(
+                        _describe_finished(snapshot)
+                        for snapshot in pending_matches
+                    )
+                    raise intent.IntentHandleError(
+                        f"There is more than one dismissed timer called "
+                        f"{name} still stopping: {listed}. I can't tell "
+                        f"which one you mean — dismiss the one you want "
+                        f"from the Timers view"
+                    )
+                raise intent.IntentHandleError(
+                    f"I couldn't find a finished timer called {name}"
+                )
             else:
                 raise intent.IntentHandleError(
                     f"I couldn't find a finished timer called {name}"
@@ -187,6 +275,18 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
         elif len(finished) == 1:
             target = finished[0]
         elif not finished:
+            # F4: nothing finished — but a stop may still be pending.
+            if _redismiss_fn is not None and len(pending_snaps) == 1:
+                return await _redismiss(pending_snaps[0])
+            if _redismiss_fn is not None and len(pending_snaps) > 1:
+                listed = "; ".join(
+                    _describe_finished(snapshot) for snapshot in pending_snaps
+                )
+                raise intent.IntentHandleError(
+                    f"There are several dismissed timers still "
+                    f"stopping: {listed}. Say which one to try "
+                    f"stopping again"
+                )
             raise intent.IntentHandleError("There are no finished timers to dismiss")
         else:
             listed = "; ".join(
@@ -197,8 +297,23 @@ class DismissFinishedTimerIntentHandler(intent.IntentHandler):
                 f"Say which one to dismiss"
             )
 
-        bridge.dismiss_timer(target.timer_id)
-        response = intent_obj.create_response()
-        label = target.name or "Timer"
-        response.async_set_speech(f"{label} timer dismissed")
-        return response
+        # The dismiss returns its own send outcome directly (round-2
+        # B6): the handler reports THIS dismiss's outcome, never a
+        # bridge-global "last outcome" that a concurrent dismiss on
+        # another satellite could have overwritten while this one
+        # awaited the persist below.
+        _, outcome = bridge.dismiss_timer(target.timer_id)
+        await _persist_bridge()
+        # B1: never state the stop as a completed fact. The dismiss
+        # sends CANCELLED best-effort and the bridge keeps retrying
+        # it (trigger 4, on the backoff cadence until the 24 h prune),
+        # but "sent" is not delivery confirmation — a Wyoming silent
+        # drop returns cleanly while the event never arrives — so the
+        # reply says what is happening, not what has happened. F4:
+        # when the immediate send observably failed, the reply says
+        # so (the returned outcome), instead of answering a failed
+        # send with the same words as a clean one.
+        return await _reply_stopping(
+            target.name or "Timer",
+            outcome,
+        )

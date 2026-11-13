@@ -59,6 +59,7 @@ from .const import (
     SERVICE_RESTORE_FINISHED_TIMER,
     SERVICE_RESTORE_TIMER,
     SERVICE_RESUME_TIMER,
+    SERVICE_RETRY_DISMISS,
     SERVICE_START_TIMER,
 )
 from .intents import DismissFinishedTimerIntentHandler, async_ensure_dismiss_sentences
@@ -482,6 +483,33 @@ def _register_services(
         # a finished timer the user already cleared.
         await bridge.persist()
 
+    async def handle_retry_dismiss(call) -> None:
+        """Re-send the stop for a timer already dismissed (F4).
+
+        The finished record is gone, so ``dismiss_timer`` cannot find
+        the id — but the pending CANCELLED is still retrying, and this
+        sends it NOW instead of waiting for the trigger-4 backoff.
+        The record stays pending either way (a re-send never purges);
+        the outcome is logged, not raised — an observably-failed
+        re-send leaves the retry running, it does not fail the call.
+        """
+        try:
+            outcome = bridge.redismiss_timer(call.data["timer_id"])
+        except KeyError:
+            raise HomeAssistantError(
+                f"Timer {call.data['timer_id']} not found"
+            ) from None
+        if outcome != "sent":
+            _LOGGER.warning(
+                "Re-dismiss for timer %s could not reach the "
+                "satellite (%s); the stop keeps retrying",
+                call.data["timer_id"],
+                outcome,
+            )
+        # Persist site (3): the re-send's attempt bookkeeping must
+        # reach storage before the service call returns.
+        await bridge.persist()
+
     async def handle_restart(call) -> None:
         try:
             bridge.restart_timer(
@@ -633,6 +661,9 @@ def _register_services(
         DOMAIN, SERVICE_DISMISS_TIMER, handle_dismiss, schema=_TIMER_ID_SCHEMA
     )
     hass.services.async_register(
+        DOMAIN, SERVICE_RETRY_DISMISS, handle_retry_dismiss, schema=_TIMER_ID_SCHEMA
+    )
+    hass.services.async_register(
         DOMAIN, SERVICE_RESTART_TIMER, handle_restart, schema=_RESTART_SCHEMA
     )
     hass.services.async_register(
@@ -666,6 +697,7 @@ def _unregister_services(hass: HomeAssistant) -> None:
         SERVICE_CANCEL_TIMER,
         SERVICE_ADD_TIME,
         SERVICE_DISMISS_TIMER,
+        SERVICE_RETRY_DISMISS,
         SERVICE_RESTART_TIMER,
         SERVICE_START_TIMER,
         SERVICE_RESTORE_TIMER,

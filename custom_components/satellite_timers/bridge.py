@@ -2942,8 +2942,10 @@ class SatelliteTimerBridge:
         clears at +45:59, and a restart whose startup drain
         succeeds advances it — only a failed drain during the
         restart resets it. A single failed attempt clears at ~46–91
-        min from the last attempt; 61 min is only the floor for
-        failures at due ticks. The skip and the streak-reset-on-failure
+        min from the last attempt once the backoff ladder is at the
+        15-minute step; earlier in the ladder it clears sooner, and
+        61 min is only the floor for failures at due ticks at that
+        step. The skip and the streak-reset-on-failure
         are both correct and unchanged; the bound is what is
         overstated, so the user-facing text states the usual case
         and names the failure overrun separately — usually within

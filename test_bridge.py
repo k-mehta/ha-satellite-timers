@@ -2704,11 +2704,11 @@ check("B2: _evaluate_repair_issues docstring drops the supersede clause",
 check("B2: docstring states the single-failure clear range",
       "single failed attempt clears at ~46–91"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
-check("B2: docstring states the range is measured from the last attempt",
-      "min from the last attempt; 61 min is only the floor for"
+check("B2: docstring states the range is measured from the last attempt once the ladder is at the 15-minute step",
+      "min from the last attempt once the backoff ladder is at the"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
-check("B2: docstring states the 61 min floor is for due-tick failures only",
-      "failures at due ticks."
+check("B2: docstring states the 61 min floor is for due-tick failures at the 15-minute step only",
+      "61 min is only the floor for failures at due ticks at that"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 check("B2: docstring quotes the about-91-minutes overrun",
       "can push it to about 91 minutes"
@@ -3061,6 +3061,127 @@ check("B3 failed attempt: docstring states the failed-attempt clear time",
       "+90:59 (90.98 min)"
       in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
 b3d.stop()
+
+# ------------------------------------------------- burst-8 delta critic Finding 1 (F1): early-ladder failure clears sooner
+# The docstring's "~46–91 min" range only summarizes count>=3
+# measurements: the backoff delay depends on attempt_count (60 s /
+# 5 min / 15 min), so a failure early in the ladder clears sooner. A
+# CANCELLED record at attempt_count=1 whose satellite flaps
+# (unavailable through the first due ticks) and then fails its first
+# post-recovery attempt clears at +40:59 from the last attempt — 5
+# min under the "~46" floor: the failed attempt at +5:59 re-stamps
+# last_attempt_at at count 2, so the three "sent"s land at +10:59
+# (5 min step), +25:59 and +40:59 (15 min steps). This pins the
+# numbers behind the docstring's "earlier in the ladder it clears
+# sooner" qualification. States + raising-handler swap follow the
+# B3c / B3d harness patterns above.
+b3e_calls = []
+b3e_mgr = FakeTimerManager()
+b3e_hass = FakeHassWithTasks(b3e_mgr)
+b3e_mgr.handlers["dev1"] = _make_handler(b3e_calls)
+b3e = bridge.SatelliteTimerBridge(b3e_hass, ["dev1"])
+_LOOP.run_until_complete(b3e.async_load_persisted(FakeStore()))
+_LOOP.run_until_complete(b3e.start())
+b3e._device_entities = {"dev1": "assist_satellite.kitchen_hub"}
+b3e_states = _B3cStates()
+b3e_hass.states = b3e_states
+b3e_t0 = datetime.now(timezone.utc)
+b3e._enqueue(bridge.PendingRecord(
+    timer_id="B305", device_id="dev1", event_type="cancelled",
+    enqueued_at=b3e_t0 - timedelta(minutes=6), name="Pasta",
+    total_seconds=600, language="en", is_finished=True,
+    delivery_failed=True, attempt_count=1,
+    last_attempt_at=b3e_t0))
+b3e_created = ir_registry.created.count(
+    ("satellite_timers", "undelivered_timer_events"))
+b3e_deleted = ir_registry.deleted.count(
+    ("satellite_timers", "undelivered_timer_events"))
+b3e._evaluate_repair_issues(b3e_t0)
+check("B3 flap-fail: old failed CANCELLED opens the issue",
+      ir_registry.created.count(
+          ("satellite_timers", "undelivered_timer_events"))
+      == b3e_created + 1
+      and b3e._repair_issue_present() is True)
+
+
+def _b3e_tick(when, unavailable):
+    b3e_states.map["assist_satellite.kitchen_hub"] = _FakeState(
+        "unavailable" if unavailable else "idle")
+    _LOOP.run_until_complete(b3e._trigger4_tick(when))
+
+
+_b3e_tick(b3e_t0 + timedelta(seconds=59), True)
+check("B3 flap-fail: +0:59 unavailable is no attempt, streak 0",
+      b3e._pending["B305"].sent_streak == 0
+      and b3e._pending["B305"].attempt_count == 1
+      and b3e_calls.count("cancelled:B305") == 0)
+_b3e_tick(b3e_t0 + timedelta(minutes=4, seconds=59), True)
+check("B3 flap-fail: +4:59 unavailable is still no attempt, clock untouched",
+      b3e._pending["B305"].sent_streak == 0
+      and b3e._pending["B305"].attempt_count == 1
+      and b3e._pending["B305"].last_attempt_at == b3e_t0
+      and b3e_calls.count("cancelled:B305") == 0
+      and b3e._repair_issue_present() is True)
+dict.__setitem__(b3e_mgr.handlers, "dev1", _b3d_raising_handler(b3e_calls))
+_b3e_tick(b3e_t0 + timedelta(minutes=5, seconds=59), False)
+check("B3 flap-fail: failed attempt at +5:59 resets the streak to 0, count 2",
+      b3e._pending["B305"].sent_streak == 0
+      and b3e._pending["B305"].delivery_failed is True
+      and b3e._pending["B305"].attempt_count == 2
+      and b3e._pending["B305"].last_attempt_at
+      == b3e_t0 + timedelta(minutes=5, seconds=59)
+      and b3e_calls.count("cancelled:B305") == 1
+      and b3e._repair_issue_present() is True)
+dict.__setitem__(b3e_mgr.handlers, "dev1", _make_handler(b3e_calls))
+_b3e_tick(b3e_t0 + timedelta(minutes=9, seconds=59), False)
+check("B3 flap-fail: +9:59 is still streak 0 — ladder restarted, next due +10:59",
+      b3e._pending["B305"].sent_streak == 0
+      and b3e_calls.count("cancelled:B305") == 1)
+_b3e_tick(b3e_t0 + timedelta(minutes=10, seconds=59), False)
+check("B3 flap-fail: +10:59 is streak 1, mark and issue stay",
+      b3e._pending["B305"].sent_streak == 1
+      and b3e._pending["B305"].delivery_failed is True
+      and b3e_calls.count("cancelled:B305") == 2
+      and b3e._repair_issue_present() is True)
+_b3e_tick(b3e_t0 + timedelta(minutes=24, seconds=59), False)
+check("B3 flap-fail: +24:59 is still streak 1 — next due +25:59",
+      b3e._pending["B305"].sent_streak == 1
+      and b3e_calls.count("cancelled:B305") == 2)
+_b3e_tick(b3e_t0 + timedelta(minutes=25, seconds=59), False)
+check("B3 flap-fail: +25:59 is streak 2, mark and issue stay",
+      b3e._pending["B305"].sent_streak == 2
+      and b3e._pending["B305"].delivery_failed is True
+      and b3e_calls.count("cancelled:B305") == 3
+      and b3e._repair_issue_present() is True)
+_b3e_tick(b3e_t0 + timedelta(minutes=39, seconds=59), False)
+check("B3 flap-fail: +39:59 is still streak 2 — next due +40:59",
+      b3e._pending["B305"].sent_streak == 2
+      and b3e_calls.count("cancelled:B305") == 3)
+# Non-vacuous "not before" (burst-6 delta critic Finding 4): as in
+# B3c / B3d above — assert the deleted count is unchanged at the
+# tick before the clear tick.
+check("B3 flap-fail: issue still present at +39:59, not deleted before +40:59",
+      ir_registry.deleted.count(
+          ("satellite_timers", "undelivered_timer_events"))
+      == b3e_deleted
+      and b3e._repair_issue_present() is True)
+_b3e_tick(b3e_t0 + timedelta(minutes=40, seconds=59), False)
+check("B3 flap-fail: +40:59 is streak 3 and the mark clears",
+      b3e._pending["B305"].sent_streak == 3
+      and b3e._pending["B305"].delivery_failed is False
+      and b3e_calls.count("cancelled:B305") == 4)
+check("B3 flap-fail: issue deletes at +40:59, not before",
+      ir_registry.deleted.count(
+          ("satellite_timers", "undelivered_timer_events"))
+      == b3e_deleted + 1
+      and b3e._repair_issue_present() is False)
+check("B3 flap-fail: docstring states the early-ladder qualification",
+      "earlier in the ladder it clears sooner"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+check("B3 flap-fail: docstring states the range holds at the 15-minute step",
+      "15-minute step; earlier in the ladder it clears sooner, and"
+      in bridge.SatelliteTimerBridge._evaluate_repair_issues.__doc__)
+b3e.stop()
 
 # ------------------------------------------------- burst-6 delta critic Finding 3: pin the docstring numbers
 # The docstring states five measured clear times that no test pinned

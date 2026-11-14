@@ -1,70 +1,108 @@
-"""Constants for the Satellite Timers integration."""
+"""Constants for the Satellite Timers integration.
+
+From-scratch build, Wave W2, against the settled architecture
+(``architecture-design-settled.md``).
+
+Every numeric constant names its source in its comment (Nov 13
+no-magic-numbers rule). No constant here is a guess: where the settled
+architecture leaves a value to implementation design time, the comment
+says so and states why this value was chosen.
+"""
 
 DOMAIN = "satellite_timers"
-CONF_DEVICES = "devices"
 
-# Bridge options (§5.3/§5.4, RB-R2-4/RB-R2-7 — fixes-18 item 30: the exact
-# key strings + value literals are this step's implementation choice,
-# recorded in the rebuild log). The Q11/Q12 fields record the SETTLED
-# answers, not a user choice; O1 stays unsettled until the §25 listen
-# test settles it. There is NO Q13 field — Q13 is DEAD (no bypass exists
-# to suppress).
-CONF_Q11_RING_TIMING = "q11_ring_timing"
-CONF_Q12_AUTO_STOP_RESEND = "q12_auto_stop_resend"
-CONF_O1_ALARM_BEHAVIOUR = "o1_alarm_behaviour"
+# --- Config entry -----------------------------------------------------------
+# The primary satellite is a config-entry OPTION (settled §08 row 17,
+# §04.6). "" in the options flow means unset.
 CONF_PRIMARY_SATELLITE = "primary_satellite"
-
-# Q11 — settled ~15:02 PST Nov 12: a timer that finished while the system
-# was down NEVER rings. "never_ring" is the settled value and the default.
-Q11_NEVER_RING = "never_ring"
-Q11_RING_ON_LIVENESS_DRAIN = "ring_on_liveness_drain"  # rejected (a)
-Q11_RING_AT_BRIDGE_START = "ring_at_bridge_start"  # rejected (b)
-Q11_OPTIONS = (Q11_NEVER_RING, Q11_RING_ON_LIVENESS_DRAIN,
-               Q11_RING_AT_BRIDGE_START)
-DEFAULT_Q11_RING_TIMING = Q11_NEVER_RING
-
-# Q12 — settled (b) ~08:41 PST Nov 12: never re-ring a stopped alarm.
-Q12_NEVER_RESEND = "never_resend"
-Q12_RESEND_ONCE_PER_REGISTRATION = "resend_once_per_registration"  # rejected (a)
-Q12_OPTIONS = (Q12_NEVER_RESEND, Q12_RESEND_ONCE_PER_REGISTRATION)
-DEFAULT_Q12_AUTO_STOP_RESEND = Q12_NEVER_RESEND
-
-# O1 — the satellite firmware's alarm behaviour, measured by the §25
-# listen test (RB-R0-7). "unsettled" is the default until it settles.
-O1_UNSETTLED = "unsettled"
-O1_RINGS_UNTIL_CANCELLED = "rings_until_cancelled"
-O1_AUTO_STOP = "auto_stop"
-O1_OPTIONS = (O1_UNSETTLED, O1_RINGS_UNTIL_CANCELLED, O1_AUTO_STOP)
-DEFAULT_O1_ALARM_BEHAVIOUR = O1_UNSETTLED
-
-# Primary satellite (§5.4): the device id the bridge rings when a chip
-# tap names no satellite. "" in the options flow means unset.
 PRIMARY_SATELLITE_UNSET = ""
 
+# --- Services (§09 C1 service table) ---------------------------------------
+SERVICE_START_TIMER = "start_timer"
 SERVICE_PAUSE_TIMER = "pause_timer"
 SERVICE_RESUME_TIMER = "resume_timer"
 SERVICE_CANCEL_TIMER = "cancel_timer"
-SERVICE_ADD_TIME = "add_time"
 SERVICE_DISMISS_TIMER = "dismiss_timer"
-SERVICE_RETRY_DISMISS = "retry_dismiss"
+SERVICE_ACKNOWLEDGE_TIMER = "acknowledge_timer"
 SERVICE_RESTART_TIMER = "restart_timer"
-SERVICE_START_TIMER = "start_timer"
-# D6 Undo: put a cancelled / dismissed timer back with its remaining
-# time (restore_timer) or its finished record (restore_finished_timer).
-# The card calls these from the Undo toast; they are the only way to
-# restore a timer the TimerManager no longer holds.
-SERVICE_RESTORE_TIMER = "restore_timer"
-SERVICE_RESTORE_FINISHED_TIMER = "restore_finished_timer"
+SERVICE_ADD_TIME = "add_time"
+SERVICE_UNDO_REMOVE = "undo_remove"
+SERVICE_RING_STARTED = "ring_started"
 
-# Voice dismissal of a finished timer. Home Assistant's built-in timer
-# sentences cannot do this: "cancel/stop the pasta timer" looks the timer
-# up in the TimerManager, and a finished timer is already gone from there.
-# So the bridge registers its own intent and ships the sentences for it
-# (see intents.py).
-INTENT_DISMISS_TIMER = "SatelliteTimersDismissTimer"
-DISMISS_SENTENCES_FILE = "satellite_timers_dismiss.yaml"
+# --- Store (§08 row 1) -----------------------------------------------------
+# Versioned JSON, atomic write (HA Store). Version 2 is this build's
+# schema; a payload whose version is not 2 is discarded on load (the
+# superseded build's v1 store is never migrated: the old build is not
+# a build base, §09 §(c)).
+STORE_VERSION = 2
+STORE_KEY = "satellite_timers"
 
+# --- Idempotency (§03.2 M1) ------------------------------------------------
+# Dedupe entries expire 600 s after completed_at.
+DEDUPE_TTL_SECONDS = 600
+
+# --- Ringing (§03.8, §09 C3) -----------------------------------------------
+# 3600 s, settled Nov 13 — "like Alexa" (OQ-TB-3).
+RING_WINDOW_SECONDS = 3600
+# 5 s: the ring-start ack window (A15, §09 C3).
+RING_ACK_TIMEOUT_SECONDS = 5
+
+# --- Tick + reconcile (§03.13) ---------------------------------------------
+TICK_INTERVAL_SECONDS = 1
+RECONCILE_INTERVAL_SECONDS = 30
+
+# --- Undo (§09 C9) ----------------------------------------------------------
+UNDO_WINDOW_SECONDS = 5
+
+# --- Duration bounds (v2 §6 A7) --------------------------------------------
+# A timer runs from 1 second to 24 hours. 24 h is a design choice, not
+# a measured derivation (v2 A7 says so); review may change the value,
+# not the existence of the bound.
+MIN_TIMER_DURATION_SECONDS = 1
+MAX_TIMER_DURATION_SECONDS = 86400
+
+# --- Error standard (ERS-1, §07.9) -----------------------------------------
+# One retry ladder: 4 attempts, delays [2, 8, 30] seconds.
+RETRY_MAX_ATTEMPTS = 4
+RETRY_DELAYS_S = (2, 8, 30)
+
+# --- Re-probe (§08 row 41, ERS-7) ------------------------------------------
+# A persistent bridge failure re-appears via a 60 s silent re-probe.
+REPROBE_INTERVAL_SECONDS = 60
+
+# --- Persist drain cap (ERS-3) --------------------------------------------
+# A burst of mutations arriving during a save is drained in at most this
+# many passes; anything left after the cap is re-scheduled as a fresh
+# persist task (bridge.py _persist) — the invariant is that every
+# mutation is eventually persisted, not that one task does it all.
+# 8 passes is far above any realistic burst: a save takes a few ms and
+# mutations arrive one per service call or tick transition.
+PERSIST_MAX_DRAIN_PASSES = 8
+
+# --- Sensor contract (§03.6, §09 C2) ----------------------------------------
+CONTRACT_VERSION = 2
+
+# --- Version sensor (§03.6, §08 row 44) ------------------------------------
+# BRIDGE_VERSION is read from the integration manifest at runtime
+# (bridge.py), never hardcoded here.
+# MIN_CARD_VERSION is an implementation choice, not a measured
+# derivation: the new-build cards are v2 (W5); the 0.x cards of the
+# superseded build cannot read this bridge's contract, so they
+# degrade (G-08 skew matrix). Re-decided when the first v2 card ships.
+MIN_CARD_VERSION = "2.0.0"
+
+# --- Frontend plumbing (unchanged from the earlier build) ----------------
+# The timer screen card is served from the integration's www/ directory
+# and registered as a Lovelace resource. W2 writes no card code; these
+# constants are the integration plumbing that serves the existing file.
 CARD_URL_PATH = "/satellite_timers"
 CARD_FILE = "timer-screen-card.js"
 CARD_URL = f"{CARD_URL_PATH}/{CARD_FILE}"
 CARD_RESOURCE_TYPE = "module"
+
+# --- Announcement path (§08 row 21, §04.7) ----------------------------------
+ANNOUNCE_AUTOMATION_ENTITY_ID = "automation.family_hub_timer_announcement"
+
+# --- Repair issues -----------------------------------------------------------
+ISSUE_UNDELIVERED_TIMER_EVENTS = "undelivered_timer_events"
+ISSUE_VOICE_ROUTING = "bridge_voice_routing"

@@ -1,7 +1,36 @@
+start_timer:
+  name: Start timer
+  description: Start a timer on a satellite by name and duration. Returns the timer's state, including the sensor entity id to bind the card to.
+  fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent — retrying with the same command_id returns the stored result instead of starting a second timer.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
+    name:
+      name: Name
+      description: The timer's display name. A recipe chip passes the recipe name.
+      required: true
+      example: "Pasta"
+    duration_seconds:
+      name: Duration
+      description: How long the timer runs, in seconds (1 to 86400).
+      required: true
+      example: 600
+    device_id:
+      name: Satellite
+      description: The satellite device id or assist_satellite entity id. Omit to use the primary satellite, or the single configured satellite.
+      required: false
+      example: "assist_satellite.kitchen"
 pause_timer:
   name: Pause timer
-  description: Pause a running voice timer.
+  description: Pause a running timer. A timer in any other state returns its current state unchanged.
   fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
     timer_id:
       name: Timer ID
       description: The timer_id attribute of the bridge sensor for the timer.
@@ -9,8 +38,13 @@ pause_timer:
       example: "01K8..."
 resume_timer:
   name: Resume timer
-  description: Resume a paused voice timer.
+  description: Resume a paused timer. A timer in any other state returns its current state unchanged.
   fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
     timer_id:
       name: Timer ID
       description: The timer_id attribute of the bridge sensor for the timer.
@@ -18,8 +52,55 @@ resume_timer:
       example: "01K8..."
 cancel_timer:
   name: Cancel timer
-  description: Cancel a voice timer. The bridge sensor disappears.
+  description: Cancel a running or paused timer. The bridge sensor disappears, and the cancel can be undone for 5 seconds with undo_remove.
   fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+dismiss_timer:
+  name: Dismiss timer
+  description: Clear a finished timer. The bridge sensor disappears, and the dismiss can be undone for 5 seconds with undo_remove. A timer that is still running cannot be dismissed; cancel it instead.
+  fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+acknowledge_timer:
+  name: Acknowledge timer
+  description: Stop a ringing timer. The timer stays as a finished timer until it is dismissed.
+  fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
+    timer_id:
+      name: Timer ID
+      description: The timer_id attribute of the bridge sensor for the timer.
+      required: true
+      example: "01K8..."
+restart_timer:
+  name: Restart timer
+  description: Start a finished timer again, for its full original duration, as a new timer.
+  fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
     timer_id:
       name: Timer ID
       description: The timer_id attribute of the bridge sensor for the timer.
@@ -27,140 +108,48 @@ cancel_timer:
       example: "01K8..."
 add_time:
   name: Add time
-  description: Add time to a running or paused voice timer.
+  description: Add time to a running or paused timer. A negative number removes time instead. A timer in any other state returns its current state unchanged.
   fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
     timer_id:
       name: Timer ID
       description: The timer_id attribute of the bridge sensor for the timer.
       required: true
       example: "01K8..."
-    minutes:
-      name: Minutes
-      description: Whole minutes to add.
-      required: false
-      default: 0
-      example: 1
     seconds:
       name: Seconds
-      description: Seconds to add.
-      required: false
-      default: 0
-      example: 30
-dismiss_timer:
-  name: Dismiss timer
-  description: Clear a finished timer. The bridge sensor disappears. A timer that is still running cannot be dismissed; cancel it instead.
+      description: Seconds to add (negative to remove).
+      required: true
+      example: 60
+undo_remove:
+  name: Undo remove
+  description: Put a timer cancelled or dismissed within the last 5 seconds back exactly as it was — same timer, same state, same time left. After 5 seconds the undo is gone.
+  fields:
+    command_id:
+      name: Command ID
+      description: A UUID v4 that makes the call idempotent.
+      required: true
+      example: "123e4567-e89b-42d3-a456-426614174000"
+    timer_id:
+      name: Timer ID
+      description: The timer_id of the timer that was cancelled or dismissed.
+      required: true
+      example: "01K8..."
+ring_started:
+  name: Ring started
+  description: Called by the announcement automation when a finished timer's ring starts playing. Confirms the ring reached the satellite; without it, the bridge records the ring as missed after 5 seconds.
   fields:
     timer_id:
       name: Timer ID
       description: The timer_id attribute of the bridge sensor for the timer.
       required: true
       example: "01K8..."
-retry_dismiss:
-  name: Retry dismiss
-  description: Send the stop for a timer that was already dismissed, right now instead of waiting for the next automatic retry. Use it when the satellite is still ringing after a dismiss. The timer stays dismissed either way.
-  fields:
-    timer_id:
-      name: Timer ID
-      description: The timer_id of the dismissed timer (the same id the dismiss used).
-      required: true
-      example: "01K8..."
-start_timer:
-  name: Start timer
-  description: Start a timer on a satellite by name and duration. Returns the created timer sensor's entity id. Duplicate names are accepted. A chip-started timer does not trigger the timer-jump automation.
-  fields:
-    name:
-      name: Name
-      description: The timer's display name. A recipe chip passes the recipe name.
-      required: true
-      example: "Pasta"
-    duration:
-      name: Duration
-      description: How long the timer runs, in SECONDS.
-      required: true
-      example: 600
-    satellite:
-      name: Satellite
-      description: The satellite entity id (e.g. the kitchen satellite). Omit to use the default satellite.
+    command_id:
+      name: Command ID
+      description: A UUID v4, when the caller has one. When omitted, the bridge generates one and returns it.
       required: false
-      example: "assist_satellite.kitchen"
-restart_timer:
-  name: Restart timer
-  description: Start a finished timer again, for the same duration unless minutes or seconds override it.
-  fields:
-    timer_id:
-      name: Timer ID
-      description: The timer_id attribute of the bridge sensor for the timer.
-      required: true
-      example: "01K8..."
-    minutes:
-      name: Minutes
-      description: Duration override, whole minutes. Omit to reuse the original duration.
-      required: false
-      default: 0
-      example: 10
-    seconds:
-      name: Seconds
-      description: Duration override, seconds. Omit to reuse the original duration.
-      required: false
-      default: 0
-      example: 0
-restore_timer:
-  name: Restore timer
-  description: Put a cancelled timer back with the time it had left when it was cancelled (Undo). A paused timer comes back paused. The restored timer gets a new timer id.
-  fields:
-    name:
-      name: Timer name
-      description: The name of the timer to restore.
-      required: true
-      example: "Pasta"
-    duration:
-      name: Seconds left
-      description: The seconds left on the timer when it was cancelled.
-      required: true
-      example: 420
-    paused:
-      name: Paused
-      description: Restore the timer paused (true) or running (false).
-      required: false
-      default: false
-      example: true
-    satellite:
-      name: Satellite
-      description: The satellite entity id (e.g. the kitchen satellite). Omit to use the default satellite.
-      required: false
-      example: "assist_satellite.kitchen"
-restore_finished_timer:
-  name: Restore finished timer
-  description: Put a dismissed finished timer back, WITHOUT ringing the satellite again (Undo). The original finished time is preserved, so "Done — N min ago" is unchanged. The restored timer gets a new timer id.
-  fields:
-    name:
-      name: Timer name
-      description: The name of the timer to restore.
-      required: true
-      example: "Pasta"
-    total_seconds:
-      name: Total duration
-      description: The timer's full duration in seconds.
-      required: true
-      example: 600
-    finished_at:
-      name: Finished at
-      description: ISO-8601 time the timer originally finished.
-      required: true
-      example: "2026-11-11T18:12:00+00:00"
-    satellite:
-      name: Satellite
-      description: The satellite entity id (e.g. the kitchen satellite). Omit to use the default satellite.
-      required: false
-      example: "assist_satellite.kitchen"
-    started_via_service:
-      name: Started via service
-      description: True when the original timer was started from the dashboard (a chip or preset), not by voice.
-      required: false
-      default: false
-      example: true
-    started_at:
-      name: Started at
-      description: ISO-8601 time the original timer started. Omit to derive it from finished_at minus total_seconds.
-      required: false
-      example: "2026-11-11T18:02:00+00:00"
+      example: "123e4567-e89b-42d3-a456-426614174000"

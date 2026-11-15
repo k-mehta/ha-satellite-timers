@@ -5,6 +5,33 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases are tagged `vX.Y.Z`; the manifest version always matches the tag.
 
+## [2.0.0] - 2026-11-14
+
+Complete rewrite of the integration. The bridge now owns timer truth
+and idempotency: every command carries a client-generated idempotency
+key, so a retried start can never mint a duplicate timer, and the
+timer card holds no guard machinery of its own.
+
+### Added
+
+- Timer sensors report `active`, `paused`, and `finished`. A timer
+  that finished while the system was down restores as finished and is
+  shown, never rung; a stopped alarm is never re-rung.
+- Voice routing: the bridge takes over Home Assistant's voice-timer
+  handling (intent override), so dashboard timers and voice timers
+  stay in sync.
+- Services: `start_timer`, `pause_timer`, `resume_timer`,
+  `cancel_timer`, `dismiss_timer`, `acknowledge_timer`,
+  `restart_timer`, `add_time`, `undo_remove`, `ring_started`.
+- Setup asks nothing: one instance, no device picker. The primary
+  satellite is picked in Options.
+
+### Removed
+
+- The `restore_timer` and `restore_finished_timer` services are gone:
+  restore is now part of the bridge's own persistent timer records,
+  not a service call.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added

@@ -53,12 +53,34 @@ jobs:
       - name: Install PyYAML for services metadata check
         run: python3 -c "import yaml" 2>/dev/null || pip install -q pyyaml
       - name: Validate services metadata
-        run: python3 -c "import yaml; d = yaml.safe_load(open('custom_components/satellite_timers/services.yaml')); assert set(d) == {'pause_timer', 'resume_timer', 'cancel_timer', 'add_time', 'dismiss_timer', 'restart_timer', 'start_timer', 'restore_timer', 'restore_finished_timer'}, sorted(d)"
+        run: |
+          python3 - <<'PY'
+          import re
+          import yaml
+          from pathlib import Path
+
+          # The service names live in exactly one place: the SERVICE_*
+          # constants in const.py (services.py registers them,
+          # services.yaml describes them). A hardcoded list here drifted
+          # twice and failed CI on every push; derive it instead so the
+          # check can never rot again.
+          const = Path("custom_components/satellite_timers/const.py").read_text()
+          registered = set(re.findall(r'^SERVICE_\w+ = "([a-z_]+)"', const, re.M))
+          described = set(yaml.safe_load(Path("custom_components/satellite_timers/services.yaml").read_text()))
+          assert registered, "no SERVICE_* constants found in const.py"
+          assert registered == described, (
+              f"services mismatch: registered-only={sorted(registered - described)} "
+              f"described-only={sorted(described - registered)}"
+          )
+          PY
       - name: Check timer-screen card syntax
         run: node --check custom_components/satellite_timers/www/timer-screen-card.js
       - name: Run timer-screen card node tests
         run: node --test custom_components/satellite_timers/www/timer-screen-card.test.cjs
-      - name: Run bridge smoke tests
+      # The in-process integration check (tests/bridge_integration_check.py)
+      # needs real Home Assistant, so it runs on the rig, not here; CI
+      # runs the pure-module pytest suite only.
+      - name: Run bridge test suite
         run: |
-          python3 test_bridge.py
-          python3 test_sensor_device_info.py
+          pip install -q pytest
+          python3 -m pytest tests/ -q

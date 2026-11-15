@@ -2355,7 +2355,7 @@ class TimerScreenCard extends HTMLElement {
       kind: error.kind ?? "call-failed",
       scope: `dial:${record.entityId}`,
       message: bridgeTooOld
-        ? "Timer controls need the updated bridge. Update Satellite Timers in HACS, restart Home Assistant, then reload this page."
+        ? "This timer card needs a newer Satellite Timers bridge. Update Satellite Timers in HACS, restart Home Assistant, then reload this page."
         : isNotFound
           ? `Couldn't do that — the timer service wasn't found. (${ERS_BOUNDARY})`
           : `Couldn't do that — ${error.message}`,
